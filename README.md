@@ -1,7 +1,7 @@
 # @inixiative/agent-session
 
 Drive coding-agent CLIs as **persistent, streaming, event-captured sessions** —
-one interface, any agent. Claude Code today; Codex, Gemini, and Grok planned.
+one interface, any agent. Claude Code and Codex today; Gemini and Grok planned.
 
 Most ways to script a coding agent are one-shot (`claude -p "…"`) and lose the
 process. `agent-session` keeps a single long-lived agent process, streams turns
