@@ -10,7 +10,8 @@
   },
   "files": ["src"],
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
   },
   "keywords": [
     "claude-code", "codex", "agent", "session", "stream", "stream-json",
