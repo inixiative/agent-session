@@ -56,7 +56,7 @@ session.kill();
 | Runtime | Status |
 |---|---|
 | Claude Code | ✅ shipped |
-| Codex CLI (`codex exec`, JSON events) | planned |
+| Codex CLI (`codex mcp-server`, JSON-RPC) | ✅ shipped (`CodexSession`; `CodexAppServerSession` experimental) |
 | Gemini CLI | planned |
 | Grok CLI | planned (when its headless/stream mode matures) |
 

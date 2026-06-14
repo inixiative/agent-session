@@ -58,6 +58,11 @@ export interface ClaudeCodeSessionConfig {
   bin?: string;
   /** Model. Defaults to "sonnet". */
   model?: string;
+  /**
+   * Reasoning-effort level (`--effort`). One of low|medium|high|xhigh|max.
+   * Omitted → the CLI's default effort. Recorded per run for comparability.
+   */
+  effort?: string;
   /** Working directory for the session. */
   cwd?: string;
   /** Max agentic turns per message. Defaults to 25. */
@@ -122,6 +127,7 @@ export class ClaudeCodeSession implements HarnessSession {
   // -- Config --
   private _bin: string;
   private _model: string;
+  private _effort?: string;
   private _cwd: string;
   private _maxTurns: number;
   private _permissionMode: string;
@@ -174,6 +180,7 @@ export class ClaudeCodeSession implements HarnessSession {
     }
     this._bin = bin;
     this._model = config?.model ?? "sonnet";
+    this._effort = config?.effort;
     this._cwd = config?.cwd ?? process.cwd();
     this._maxTurns = config?.maxTurns ?? 25;
     this._permissionMode = config?.permissionMode ?? "bypassPermissions";
@@ -336,6 +343,7 @@ export class ClaudeCodeSession implements HarnessSession {
     const forked = new ClaudeCodeSession({
       bin: this._bin,
       model: this._model,
+      effort: this._effort,
       cwd: opts?.cwd ?? this._cwd,
       maxTurns: this._maxTurns,
       permissionMode: this._permissionMode,
@@ -616,6 +624,7 @@ export class ClaudeCodeSession implements HarnessSession {
       "--input-format", "stream-json",
       "--output-format", "stream-json",
       "--model", this._model,
+      ...(this._effort ? ["--effort", this._effort] : []),
       "--max-turns", String(this._maxTurns),
       "--permission-mode", this._permissionMode,
       "--include-hook-events",
