@@ -62,6 +62,8 @@ session.kill();
 
 Opaque runtimes degrade gracefully — fewer event types, never a hard failure.
 
+Proposed [subscription pooling goals](tickets/README.md) cover distributing session workloads across subscriptions while keeping working context independent of the capacity supplying it.
+
 ## Provenance
 
 Extracted from [`inixiative/foundry`](https://github.com/inixiative/foundry),
