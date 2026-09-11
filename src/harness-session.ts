@@ -17,7 +17,50 @@
 // Event taxonomy — classified events from the agent stream
 // ---------------------------------------------------------------------------
 
+/** IDs are native only when observed. admissionId is generated locally, never a native turn ID. */
+export interface SessionIdentity {
+  readonly admissionId?: string;
+  readonly nativeSessionId?: string;
+  readonly threadId?: string;
+  readonly turnId?: string;
+  readonly itemId?: string;
+  readonly callId?: string;
+  readonly messageId?: string;
+  readonly rpcRequestId?: number;
+  readonly correlation?: "native-turn" | "ordered-stream" | "unknown";
+}
+export type NativeOutcome = "unknown" | "completed" | "failed";
+export interface NativeTerminal {
+  readonly type: string;
+  readonly eventId?: string;
+  readonly turnId?: string;
+  readonly subtype?: string;
+  readonly reason?: string;
+  readonly apiErrorStatus?: number;
+}
+export interface SessionAttempt extends SessionIdentity {
+  readonly nativeOutcome: NativeOutcome;
+  readonly localOutcome: "pending" | "resolved" | "rejected";
+  readonly dispatch: "not-dispatched" | "attempted";
+  readonly transportOutcome: "open" | "failed" | "closed";
+  readonly terminal?: NativeTerminal;
+  readonly rpcOutcome?: "pending" | "resolved" | "failed" | "unknown";
+  readonly localFailure?: "timeout" | "interrupt-request" | "transport" | "rpc" | "validation" | "blocked" | "killed" | "unrecognized-terminal" | "registration";
+  readonly content: string;
+  readonly events: readonly SessionEvent[];
+  readonly tokens?: { input: number; output: number };
+}
+/** A rejected local send can still have a later native terminal; read attempt again to reconcile. */
+export class SessionTurnError extends Error {
+  constructor(message: string, private readonly evidence: () => SessionAttempt, options?: ErrorOptions) {
+    super(message, options); this.name = "SessionTurnError";
+  }
+  get attempt(): SessionAttempt { return this.evidence(); }
+}
+
 export type SessionEventKind =
+  | "text_delta"
+  | "native_status"
   | "session_start"
   | "session_end"
   | "session_compact"
@@ -28,17 +71,43 @@ export type SessionEventKind =
   | "result"
   | "error";
 
-export interface SessionEvent {
+export interface SessionEvent extends SessionIdentity {
+  /**
+   * Session-history evidence excluded from admission results and state transitions.
+   * "session-configuration": a native lifecycle/configuration envelope (Claude system/init)
+   * retained with its binding; it belongs to the session, never to an admission, and a
+   * repeated one is not evidence of compaction or restart. "duplicate-boundary": an explicit
+   * compaction boundary whose native uuid was already recorded.
+   */
+  readonly unattributedReason?: "no-admission" | "foreign-session" | "foreign-turn" | "duplicate-terminal" | "after-terminal"
+    | "unrecognized-event" | "session-configuration" | "duplicate-boundary" | "duplicate-tool" | "unmatched-tool" | "malformed-tool";
+  /** Local transport observation, not a native terminal acknowledgment. */
+  readonly transportOutcome?: SessionAttempt["transportOutcome"];
+  readonly nativeOutcome?: NativeOutcome;
+  readonly terminal?: NativeTerminal;
   readonly kind: SessionEventKind;
   readonly timestamp: number;
   /** Text content (for text, thinking, result, error). */
   readonly text?: string;
   /** Tool name (for tool_use). */
   readonly toolName?: string;
+  /** Native MCP invocation identity, separate from call ID and SDK request IDs.
+   * Display name is mcp__<server>__<tool>; use these fields for exact comparisons. */
+  readonly toolServer?: string;
+  readonly toolMethod?: string;
   /** Tool input arguments (for tool_use). */
   readonly toolInput?: Record<string, unknown>;
   /** Tool output (for tool_result). */
   readonly toolOutput?: string;
+  /** Public text content is retained; unsupported/non-text result payload is omitted. */
+  readonly toolOutputOmitted?: boolean;
+  /** Exact public tool names from `tool_reference` result blocks (tool search), in order,
+   * duplicates preserved; a separately owned guard judges ownership. Absent when none. */
+  readonly toolReferences?: readonly string[];
+  /** Public type labels of omitted non-text result blocks, in first-seen order; unknown or
+   * malformed shapes are "unsupported". Present only when toolOutputOmitted is true. */
+  readonly toolOutputOmittedTypes?: readonly string[];
+  readonly toolInputOmitted?: string;
   /** Whether the tool call failed (for tool_result). */
   readonly toolError?: boolean;
   /** Compaction source runtime (for session_compact): "claude-code" | "codex" | etc. */
@@ -51,12 +120,17 @@ export interface SessionEvent {
   readonly externalSessionId?: string;
   /** Token usage (for result). */
   readonly tokens?: { input: number; output: number };
-  /** Raw message from the stream (for Oracle introspection). */
+  /** Owned, deeply frozen native JSON data (for Oracle introspection). */
   readonly raw?: unknown;
 }
 
 /** Result of a single send() — the turn's content plus all classified events. */
-export interface SessionResult {
+export interface SessionResult extends SessionIdentity {
+  readonly localOutcome?: SessionAttempt["localOutcome"];
+  readonly transportOutcome?: SessionAttempt["transportOutcome"];
+  readonly rpcOutcome?: SessionAttempt["rpcOutcome"];
+  readonly nativeOutcome?: NativeOutcome;
+  readonly terminal?: NativeTerminal;
   readonly content: string;
   readonly events: readonly SessionEvent[];
   readonly tokens?: { input: number; output: number };
@@ -65,7 +139,15 @@ export interface SessionResult {
 }
 
 /** Full session record for Oracle evaluation. */
+export interface SessionDiagnostics {
+  /** Counts only: observer exception messages/objects are never retained. */
+  readonly observerFailures: { readonly synchronous: number; readonly asynchronous: number };
+}
 export interface SessionArtifact {
+  readonly diagnostics?: SessionDiagnostics;
+  readonly attempts?: readonly SessionAttempt[];
+  /** Legacy totalTokens contains observed counts only, not proof of complete accounting. */
+  readonly accounting?: "observed-only";
   /** The runtime's native session ID. See SessionEvent.externalSessionId. */
   readonly externalSessionId?: string;
   readonly events: readonly SessionEvent[];
@@ -94,11 +176,23 @@ export type BeforeSendHook = (
   message: string,
 ) => string | Promise<string>;
 
+export interface SessionSendOptions {
+  timeout?: number;
+  /** Required ownership registration, not an observer. Rejection prevents the native write. */
+  onAdmission?: (attempt: SessionAttempt) => void | Promise<void>;
+}
+
 // ---------------------------------------------------------------------------
 // HarnessSession interface
 // ---------------------------------------------------------------------------
 
 export interface HarnessSession {
+  /** One immutable admission snapshot, without copying unrelated session history. */
+  inspectAttempt?(admissionId: string): SessionAttempt | undefined;
+  readonly admissionProtocol?: "prewrite-v1";
+  readonly diagnostics?: SessionDiagnostics;
+  readonly attempts?: readonly SessionAttempt[];
+  readonly accounting?: "observed-only";
   readonly alive: boolean;
   /**
    * The agent runtime's native session ID — external to Foundry.
@@ -115,7 +209,7 @@ export interface HarnessSession {
   start(): Promise<void>;
 
   /** Send a message. Queued if another turn is in-flight. */
-  send(message: string, opts?: { timeout?: number }): Promise<SessionResult>;
+  send(message: string, opts?: SessionSendOptions): Promise<SessionResult>;
 
   /**
    * Fork: create a new (unstarted) session branching from current state.
@@ -123,7 +217,7 @@ export interface HarnessSession {
    */
   fork(opts?: { cwd?: string; baseContext?: string }): HarnessSession;
 
-  /** Interrupt the current in-flight turn (best-effort). */
+  /** Reject the local waiter. No native cancellation acknowledgment is currently implemented. */
   interrupt(): void;
 
   /** Kill the session process and reject any pending turns. */

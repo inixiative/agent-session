@@ -1,0 +1,1190 @@
+{
+  "format": 4,
+  "evidenceSource": "native-cli",
+  "runId": "s1-continuation-20260907T041000Z",
+  "path": "claude",
+  "startedAt": "2026-09-07T04:10:04.291Z",
+  "sourceRevision": "4336603026fa64a15dbea5e0b8c61a12d6e14657",
+  "sourceHashes": {
+    "src/claude-code-session.ts": "fa528a6b2ac45807e578cef27640cd3439403a4db4af2de2ab58ce7f2a462d03",
+    "src/codex-session.ts": "cfccba00aaaa4e3731ca90a679a994b4055a233480d08c317e0feebf1da1cefe",
+    "src/harness-session.ts": "f6486c3a6fe8c6ae092d8bdd264bd38f17be6ee313dc97bf083dfdca67939f93",
+    "src/turn-state.ts": "9a282c4be33e703594460dfc0c8058215e9fd4fa9dc6aa7623fa549b0f970c42",
+    "src/retained-evidence.ts": "7082cde4c70bf08ed93d99e1950a567fc281edb1c5976a3b59d48ea28f1cfa65",
+    "scripts/s0/continuation-plan.ts": "68cb93c20871c1dbe837b994d965b43b086e6fe9b038fb7646c978a83d54c3fd",
+    "scripts/s0/continuation.ts": "aa0bc2e92ed9a0dbc9ffcd13a698f1e91715fbbba0b8407d07644d7f3a88c985",
+    "scripts/s0/continuation-record.ts": "4a856a9df7b48a25a836c3ddd83e6270b4dba00a553567b29d9c7a39cd88cf1b",
+    "scripts/s0/sanitize.ts": "bb192917616fa5a6fe5c4ef3739f4f2f88c358d053a2848b28c45e7e780b6e73",
+    "scripts/s0/observation.ts": "aecb2212bae6140935f747fefdcd0938429b85d520355564f56e8c0b9084a9e3",
+    "scripts/s0/lifecycle.ts": "a8ffa4f796965d8c0111aeabc0a3da0b93db7eccd348adde276fafc3017b1fc0",
+    "package.json": "34ae66e1af9a6e4bf4210868ebd7f0b45c8277106c9033a2eb949668f0e0ad13"
+  },
+  "package": {
+    "name": "@inixiative/agent-session",
+    "version": "0.1.0",
+    "source": "sibling checkout, not installed in Foundry"
+  },
+  "requested": {
+    "model": "claude-fable-5-1",
+    "effort": "max"
+  },
+  "versions": {
+    "bun": {
+      "command": {
+        "executable": "bun",
+        "args": [
+          "--version"
+        ]
+      },
+      "exitCode": 0,
+      "value": "1.3.14"
+    },
+    "cli": {
+      "command": {
+        "executable": "claude",
+        "args": [
+          "--version"
+        ]
+      },
+      "exitCode": 0,
+      "value": "2.1.258 (Claude Code)"
+    }
+  },
+  "tasks": [
+    {
+      "file": "sentinel-one.txt",
+      "content": "S1_FIRST_SENTINEL_29\n",
+      "marker": "S1_FIRST_DONE",
+      "prompt": "Disposable continuation probe. Use a shell tool to run exactly: bun --version && cat sentinel-one.txt . Read only this controlled directory. Do not edit files, inspect other directories, use agents, or do other work. Then respond briefly with S1_FIRST_DONE and the two observed outputs."
+    },
+    {
+      "file": "sentinel-two.txt",
+      "content": "S1_SECOND_SENTINEL_83\n",
+      "marker": "S1_SECOND_DONE",
+      "prompt": "Disposable continuation probe. Use a shell tool to run exactly: bun --version && cat sentinel-two.txt . Read only this controlled directory. Do not edit files, inspect other directories, use agents, or do other work. Then respond briefly with S1_SECOND_DONE and the two observed outputs."
+    }
+  ],
+  "before": {
+    "alias": "<controlled-sample>",
+    "directoryEntriesHash": "7bcd5e1672b3f7b7a93d528fb7b8b71200630b70c835132af02cb4766376a41d",
+    "manifestHash": "1c1e7c7b9c4758792c24efeb5a15b686df50c14c7e496ca8a0671629f6b034f6",
+    "entryCount": 2,
+    "files": [
+      {
+        "file": "sentinel-one.txt",
+        "hash": "48cf87e46c28f0fc4816aadc8f4fb58c340fd99337a51da620c5dd4cd11c4be2"
+      },
+      {
+        "file": "sentinel-two.txt",
+        "hash": "4b11f06aa767807f7e7feb16c0102128882cd3db31752133c58a9deed0b4a7d0"
+      }
+    ],
+    "unchanged": true
+  },
+  "limits": {
+    "processes": 1,
+    "admittedSends": 2,
+    "startDeadlineMs": 15000,
+    "sendDeadlineMs": 180000,
+    "settleMs": 50,
+    "retries": 0,
+    "resume": false,
+    "fork": false,
+    "maxTurnsClaude": 8,
+    "admissionDeadline": "sendDeadlineMs is one monotonic deadline per admission covering local settlement, the current admission's native outcome and trailing frames; settleMs only lets trailing frames land and is capped by the same deadline.",
+    "afterDeadline": "Admission stops permanently with native outcome unknown; ownership is retained for reconciliation/cleanup on the same late terminal or owned process exit. Never resume, re-send, fork or reset identity."
+  },
+  "selectedModelEffort": "Only emitted native configuration frames constitute evidence; requests are not acknowledgments",
+  "capture": {
+    "stop": "running",
+    "sendCalls": 1,
+    "admittedSends": 1,
+    "observedTurnWrites": 1,
+    "spawnCount": 1,
+    "nativeOutcome": "completed",
+    "admissionClosed": null,
+    "processExited": false,
+    "processExitCode": null,
+    "cleanupAllowed": true,
+    "accountIdentity": "unknown",
+    "capacity": "unknown",
+    "subscriptionContinuity": "unknown",
+    "turns": [
+      {
+        "index": 0,
+        "admittedAt": "2026-09-07T04:10:04.295Z",
+        "finishedAt": "2026-09-07T04:10:18.120Z",
+        "firstFrame": 0,
+        "endFrameExclusive": 17,
+        "nativeWait": "known",
+        "localSend": "resolved",
+        "verified": true,
+        "result": {
+          "nativeSessionId": "ref-3",
+          "correlation": "ordered-stream",
+          "admissionId": "ref-12",
+          "nativeOutcome": "completed",
+          "localOutcome": "resolved",
+          "dispatch": "attempted",
+          "transportOutcome": "open",
+          "terminal": {
+            "type": "result",
+            "eventId": "ref-25",
+            "subtype": "success",
+            "reason": "unknown"
+          },
+          "content": "1.3.14\nS1_FIRST_SENTINEL_29\nS1_FIRST_DONE",
+          "tokens": {
+            "input": 58,
+            "output": 401
+          },
+          "externalSessionId": "ref-3",
+          "omittedFieldCount": 1
+        },
+        "eventIndices": [
+          7,
+          8,
+          9,
+          15,
+          16,
+          17
+        ],
+        "attempt": {
+          "nativeSessionId": "ref-3",
+          "correlation": "ordered-stream",
+          "admissionId": "ref-12",
+          "nativeOutcome": "completed",
+          "localOutcome": "resolved",
+          "dispatch": "attempted",
+          "transportOutcome": "open",
+          "terminal": {
+            "type": "result",
+            "eventId": "ref-25",
+            "subtype": "success",
+            "reason": "unknown"
+          },
+          "content": "1.3.14\nS1_FIRST_SENTINEL_29\nS1_FIRST_DONE",
+          "tokens": {
+            "input": 58,
+            "output": 401
+          },
+          "omittedFieldCount": 1
+        }
+      }
+    ],
+    "admission": {
+      "sendAdmitted": true,
+      "attemptedWrites": 1,
+      "observedWrites": 1,
+      "possibleTurnWrite": true,
+      "outboundObserverFailed": false,
+      "noTurn": false
+    },
+    "observerErrors": [],
+    "diagnostics": {
+      "observerFailures": {
+        "synchronous": 0,
+        "asynchronous": 0
+      }
+    },
+    "lifecycle": [
+      {
+        "kind": "spawned",
+        "at": "2026-09-07T04:10:04.293Z",
+        "pid": "ref-1",
+        "executable": "claude",
+        "args": [
+          "--print",
+          "--verbose",
+          "--input-format",
+          "stream-json",
+          "--output-format",
+          "stream-json",
+          "--model",
+          "claude-fable-5-1",
+          "--effort",
+          "max",
+          "--max-turns",
+          "8",
+          "--permission-mode",
+          "bypassPermissions",
+          "--include-hook-events"
+        ]
+      },
+      {
+        "kind": "send-admitted",
+        "at": "2026-09-07T04:10:04.295Z"
+      },
+      {
+        "kind": "admission-settled",
+        "at": "2026-09-07T04:10:18.174Z",
+        "nativeWait": "known",
+        "verified": true
+      }
+    ],
+    "stderrBytes": 0,
+    "observedConfiguration": [
+      {
+        "frame": 2,
+        "model": "claude-fable-5-1",
+        "effort": null
+      }
+    ],
+    "stdin": {
+      "chunks": [
+        {
+          "index": 0,
+          "bytes": 366,
+          "at": "2026-09-07T04:10:04.295Z"
+        }
+      ],
+      "frames": [
+        {
+          "index": 0,
+          "firstChunk": 0,
+          "lastChunk": 0,
+          "newline": true,
+          "at": "2026-09-07T04:10:04.295Z",
+          "value": {
+            "type": "user",
+            "message": {
+              "role": "user",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Disposable continuation probe. Use a shell tool to run exactly: bun --version && cat sentinel-one.txt . Read only this controlled directory. Do not edit files, inspect other directories, use agents, or do other work. Then respond briefly with S1_FIRST_DONE and the two observed outputs."
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "stdout": {
+      "chunks": [
+        {
+          "index": 0,
+          "bytes": 253,
+          "at": "2026-09-07T04:10:04.522Z"
+        },
+        {
+          "index": 1,
+          "bytes": 9508,
+          "at": "2026-09-07T04:10:05.018Z"
+        },
+        {
+          "index": 2,
+          "bytes": 7857,
+          "at": "2026-09-07T04:10:05.605Z"
+        },
+        {
+          "index": 3,
+          "bytes": 194,
+          "at": "2026-09-07T04:10:09.881Z"
+        },
+        {
+          "index": 4,
+          "bytes": 196,
+          "at": "2026-09-07T04:10:11.396Z"
+        },
+        {
+          "index": 5,
+          "bytes": 196,
+          "at": "2026-09-07T04:10:12.149Z"
+        },
+        {
+          "index": 6,
+          "bytes": 2271,
+          "at": "2026-09-07T04:10:12.152Z"
+        },
+        {
+          "index": 7,
+          "bytes": 770,
+          "at": "2026-09-07T04:10:13.071Z"
+        },
+        {
+          "index": 8,
+          "bytes": 930,
+          "at": "2026-09-07T04:10:13.076Z"
+        },
+        {
+          "index": 9,
+          "bytes": 246,
+          "at": "2026-09-07T04:10:13.079Z"
+        },
+        {
+          "index": 10,
+          "bytes": 246,
+          "at": "2026-09-07T04:10:13.080Z"
+        },
+        {
+          "index": 11,
+          "bytes": 511,
+          "at": "2026-09-07T04:10:13.082Z"
+        },
+        {
+          "index": 12,
+          "bytes": 317,
+          "at": "2026-09-07T04:10:13.097Z"
+        },
+        {
+          "index": 13,
+          "bytes": 1017,
+          "at": "2026-09-07T04:10:13.135Z"
+        },
+        {
+          "index": 14,
+          "bytes": 478,
+          "at": "2026-09-07T04:10:13.679Z"
+        },
+        {
+          "index": 15,
+          "bytes": 1008,
+          "at": "2026-09-07T04:10:18.093Z"
+        },
+        {
+          "index": 16,
+          "bytes": 2010,
+          "at": "2026-09-07T04:10:18.118Z"
+        }
+      ],
+      "frames": [
+        {
+          "index": 0,
+          "firstChunk": 0,
+          "lastChunk": 0,
+          "newline": true,
+          "at": "2026-09-07T04:10:04.522Z",
+          "value": {
+            "type": "system",
+            "subtype": "unknown",
+            "uuid": "ref-2",
+            "session_id": "ref-3",
+            "omittedFieldCount": 3
+          }
+        },
+        {
+          "index": 1,
+          "firstChunk": 1,
+          "lastChunk": 1,
+          "newline": true,
+          "at": "2026-09-07T04:10:05.019Z",
+          "value": {
+            "type": "system",
+            "subtype": "unknown",
+            "output": "[redacted]",
+            "stdout": "[redacted]",
+            "stderr": "[redacted]",
+            "uuid": "ref-4",
+            "session_id": "ref-3",
+            "omittedFieldCount": 4
+          }
+        },
+        {
+          "index": 2,
+          "firstChunk": 2,
+          "lastChunk": 2,
+          "newline": true,
+          "at": "2026-09-07T04:10:05.606Z",
+          "value": {
+            "type": "system",
+            "subtype": "init",
+            "session_id": "ref-3",
+            "tools": [
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]",
+              "[redacted]"
+            ],
+            "model": "claude-fable-5-1",
+            "capabilities": [
+              "[redacted]",
+              "[redacted]",
+              "[redacted]"
+            ],
+            "uuid": "ref-5",
+            "omittedFieldCount": 17
+          }
+        },
+        {
+          "index": 3,
+          "firstChunk": 3,
+          "lastChunk": 3,
+          "newline": true,
+          "at": "2026-09-07T04:10:09.881Z",
+          "value": {
+            "type": "system",
+            "subtype": "unknown",
+            "session_id": "ref-3",
+            "uuid": "ref-6",
+            "omittedFieldCount": 2
+          }
+        },
+        {
+          "index": 4,
+          "firstChunk": 4,
+          "lastChunk": 4,
+          "newline": true,
+          "at": "2026-09-07T04:10:11.396Z",
+          "value": {
+            "type": "system",
+            "subtype": "unknown",
+            "session_id": "ref-3",
+            "uuid": "ref-7",
+            "omittedFieldCount": 2
+          }
+        },
+        {
+          "index": 5,
+          "firstChunk": 5,
+          "lastChunk": 5,
+          "newline": true,
+          "at": "2026-09-07T04:10:12.149Z",
+          "value": {
+            "type": "system",
+            "subtype": "unknown",
+            "session_id": "ref-3",
+            "uuid": "ref-8",
+            "omittedFieldCount": 2
+          }
+        },
+        {
+          "index": 6,
+          "firstChunk": 6,
+          "lastChunk": 6,
+          "newline": true,
+          "at": "2026-09-07T04:10:12.152Z",
+          "value": {
+            "type": "assistant",
+            "message": {
+              "model": "claude-fable-5-1",
+              "id": "ref-11",
+              "type": "message",
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "thinking",
+                  "omitted": "reasoning"
+                }
+              ],
+              "usage": {
+                "input_tokens": 2,
+                "cache_creation_input_tokens": 14852,
+                "cache_read_input_tokens": 10477,
+                "cache_creation": {
+                  "omittedFieldCount": 2
+                },
+                "output_tokens": 4,
+                "omittedFieldCount": 2
+              },
+              "diagnostics": null,
+              "omittedFieldCount": 3
+            },
+            "session_id": "ref-3",
+            "uuid": "ref-9",
+            "request_id": "ref-10"
+          }
+        },
+        {
+          "index": 7,
+          "firstChunk": 7,
+          "lastChunk": 7,
+          "newline": true,
+          "at": "2026-09-07T04:10:13.071Z",
+          "value": {
+            "type": "assistant",
+            "message": {
+              "model": "claude-fable-5-1",
+              "id": "ref-11",
+              "type": "message",
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "[redacted]"
+                }
+              ],
+              "usage": {
+                "input_tokens": 2,
+                "cache_creation_input_tokens": 14852,
+                "cache_read_input_tokens": 10477,
+                "cache_creation": {
+                  "omittedFieldCount": 2
+                },
+                "output_tokens": 4,
+                "omittedFieldCount": 2
+              },
+              "diagnostics": null,
+              "omittedFieldCount": 3
+            },
+            "session_id": "ref-3",
+            "uuid": "ref-13",
+            "request_id": "ref-10"
+          }
+        },
+        {
+          "index": 8,
+          "firstChunk": 8,
+          "lastChunk": 8,
+          "newline": true,
+          "at": "2026-09-07T04:10:13.076Z",
+          "value": {
+            "type": "assistant",
+            "message": {
+              "model": "claude-fable-5-1",
+              "id": "ref-11",
+              "type": "message",
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "tool_use",
+                  "id": "ref-15",
+                  "name": "Bash",
+                  "input": {
+                    "command": "bun --version\ncat sentinel-one.txt",
+                    "omittedFieldCount": 1
+                  },
+                  "omittedFieldCount": 1
+                }
+              ],
+              "usage": {
+                "input_tokens": 2,
+                "cache_creation_input_tokens": 14852,
+                "cache_read_input_tokens": 10477,
+                "cache_creation": {
+                  "omittedFieldCount": 2
+                },
+                "output_tokens": 4,
+                "omittedFieldCount": 2
+              },
+              "diagnostics": null,
+              "omittedFieldCount": 3
+            },
+            "session_id": "ref-3",
+            "uuid": "ref-14",
+            "request_id": "ref-10"
+          }
+        },
+        {
+          "index": 9,
+          "firstChunk": 9,
+          "lastChunk": 9,
+          "newline": true,
+          "at": "2026-09-07T04:10:13.079Z",
+          "value": {
+            "type": "system",
+            "subtype": "unknown",
+            "uuid": "ref-16",
+            "session_id": "ref-3",
+            "omittedFieldCount": 3
+          }
+        },
+        {
+          "index": 10,
+          "firstChunk": 10,
+          "lastChunk": 10,
+          "newline": true,
+          "at": "2026-09-07T04:10:13.080Z",
+          "value": {
+            "type": "system",
+            "subtype": "unknown",
+            "uuid": "ref-17",
+            "session_id": "ref-3",
+            "omittedFieldCount": 3
+          }
+        },
+        {
+          "index": 11,
+          "firstChunk": 11,
+          "lastChunk": 11,
+          "newline": true,
+          "at": "2026-09-07T04:10:13.082Z",
+          "value": {
+            "uuid": "ref-18",
+            "session_id": "ref-3",
+            "type": "unknown",
+            "shape": {
+              "object": [
+                [
+                  "type",
+                  "string"
+                ],
+                [
+                  "uuid",
+                  "string"
+                ],
+                [
+                  "session_id",
+                  "string"
+                ]
+              ],
+              "omittedKeys": 1
+            }
+          }
+        },
+        {
+          "index": 12,
+          "firstChunk": 12,
+          "lastChunk": 12,
+          "newline": true,
+          "at": "2026-09-07T04:10:13.097Z",
+          "value": {
+            "type": "system",
+            "subtype": "unknown",
+            "output": "[redacted]",
+            "stdout": "[redacted]",
+            "stderr": "[redacted]",
+            "uuid": "ref-19",
+            "session_id": "ref-3",
+            "omittedFieldCount": 4
+          }
+        },
+        {
+          "index": 13,
+          "firstChunk": 13,
+          "lastChunk": 13,
+          "newline": true,
+          "at": "2026-09-07T04:10:13.135Z",
+          "value": {
+            "type": "system",
+            "subtype": "unknown",
+            "output": "bun --version",
+            "stdout": "bun --version",
+            "stderr": "[redacted]",
+            "uuid": "ref-20",
+            "session_id": "ref-3",
+            "omittedFieldCount": 4
+          }
+        },
+        {
+          "index": 14,
+          "firstChunk": 14,
+          "lastChunk": 14,
+          "newline": true,
+          "at": "2026-09-07T04:10:13.680Z",
+          "value": {
+            "type": "user",
+            "message": {
+              "role": "user",
+              "content": [
+                {
+                  "tool_use_id": "ref-15",
+                  "type": "tool_result",
+                  "content": "1.3.14\nS1_FIRST_SENTINEL_29",
+                  "is_error": false
+                }
+              ]
+            },
+            "session_id": "ref-3",
+            "uuid": "ref-21",
+            "omittedFieldCount": 1
+          }
+        },
+        {
+          "index": 15,
+          "firstChunk": 15,
+          "lastChunk": 15,
+          "newline": true,
+          "at": "2026-09-07T04:10:18.094Z",
+          "value": {
+            "type": "assistant",
+            "message": {
+              "model": "claude-fable-5-1",
+              "id": "ref-24",
+              "type": "message",
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "1.3.14\nS1_FIRST_SENTINEL_29\nS1_FIRST_DONE"
+                }
+              ],
+              "usage": {
+                "input_tokens": 56,
+                "cache_creation_input_tokens": 321,
+                "cache_read_input_tokens": 25329,
+                "cache_creation": {
+                  "omittedFieldCount": 2
+                },
+                "output_tokens": 1,
+                "omittedFieldCount": 2
+              },
+              "diagnostics": null,
+              "omittedFieldCount": 3
+            },
+            "session_id": "ref-3",
+            "uuid": "ref-22",
+            "request_id": "ref-23"
+          }
+        },
+        {
+          "index": 16,
+          "firstChunk": 16,
+          "lastChunk": 16,
+          "newline": true,
+          "at": "2026-09-07T04:10:18.118Z",
+          "value": {
+            "duration_api_ms": 11897,
+            "stop_reason": "end_turn",
+            "session_id": "ref-3",
+            "usage": {
+              "input_tokens": 58,
+              "cache_creation_input_tokens": 15173,
+              "cache_read_input_tokens": 35806,
+              "output_tokens": 401,
+              "cache_creation": {
+                "omittedFieldCount": 2
+              },
+              "omittedFieldCount": 6
+            },
+            "modelUsage": {
+              "omittedFieldCount": 1
+            },
+            "terminal_reason": "unknown",
+            "is_error": false,
+            "num_turns": 2,
+            "subtype": "success",
+            "result": "1.3.14\nS1_FIRST_SENTINEL_29\nS1_FIRST_DONE",
+            "type": "result",
+            "duration_ms": 12525,
+            "uuid": "ref-25",
+            "omittedFieldCount": 9
+          }
+        }
+      ]
+    },
+    "normalized": [
+      {
+        "kind": "session_start",
+        "timestamp": 1788754204294
+      },
+      {
+        "kind": "native_status",
+        "timestamp": 1788754204523,
+        "correlation": "unknown",
+        "unattributedReason": "unrecognized-event",
+        "nativeSessionId": "ref-3",
+        "raw": {
+          "type": "system",
+          "subtype": "unknown",
+          "uuid": "ref-2",
+          "session_id": "ref-3",
+          "omittedFieldCount": 3
+        }
+      },
+      {
+        "kind": "native_status",
+        "timestamp": 1788754205019,
+        "correlation": "unknown",
+        "unattributedReason": "unrecognized-event",
+        "nativeSessionId": "ref-3",
+        "raw": {
+          "type": "system",
+          "subtype": "unknown",
+          "output": "[redacted]",
+          "stdout": "[redacted]",
+          "stderr": "[redacted]",
+          "uuid": "ref-4",
+          "session_id": "ref-3",
+          "omittedFieldCount": 4
+        }
+      },
+      {
+        "kind": "native_status",
+        "timestamp": 1788754205606,
+        "correlation": "unknown",
+        "unattributedReason": "unrecognized-event",
+        "nativeSessionId": "ref-3",
+        "raw": {
+          "type": "system",
+          "subtype": "init",
+          "session_id": "ref-3",
+          "tools": [
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]"
+          ],
+          "model": "claude-fable-5-1",
+          "capabilities": [
+            "[redacted]",
+            "[redacted]",
+            "[redacted]"
+          ],
+          "uuid": "ref-5",
+          "omittedFieldCount": 17
+        }
+      },
+      {
+        "kind": "native_status",
+        "timestamp": 1788754209882,
+        "correlation": "unknown",
+        "unattributedReason": "unrecognized-event",
+        "nativeSessionId": "ref-3",
+        "raw": {
+          "type": "system",
+          "subtype": "unknown",
+          "session_id": "ref-3",
+          "uuid": "ref-6",
+          "omittedFieldCount": 2
+        }
+      },
+      {
+        "kind": "native_status",
+        "timestamp": 1788754211396,
+        "correlation": "unknown",
+        "unattributedReason": "unrecognized-event",
+        "nativeSessionId": "ref-3",
+        "raw": {
+          "type": "system",
+          "subtype": "unknown",
+          "session_id": "ref-3",
+          "uuid": "ref-7",
+          "omittedFieldCount": 2
+        }
+      },
+      {
+        "kind": "native_status",
+        "timestamp": 1788754212149,
+        "correlation": "unknown",
+        "unattributedReason": "unrecognized-event",
+        "nativeSessionId": "ref-3",
+        "raw": {
+          "type": "system",
+          "subtype": "unknown",
+          "session_id": "ref-3",
+          "uuid": "ref-8",
+          "omittedFieldCount": 2
+        }
+      },
+      {
+        "nativeSessionId": "ref-3",
+        "messageId": "ref-11",
+        "admissionId": "ref-12",
+        "kind": "thinking",
+        "omitted": "reasoning"
+      },
+      {
+        "nativeSessionId": "ref-3",
+        "correlation": "ordered-stream",
+        "kind": "text",
+        "timestamp": 1788754213071,
+        "text": "[redacted]",
+        "raw": {
+          "type": "text",
+          "text": "[redacted]"
+        },
+        "messageId": "ref-11",
+        "admissionId": "ref-12"
+      },
+      {
+        "nativeSessionId": "ref-3",
+        "correlation": "ordered-stream",
+        "kind": "tool_use",
+        "timestamp": 1788754213076,
+        "callId": "ref-15",
+        "itemId": "ref-15",
+        "toolName": "Bash",
+        "toolInput": {
+          "command": "bun --version\ncat sentinel-one.txt",
+          "omittedFieldCount": 1
+        },
+        "raw": {
+          "type": "tool_use",
+          "id": "ref-15",
+          "name": "Bash",
+          "input": {
+            "command": "bun --version\ncat sentinel-one.txt",
+            "omittedFieldCount": 1
+          },
+          "omittedFieldCount": 1
+        },
+        "messageId": "ref-11",
+        "admissionId": "ref-12"
+      },
+      {
+        "kind": "native_status",
+        "timestamp": 1788754213080,
+        "correlation": "unknown",
+        "unattributedReason": "unrecognized-event",
+        "nativeSessionId": "ref-3",
+        "raw": {
+          "type": "system",
+          "subtype": "unknown",
+          "uuid": "ref-16",
+          "session_id": "ref-3",
+          "omittedFieldCount": 3
+        }
+      },
+      {
+        "kind": "native_status",
+        "timestamp": 1788754213080,
+        "correlation": "unknown",
+        "unattributedReason": "unrecognized-event",
+        "nativeSessionId": "ref-3",
+        "raw": {
+          "type": "system",
+          "subtype": "unknown",
+          "uuid": "ref-17",
+          "session_id": "ref-3",
+          "omittedFieldCount": 3
+        }
+      },
+      {
+        "kind": "native_status",
+        "timestamp": 1788754213082,
+        "correlation": "unknown",
+        "unattributedReason": "unrecognized-event",
+        "nativeSessionId": "ref-3",
+        "raw": {
+          "uuid": "ref-18",
+          "session_id": "ref-3",
+          "type": "unknown",
+          "shape": {
+            "object": [
+              [
+                "type",
+                "string"
+              ],
+              [
+                "uuid",
+                "string"
+              ],
+              [
+                "session_id",
+                "string"
+              ]
+            ],
+            "omittedKeys": 1
+          }
+        }
+      },
+      {
+        "kind": "native_status",
+        "timestamp": 1788754213098,
+        "correlation": "unknown",
+        "unattributedReason": "unrecognized-event",
+        "nativeSessionId": "ref-3",
+        "raw": {
+          "type": "system",
+          "subtype": "unknown",
+          "output": "[redacted]",
+          "stdout": "[redacted]",
+          "stderr": "[redacted]",
+          "uuid": "ref-19",
+          "session_id": "ref-3",
+          "omittedFieldCount": 4
+        }
+      },
+      {
+        "kind": "native_status",
+        "timestamp": 1788754213135,
+        "correlation": "unknown",
+        "unattributedReason": "unrecognized-event",
+        "nativeSessionId": "ref-3",
+        "raw": {
+          "type": "system",
+          "subtype": "unknown",
+          "output": "bun --version",
+          "stdout": "bun --version",
+          "stderr": "[redacted]",
+          "uuid": "ref-20",
+          "session_id": "ref-3",
+          "omittedFieldCount": 4
+        }
+      },
+      {
+        "nativeSessionId": "ref-3",
+        "correlation": "ordered-stream",
+        "kind": "tool_result",
+        "timestamp": 1788754213680,
+        "callId": "ref-15",
+        "toolOutput": "1.3.14\nS1_FIRST_SENTINEL_29",
+        "toolError": false,
+        "raw": {
+          "tool_use_id": "ref-15",
+          "type": "tool_result",
+          "content": "1.3.14\nS1_FIRST_SENTINEL_29",
+          "is_error": false
+        },
+        "admissionId": "ref-12"
+      },
+      {
+        "nativeSessionId": "ref-3",
+        "correlation": "ordered-stream",
+        "kind": "text",
+        "timestamp": 1788754218094,
+        "text": "1.3.14\nS1_FIRST_SENTINEL_29\nS1_FIRST_DONE",
+        "raw": {
+          "type": "text",
+          "text": "1.3.14\nS1_FIRST_SENTINEL_29\nS1_FIRST_DONE"
+        },
+        "messageId": "ref-24",
+        "admissionId": "ref-12"
+      },
+      {
+        "nativeSessionId": "ref-3",
+        "correlation": "ordered-stream",
+        "kind": "result",
+        "timestamp": 1788754218119,
+        "text": "1.3.14\nS1_FIRST_SENTINEL_29\nS1_FIRST_DONE",
+        "externalSessionId": "ref-3",
+        "tokens": {
+          "input": 58,
+          "output": 401
+        },
+        "raw": {
+          "duration_api_ms": 11897,
+          "stop_reason": "end_turn",
+          "session_id": "ref-3",
+          "usage": {
+            "input_tokens": 58,
+            "cache_creation_input_tokens": 15173,
+            "cache_read_input_tokens": 35806,
+            "output_tokens": 401,
+            "cache_creation": {
+              "omittedFieldCount": 2
+            },
+            "omittedFieldCount": 6
+          },
+          "modelUsage": {
+            "omittedFieldCount": 1
+          },
+          "terminal_reason": "unknown",
+          "is_error": false,
+          "num_turns": 2,
+          "subtype": "success",
+          "result": "1.3.14\nS1_FIRST_SENTINEL_29\nS1_FIRST_DONE",
+          "type": "result",
+          "duration_ms": 12525,
+          "uuid": "ref-25",
+          "omittedFieldCount": 9
+        },
+        "nativeOutcome": "completed",
+        "terminal": {
+          "type": "result",
+          "eventId": "ref-25",
+          "subtype": "success",
+          "reason": "unknown"
+        },
+        "admissionId": "ref-12"
+      }
+    ]
+  }
+}

@@ -1,0 +1,99 @@
+{
+  "format": 4,
+  "evidenceSource": "native-cli",
+  "runId": "s1-continuation-20260907T041000Z",
+  "path": "claude",
+  "startedAt": "2026-09-07T04:10:04.291Z",
+  "sourceRevision": "4336603026fa64a15dbea5e0b8c61a12d6e14657",
+  "sourceHashes": {
+    "src/claude-code-session.ts": "fa528a6b2ac45807e578cef27640cd3439403a4db4af2de2ab58ce7f2a462d03",
+    "src/codex-session.ts": "cfccba00aaaa4e3731ca90a679a994b4055a233480d08c317e0feebf1da1cefe",
+    "src/harness-session.ts": "f6486c3a6fe8c6ae092d8bdd264bd38f17be6ee313dc97bf083dfdca67939f93",
+    "src/turn-state.ts": "9a282c4be33e703594460dfc0c8058215e9fd4fa9dc6aa7623fa549b0f970c42",
+    "src/retained-evidence.ts": "7082cde4c70bf08ed93d99e1950a567fc281edb1c5976a3b59d48ea28f1cfa65",
+    "scripts/s0/continuation-plan.ts": "68cb93c20871c1dbe837b994d965b43b086e6fe9b038fb7646c978a83d54c3fd",
+    "scripts/s0/continuation.ts": "aa0bc2e92ed9a0dbc9ffcd13a698f1e91715fbbba0b8407d07644d7f3a88c985",
+    "scripts/s0/continuation-record.ts": "4a856a9df7b48a25a836c3ddd83e6270b4dba00a553567b29d9c7a39cd88cf1b",
+    "scripts/s0/sanitize.ts": "bb192917616fa5a6fe5c4ef3739f4f2f88c358d053a2848b28c45e7e780b6e73",
+    "scripts/s0/observation.ts": "aecb2212bae6140935f747fefdcd0938429b85d520355564f56e8c0b9084a9e3",
+    "scripts/s0/lifecycle.ts": "a8ffa4f796965d8c0111aeabc0a3da0b93db7eccd348adde276fafc3017b1fc0",
+    "package.json": "34ae66e1af9a6e4bf4210868ebd7f0b45c8277106c9033a2eb949668f0e0ad13"
+  },
+  "package": {
+    "name": "@inixiative/agent-session",
+    "version": "0.1.0",
+    "source": "sibling checkout, not installed in Foundry"
+  },
+  "requested": {
+    "model": "claude-fable-5-1",
+    "effort": "max"
+  },
+  "versions": {
+    "bun": {
+      "command": {
+        "executable": "bun",
+        "args": [
+          "--version"
+        ]
+      },
+      "exitCode": 0,
+      "value": "1.3.14"
+    },
+    "cli": {
+      "command": {
+        "executable": "claude",
+        "args": [
+          "--version"
+        ]
+      },
+      "exitCode": 0,
+      "value": "2.1.258 (Claude Code)"
+    }
+  },
+  "tasks": [
+    {
+      "file": "sentinel-one.txt",
+      "content": "S1_FIRST_SENTINEL_29\n",
+      "marker": "S1_FIRST_DONE",
+      "prompt": "Disposable continuation probe. Use a shell tool to run exactly: bun --version && cat sentinel-one.txt . Read only this controlled directory. Do not edit files, inspect other directories, use agents, or do other work. Then respond briefly with S1_FIRST_DONE and the two observed outputs."
+    },
+    {
+      "file": "sentinel-two.txt",
+      "content": "S1_SECOND_SENTINEL_83\n",
+      "marker": "S1_SECOND_DONE",
+      "prompt": "Disposable continuation probe. Use a shell tool to run exactly: bun --version && cat sentinel-two.txt . Read only this controlled directory. Do not edit files, inspect other directories, use agents, or do other work. Then respond briefly with S1_SECOND_DONE and the two observed outputs."
+    }
+  ],
+  "before": {
+    "alias": "<controlled-sample>",
+    "directoryEntriesHash": "7bcd5e1672b3f7b7a93d528fb7b8b71200630b70c835132af02cb4766376a41d",
+    "manifestHash": "1c1e7c7b9c4758792c24efeb5a15b686df50c14c7e496ca8a0671629f6b034f6",
+    "entryCount": 2,
+    "files": [
+      {
+        "file": "sentinel-one.txt",
+        "hash": "48cf87e46c28f0fc4816aadc8f4fb58c340fd99337a51da620c5dd4cd11c4be2"
+      },
+      {
+        "file": "sentinel-two.txt",
+        "hash": "4b11f06aa767807f7e7feb16c0102128882cd3db31752133c58a9deed0b4a7d0"
+      }
+    ],
+    "unchanged": true
+  },
+  "limits": {
+    "processes": 1,
+    "admittedSends": 2,
+    "startDeadlineMs": 15000,
+    "sendDeadlineMs": 180000,
+    "settleMs": 50,
+    "retries": 0,
+    "resume": false,
+    "fork": false,
+    "maxTurnsClaude": 8,
+    "admissionDeadline": "sendDeadlineMs is one monotonic deadline per admission covering local settlement, the current admission's native outcome and trailing frames; settleMs only lets trailing frames land and is capped by the same deadline.",
+    "afterDeadline": "Admission stops permanently with native outcome unknown; ownership is retained for reconciliation/cleanup on the same late terminal or owned process exit. Never resume, re-send, fork or reset identity."
+  },
+  "selectedModelEffort": "Only emitted native configuration frames constitute evidence; requests are not acknowledgments",
+  "status": "reserved-before-start"
+}

@@ -1,0 +1,810 @@
+{
+  "format": 2,
+  "runId": "2026-09-07-correction-1",
+  "path": "claude",
+  "startedAt": "2026-09-07T01:00:46.578Z",
+  "sourceRevision": "4336603026fa64a15dbea5e0b8c61a12d6e14657",
+  "sourceHashes": {
+    "src/claude-code-session.ts": "3f28ca748a522dd3ed854c0ad8eb60679d7cc33e620a6b5995d7f733677de406",
+    "src/codex-session.ts": "feb1e41d8a25baace4bfcd559de2cd77bd6517ed6ec60398b424363e0e7be7f6",
+    "src/harness-session.ts": "7861a2031eb56f5250433a49bc828c853bd685efa3db61354140e10b2ec552b2",
+    "scripts/s0/sanitize.ts": "87dc254001e397e5338f3f6acb2ae2067e04f12a951e490419624d0753d88037",
+    "scripts/s0/observation.ts": "aecb2212bae6140935f747fefdcd0938429b85d520355564f56e8c0b9084a9e3",
+    "scripts/s0/record.ts": "414aa3c79061b478557bca9c3c8d23f5bf57decdf1a8d3044d0ed7dac23b45a7"
+  },
+  "capturePolicy": {
+    "framing": "exact starting/ending observed chunk; original bytes not persisted",
+    "identities": "explicit ID fields pseudonymized even on unknown/analysis items; absence of an allowed field is wire absence, not type-based sanitizer omission",
+    "payload": "typed numeric fields only; analysis/reasoning bodies omitted independently of type/kind"
+  },
+  "package": {
+    "name": "@inixiative/agent-session",
+    "version": "0.1.0",
+    "source": "sibling checkout; not installed in Foundry"
+  },
+  "versions": {
+    "bun": {
+      "command": [
+        "bun",
+        "--version"
+      ],
+      "exitCode": 0,
+      "value": "1.3.14"
+    },
+    "cli": {
+      "command": [
+        "claude",
+        "--version"
+      ],
+      "exitCode": 0,
+      "value": "2.1.258 (Claude Code)"
+    }
+  },
+  "requested": {
+    "model": "claude-fable-5-1",
+    "effort": "max"
+  },
+  "accountIdentity": "unknown",
+  "capacity": "unknown",
+  "prompt": "Disposable protocol probe. Use a shell tool to run exactly: bun --version && cat sentinel.txt . Read only this controlled directory. Do not edit files, inspect other directories, use agents, or do other work. Then respond briefly with S0_PROBE_OK and the two observed outputs.",
+  "sample": {
+    "alias": "<controlled-sample>",
+    "sentinel": "S0_SENTINEL_OK\n",
+    "beforeHash": "9b07a0ec560621125b639338a1e874ae45347d72c1b984b1e2911e5f1f766967",
+    "afterHash": "9b07a0ec560621125b639338a1e874ae45347d72c1b984b1e2911e5f1f766967",
+    "filesUnchanged": true
+  },
+  "lifecycle": [
+    {
+      "kind": "spawned",
+      "at": "2026-09-07T01:00:46.605Z",
+      "pid": 31870,
+      "executable": "claude",
+      "args": [
+        "--print",
+        "--verbose",
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+        "--model",
+        "claude-fable-5-1",
+        "--effort",
+        "max",
+        "--max-turns",
+        "8",
+        "--permission-mode",
+        "bypassPermissions",
+        "--include-hook-events"
+      ]
+    },
+    {
+      "kind": "handshake-returned",
+      "at": "2026-09-07T01:00:46.606Z"
+    },
+    {
+      "kind": "send-admitted",
+      "at": "2026-09-07T01:00:46.607Z"
+    },
+    {
+      "kind": "send-returned",
+      "at": "2026-09-07T01:00:59.592Z"
+    },
+    {
+      "kind": "cleanup-outcome-established",
+      "at": "2026-09-07T01:00:59.593Z",
+      "nativeTerminal": "success",
+      "exited": false,
+      "noTurn": false
+    },
+    {
+      "kind": "stdin-end-requested",
+      "at": "2026-09-07T01:00:59.593Z"
+    },
+    {
+      "kind": "owned-process-kill-requested",
+      "at": "2026-09-07T01:00:59.594Z"
+    },
+    {
+      "kind": "process-exited",
+      "at": "2026-09-07T01:01:00.446Z",
+      "code": 143
+    }
+  ],
+  "observerErrors": [],
+  "nativeOutcome": "success",
+  "localSend": "resolved",
+  "capture": "terminal-recorded",
+  "result": {
+    "content": "S0_SENTINEL_OK\nS0_PROBE_OK\n1.3.14",
+    "tokens": {
+      "input": 58,
+      "output": 296
+    },
+    "externalSessionId": "ref-2"
+  },
+  "processExitCode": 143,
+  "processExited": true,
+  "finishedAt": "2026-09-07T01:01:00.547Z",
+  "artifact": {
+    "externalSessionId": "ref-2",
+    "omittedFieldCount": 7
+  },
+  "stdout": {
+    "chunks": [
+      {
+        "index": 0,
+        "bytes": 253,
+        "at": "2026-09-07T01:00:46.865Z"
+      },
+      {
+        "index": 1,
+        "bytes": 9508,
+        "at": "2026-09-07T01:00:47.361Z"
+      },
+      {
+        "index": 2,
+        "bytes": 7837,
+        "at": "2026-09-07T01:00:47.841Z"
+      },
+      {
+        "index": 3,
+        "bytes": 194,
+        "at": "2026-09-07T01:00:52.682Z"
+      },
+      {
+        "index": 4,
+        "bytes": 196,
+        "at": "2026-09-07T01:00:54.213Z"
+      },
+      {
+        "index": 5,
+        "bytes": 196,
+        "at": "2026-09-07T01:00:54.256Z"
+      },
+      {
+        "index": 6,
+        "bytes": 2103,
+        "at": "2026-09-07T01:00:54.264Z"
+      },
+      {
+        "index": 7,
+        "bytes": 766,
+        "at": "2026-09-07T01:00:54.316Z"
+      },
+      {
+        "index": 8,
+        "bytes": 926,
+        "at": "2026-09-07T01:00:55.788Z"
+      },
+      {
+        "index": 9,
+        "bytes": 246,
+        "at": "2026-09-07T01:00:55.791Z"
+      },
+      {
+        "index": 10,
+        "bytes": 246,
+        "at": "2026-09-07T01:00:55.791Z"
+      },
+      {
+        "index": 11,
+        "bytes": 514,
+        "at": "2026-09-07T01:00:55.794Z"
+      },
+      {
+        "index": 12,
+        "bytes": 317,
+        "at": "2026-09-07T01:00:55.810Z"
+      },
+      {
+        "index": 13,
+        "bytes": 1009,
+        "at": "2026-09-07T01:00:55.845Z"
+      },
+      {
+        "index": 14,
+        "bytes": 466,
+        "at": "2026-09-07T01:00:56.170Z"
+      },
+      {
+        "index": 15,
+        "bytes": 815,
+        "at": "2026-09-07T01:00:59.542Z"
+      },
+      {
+        "index": 16,
+        "bytes": 1837,
+        "at": "2026-09-07T01:00:59.590Z"
+      }
+    ],
+    "frames": [
+      {
+        "index": 0,
+        "firstChunk": 0,
+        "lastChunk": 0,
+        "newline": true,
+        "at": "2026-09-07T01:00:46.865Z",
+        "value": {
+          "type": "system",
+          "subtype": "unknown",
+          "uuid": "ref-1",
+          "session_id": "ref-2",
+          "omittedFieldCount": 3
+        }
+      },
+      {
+        "index": 1,
+        "firstChunk": 1,
+        "lastChunk": 1,
+        "newline": true,
+        "at": "2026-09-07T01:00:47.362Z",
+        "value": {
+          "type": "system",
+          "subtype": "unknown",
+          "output": "[redacted]",
+          "stdout": "[redacted]",
+          "stderr": "[redacted]",
+          "uuid": "ref-3",
+          "session_id": "ref-2",
+          "omittedFieldCount": 4
+        }
+      },
+      {
+        "index": 2,
+        "firstChunk": 2,
+        "lastChunk": 2,
+        "newline": true,
+        "at": "2026-09-07T01:00:47.841Z",
+        "value": {
+          "type": "system",
+          "subtype": "init",
+          "session_id": "ref-2",
+          "tools": [
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]"
+          ],
+          "model": "claude-fable-5-1",
+          "capabilities": [
+            "[redacted]",
+            "[redacted]",
+            "[redacted]"
+          ],
+          "uuid": "ref-4",
+          "omittedFieldCount": 17
+        }
+      },
+      {
+        "index": 3,
+        "firstChunk": 3,
+        "lastChunk": 3,
+        "newline": true,
+        "at": "2026-09-07T01:00:52.682Z",
+        "value": {
+          "type": "system",
+          "subtype": "unknown",
+          "session_id": "ref-2",
+          "uuid": "ref-5",
+          "omittedFieldCount": 2
+        }
+      },
+      {
+        "index": 4,
+        "firstChunk": 4,
+        "lastChunk": 4,
+        "newline": true,
+        "at": "2026-09-07T01:00:54.213Z",
+        "value": {
+          "type": "system",
+          "subtype": "unknown",
+          "session_id": "ref-2",
+          "uuid": "ref-6",
+          "omittedFieldCount": 2
+        }
+      },
+      {
+        "index": 5,
+        "firstChunk": 5,
+        "lastChunk": 5,
+        "newline": true,
+        "at": "2026-09-07T01:00:54.256Z",
+        "value": {
+          "type": "system",
+          "subtype": "unknown",
+          "session_id": "ref-2",
+          "uuid": "ref-7",
+          "omittedFieldCount": 2
+        }
+      },
+      {
+        "index": 6,
+        "firstChunk": 6,
+        "lastChunk": 6,
+        "newline": true,
+        "at": "2026-09-07T01:00:54.264Z",
+        "value": {
+          "type": "assistant",
+          "message": {
+            "model": "claude-fable-5-1",
+            "id": "ref-10",
+            "type": "message",
+            "role": "assistant",
+            "content": [
+              {
+                "type": "thinking",
+                "omitted": "reasoning"
+              }
+            ],
+            "usage": {
+              "input_tokens": 2,
+              "cache_creation_input_tokens": 14849,
+              "cache_read_input_tokens": 10477,
+              "cache_creation": {
+                "omittedFieldCount": 2
+              },
+              "output_tokens": 4,
+              "omittedFieldCount": 2
+            },
+            "omittedFieldCount": 4
+          },
+          "session_id": "ref-2",
+          "uuid": "ref-8",
+          "request_id": "ref-9"
+        }
+      },
+      {
+        "index": 7,
+        "firstChunk": 7,
+        "lastChunk": 7,
+        "newline": true,
+        "at": "2026-09-07T01:00:54.316Z",
+        "value": {
+          "type": "assistant",
+          "message": {
+            "model": "claude-fable-5-1",
+            "id": "ref-10",
+            "type": "message",
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "[redacted]"
+              }
+            ],
+            "usage": {
+              "input_tokens": 2,
+              "cache_creation_input_tokens": 14849,
+              "cache_read_input_tokens": 10477,
+              "cache_creation": {
+                "omittedFieldCount": 2
+              },
+              "output_tokens": 4,
+              "omittedFieldCount": 2
+            },
+            "omittedFieldCount": 4
+          },
+          "session_id": "ref-2",
+          "uuid": "ref-11",
+          "request_id": "ref-9"
+        }
+      },
+      {
+        "index": 8,
+        "firstChunk": 8,
+        "lastChunk": 8,
+        "newline": true,
+        "at": "2026-09-07T01:00:55.789Z",
+        "value": {
+          "type": "assistant",
+          "message": {
+            "model": "claude-fable-5-1",
+            "id": "ref-10",
+            "type": "message",
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "ref-13",
+                "name": "Bash",
+                "input": {
+                  "command": "bun --version\ncat sentinel.txt",
+                  "omittedFieldCount": 1
+                },
+                "omittedFieldCount": 1
+              }
+            ],
+            "usage": {
+              "input_tokens": 2,
+              "cache_creation_input_tokens": 14849,
+              "cache_read_input_tokens": 10477,
+              "cache_creation": {
+                "omittedFieldCount": 2
+              },
+              "output_tokens": 4,
+              "omittedFieldCount": 2
+            },
+            "omittedFieldCount": 4
+          },
+          "session_id": "ref-2",
+          "uuid": "ref-12",
+          "request_id": "ref-9"
+        }
+      },
+      {
+        "index": 9,
+        "firstChunk": 9,
+        "lastChunk": 9,
+        "newline": true,
+        "at": "2026-09-07T01:00:55.791Z",
+        "value": {
+          "type": "system",
+          "subtype": "unknown",
+          "uuid": "ref-14",
+          "session_id": "ref-2",
+          "omittedFieldCount": 3
+        }
+      },
+      {
+        "index": 10,
+        "firstChunk": 10,
+        "lastChunk": 10,
+        "newline": true,
+        "at": "2026-09-07T01:00:55.791Z",
+        "value": {
+          "type": "system",
+          "subtype": "unknown",
+          "uuid": "ref-15",
+          "session_id": "ref-2",
+          "omittedFieldCount": 3
+        }
+      },
+      {
+        "index": 11,
+        "firstChunk": 11,
+        "lastChunk": 11,
+        "newline": true,
+        "at": "2026-09-07T01:00:55.794Z",
+        "value": {
+          "uuid": "ref-16",
+          "session_id": "ref-2",
+          "type": "unknown",
+          "shape": {
+            "object": [
+              [
+                "type",
+                "string"
+              ],
+              [
+                "uuid",
+                "string"
+              ],
+              [
+                "session_id",
+                "string"
+              ]
+            ],
+            "omittedKeys": 1
+          }
+        }
+      },
+      {
+        "index": 12,
+        "firstChunk": 12,
+        "lastChunk": 12,
+        "newline": true,
+        "at": "2026-09-07T01:00:55.810Z",
+        "value": {
+          "type": "system",
+          "subtype": "unknown",
+          "output": "[redacted]",
+          "stdout": "[redacted]",
+          "stderr": "[redacted]",
+          "uuid": "ref-17",
+          "session_id": "ref-2",
+          "omittedFieldCount": 4
+        }
+      },
+      {
+        "index": 13,
+        "firstChunk": 13,
+        "lastChunk": 13,
+        "newline": true,
+        "at": "2026-09-07T01:00:55.845Z",
+        "value": {
+          "type": "system",
+          "subtype": "unknown",
+          "output": "bun --version",
+          "stdout": "bun --version",
+          "stderr": "[redacted]",
+          "uuid": "ref-18",
+          "session_id": "ref-2",
+          "omittedFieldCount": 4
+        }
+      },
+      {
+        "index": 14,
+        "firstChunk": 14,
+        "lastChunk": 14,
+        "newline": true,
+        "at": "2026-09-07T01:00:56.170Z",
+        "value": {
+          "type": "user",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "tool_use_id": "ref-13",
+                "type": "tool_result",
+                "content": "S0_SENTINEL_OK\n1.3.14",
+                "is_error": false
+              }
+            ]
+          },
+          "session_id": "ref-2",
+          "uuid": "ref-19",
+          "omittedFieldCount": 1
+        }
+      },
+      {
+        "index": 15,
+        "firstChunk": 15,
+        "lastChunk": 15,
+        "newline": true,
+        "at": "2026-09-07T01:00:59.542Z",
+        "value": {
+          "type": "assistant",
+          "message": {
+            "model": "claude-fable-5-1",
+            "id": "ref-22",
+            "type": "message",
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "S0_SENTINEL_OK\nS0_PROBE_OK\n1.3.14"
+              }
+            ],
+            "usage": {
+              "input_tokens": 56,
+              "cache_creation_input_tokens": 274,
+              "cache_read_input_tokens": 25326,
+              "cache_creation": {
+                "omittedFieldCount": 2
+              },
+              "output_tokens": 45,
+              "omittedFieldCount": 2
+            },
+            "omittedFieldCount": 4
+          },
+          "session_id": "ref-2",
+          "uuid": "ref-20",
+          "request_id": "ref-21"
+        }
+      },
+      {
+        "index": 16,
+        "firstChunk": 16,
+        "lastChunk": 16,
+        "newline": true,
+        "at": "2026-09-07T01:00:59.591Z",
+        "value": {
+          "duration_api_ms": 11357,
+          "stop_reason": "end_turn",
+          "session_id": "ref-2",
+          "usage": {
+            "input_tokens": 58,
+            "cache_creation_input_tokens": 15123,
+            "cache_read_input_tokens": 35803,
+            "output_tokens": 296,
+            "cache_creation": {
+              "omittedFieldCount": 2
+            },
+            "omittedFieldCount": 6
+          },
+          "modelUsage": {
+            "omittedFieldCount": 1
+          },
+          "is_error": false,
+          "num_turns": 2,
+          "subtype": "success",
+          "result": "S0_SENTINEL_OK\nS0_PROBE_OK\n1.3.14",
+          "type": "result",
+          "duration_ms": 11759,
+          "uuid": "ref-23",
+          "omittedFieldCount": 11
+        }
+      }
+    ]
+  },
+  "stdin": {
+    "chunks": [
+      {
+        "index": 0,
+        "bytes": 356,
+        "at": "2026-09-07T01:00:46.607Z"
+      }
+    ],
+    "frames": [
+      {
+        "index": 0,
+        "firstChunk": 0,
+        "lastChunk": 0,
+        "newline": true,
+        "at": "2026-09-07T01:00:46.607Z",
+        "value": {
+          "type": "user",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Disposable protocol probe. Use a shell tool to run exactly: bun --version && cat sentinel.txt . Read only this controlled directory. Do not edit files, inspect other directories, use agents, or do other work. Then respond briefly with S0_PROBE_OK and the two observed outputs."
+              }
+            ]
+          }
+        }
+      }
+    ]
+  },
+  "normalized": [
+    {
+      "kind": "session_start",
+      "timestamp": 1788742846606
+    },
+    {
+      "kind": "thinking",
+      "omitted": "reasoning"
+    },
+    {
+      "kind": "text",
+      "timestamp": 1788742854317,
+      "text": "[redacted]",
+      "raw": {
+        "type": "text",
+        "text": "[redacted]"
+      }
+    },
+    {
+      "kind": "tool_use",
+      "timestamp": 1788742855789,
+      "toolName": "Bash",
+      "toolInput": {
+        "command": "bun --version\ncat sentinel.txt",
+        "omittedFieldCount": 1
+      },
+      "raw": {
+        "type": "tool_use",
+        "id": "ref-13",
+        "name": "Bash",
+        "input": {
+          "command": "bun --version\ncat sentinel.txt",
+          "omittedFieldCount": 1
+        },
+        "omittedFieldCount": 1
+      }
+    },
+    {
+      "kind": "text",
+      "timestamp": 1788742859542,
+      "text": "S0_SENTINEL_OK\nS0_PROBE_OK\n1.3.14",
+      "raw": {
+        "type": "text",
+        "text": "S0_SENTINEL_OK\nS0_PROBE_OK\n1.3.14"
+      }
+    },
+    {
+      "kind": "result",
+      "timestamp": 1788742859591,
+      "text": "S0_SENTINEL_OK\nS0_PROBE_OK\n1.3.14",
+      "externalSessionId": "ref-2",
+      "tokens": {
+        "input": 58,
+        "output": 296
+      },
+      "raw": {
+        "duration_api_ms": 11357,
+        "stop_reason": "end_turn",
+        "session_id": "ref-2",
+        "usage": {
+          "input_tokens": 58,
+          "cache_creation_input_tokens": 15123,
+          "cache_read_input_tokens": 35803,
+          "output_tokens": 296,
+          "cache_creation": {
+            "omittedFieldCount": 2
+          },
+          "omittedFieldCount": 6
+        },
+        "modelUsage": {
+          "omittedFieldCount": 1
+        },
+        "is_error": false,
+        "num_turns": 2,
+        "subtype": "success",
+        "result": "S0_SENTINEL_OK\nS0_PROBE_OK\n1.3.14",
+        "type": "result",
+        "duration_ms": 11759,
+        "uuid": "ref-23",
+        "omittedFieldCount": 11
+      }
+    },
+    {
+      "kind": "session_end",
+      "timestamp": 1788742859594
+    }
+  ],
+  "stderrFacts": {
+    "bytes": 0,
+    "websocketListenerAnnounced": false,
+    "loopbackPort": null,
+    "lines": 0
+  },
+  "admission": {
+    "sendAdmitted": true,
+    "attemptedWrites": 1,
+    "observedWrites": 1,
+    "possibleTurnWrite": true,
+    "outboundObserverFailed": false,
+    "noTurn": false
+  }
+}

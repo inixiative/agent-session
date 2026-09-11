@@ -1,0 +1,38 @@
+{
+  "commands": [
+    [
+      "codex",
+      "app-server",
+      "--help"
+    ],
+    [
+      "codex",
+      "app-server",
+      "generate-json-schema",
+      "--out",
+      "<owned-temporary-schema-dir>"
+    ]
+  ],
+  "helpExit": 0,
+  "schemaExit": 0,
+  "stdioIsDefault": true,
+  "websocketExplicit": true,
+  "selectedSchema": [
+    {
+      "file": "TurnStartParams.json",
+      "sha256": "a3835e8c1e942e4b358e1a670939b89918b16c4d13105a579899892b7ade6dea",
+      "required": [
+        "input",
+        "threadId"
+      ],
+      "input": {
+        "items": {
+          "$ref": "#/definitions/UserInput"
+        },
+        "type": "array"
+      }
+    }
+  ],
+  "officialReference": "https://developers.openai.com/codex/app-server",
+  "sourceEdit": false
+}

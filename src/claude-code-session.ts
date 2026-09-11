@@ -1,3 +1,5 @@
+import { TurnState } from "./turn-state";
+import { retainEvidence } from "./retained-evidence";
 // ---------------------------------------------------------------------------
 // ClaudeCodeSession — long-lived Claude Code process with full event capture
 // ---------------------------------------------------------------------------
@@ -39,6 +41,7 @@ import type {
   SessionEventHandler,
   SessionResult,
   SessionArtifact,
+  SessionSendOptions,
 } from "./harness-session";
 
 // Re-export types so existing import paths keep working
@@ -66,7 +69,7 @@ export interface ClaudeCodeSessionConfig {
   /** Working directory for the session. */
   cwd?: string;
   /** Max agentic turns per message. Defaults to 25. */
-  maxTurns?: number;
+  maxTurns?: number | null;
   /** Permission mode. Defaults to "bypassPermissions". */
   permissionMode?: string;
   /** Default per-send timeout in ms. Defaults to 600000 (10 min). */
@@ -104,6 +107,8 @@ export interface ClaudeCodeSessionConfig {
 // ---------------------------------------------------------------------------
 
 interface QueuedTurn {
+  onAdmission?: SessionSendOptions["onAdmission"];
+  evidence: TurnState;
   message: string;
   timeout: number;
   resolve: (result: SessionResult) => void;
@@ -123,17 +128,59 @@ export interface PipedSubprocess {
   kill(): void;
 }
 
+// ---------------------------------------------------------------------------
+// Public tool-result content contract (stream-json `user` tool_result blocks).
+//
+// A string content is the public output verbatim. An array keeps the text
+// blocks (joined with one newline, as before) and, separately, the exact
+// `tool_name` strings of `tool_reference` blocks (Anthropic tool search returns
+// discovered tools as references, not text). Every other block, and any
+// malformed text/reference block, is omitted explicitly: `toolOutputOmitted` is
+// set and `toolOutputOmittedTypes` lists known public type labels or
+// "unsupported". Nothing else from a block is copied, so private or unexpected
+// fields never enter the public event. Reference-only output is NOT a success
+// claim; the consuming guard judges ownership and ordering.
+// ---------------------------------------------------------------------------
+const KNOWN_NON_TEXT_RESULT_TYPES = new Set(["image", "audio", "document", "resource", "resource_link"]);
+
+function publicToolResultContent(content: unknown): Pick<SessionEvent, "toolOutput" | "toolReferences" | "toolOutputOmitted" | "toolOutputOmittedTypes"> {
+  if (typeof content === "string") return { toolOutput: content };
+  if (content === undefined || content === null) return {};
+  const omittedTypes: string[] = [];
+  const omit = (type: unknown) => {
+    const label = typeof type === "string" && KNOWN_NON_TEXT_RESULT_TYPES.has(type) ? type : "unsupported";
+    if (!omittedTypes.includes(label)) omittedTypes.push(label);
+  };
+  if (!Array.isArray(content)) { omit(undefined); return { toolOutputOmitted: true, toolOutputOmittedTypes: Object.freeze(omittedTypes) }; }
+  const texts: string[] = [], references: string[] = [];
+  for (const block of content) {
+    const b = block !== null && typeof block === "object" && !Array.isArray(block) ? block as Record<string, unknown> : undefined;
+    if (b?.type === "text" && typeof b.text === "string") texts.push(b.text);
+    else if (b?.type === "tool_reference" && typeof b.tool_name === "string" && b.tool_name.length > 0) references.push(b.tool_name);
+    else omit(b?.type);
+  }
+  return {
+    toolOutput: texts.join("\n"),
+    ...(references.length ? { toolReferences: Object.freeze([...references]) } : {}),
+    ...(omittedTypes.length ? { toolOutputOmitted: true, toolOutputOmittedTypes: Object.freeze(omittedTypes) } : {}),
+  };
+}
+
 export class ClaudeCodeSession implements HarnessSession {
   // -- Config --
   private _bin: string;
   private _model: string;
   private _effort?: string;
   private _cwd: string;
-  private _maxTurns: number;
+  readonly admissionProtocol = "prewrite-v1" as const;
+  readonly turnBudgetProtocol = "optional-max-turns-v1" as const;
+  inspectAttempt(admissionId: string) { return this._attempts.find(attempt => attempt.admissionId === admissionId)?.snapshot(); }
+  private _maxTurns: number | null;
   private _permissionMode: string;
   private _defaultTimeout: number;
   private _baseContext?: string;
   private _forking = false;
+  private _awaitingForkIdentity = false;
   private _spawn?: ClaudeCodeSessionConfig["spawn"];
 
   // -- Process --
@@ -151,23 +198,28 @@ export class ClaudeCodeSession implements HarnessSession {
    */
   private _externalSessionId?: string;
   private _alive = false;
+  private _endEmitted = false;
   private _eventLog: SessionEvent[] = [];
   private _handlers: SessionEventHandler[] = [];
+  private _observerFailures = { synchronous: 0, asynchronous: 0 };
   private _beforeSendHooks: BeforeSendHook[] = [];
   private _turns = 0;
   private _totalTokens = { input: 0, output: 0 };
   private _startedAt: number;
   /**
-   * Whether we've already seen a system/init event on the stream. If a second
-   * one arrives it signals a mid-session restart — Claude Code's auto-compact
-   * kills and resumes the session, which reproduces the init event. We use
-   * this to emit `session_compact` so the FlowOrchestrator can invalidate
-   * the Librarian's injection ledger.
+   * Native uuids of explicit compaction boundaries already emitted. Claude emits a
+   * `system/init` per admission on one binding, so a repeated init is configuration
+   * evidence, never proof of compaction or restart. Only the explicit
+   * `system/compact_boundary` envelope is a compaction, and a repeat is a duplicate
+   * only when it carries the same native uuid; text-equal boundaries without one
+   * are distinct compactions.
    */
-  private _sawInit = false;
+  private _seenBoundaries = new Set<string>();
 
   // -- Turn queue --
   private _queue: QueuedTurn[] = [];
+  private _attempts: TurnState[] = [];
+  private _seenTerminals = new Set<string>();
   private _inflight: QueuedTurn | null = null;
   private _turnEvents: SessionEvent[] = [];
   private _resultText = "";
@@ -182,7 +234,11 @@ export class ClaudeCodeSession implements HarnessSession {
     this._model = config?.model ?? "sonnet";
     this._effort = config?.effort;
     this._cwd = config?.cwd ?? process.cwd();
-    this._maxTurns = config?.maxTurns ?? 25;
+    // Undefined retains standalone legacy behavior; null explicitly omits the CLI cap.
+    if (config?.maxTurns !== undefined && config.maxTurns !== null && (!Number.isSafeInteger(config.maxTurns) || config.maxTurns < 1)) {
+      throw new Error("maxTurns must be a positive safe integer or null (unbounded)");
+    }
+    this._maxTurns = config?.maxTurns === undefined ? 25 : config.maxTurns;
     this._permissionMode = config?.permissionMode ?? "bypassPermissions";
     this._defaultTimeout = config?.timeout ?? 600_000;
     this._baseContext = config?.baseContext;
@@ -195,9 +251,13 @@ export class ClaudeCodeSession implements HarnessSession {
   // Accessors
   // ---------------------------------------------------------------------------
 
+  get accounting() { return "observed-only" as const; }
+  get attempts() { return this._attempts.map(a => a.snapshot()); }
+  get diagnostics() { return Object.freeze({ observerFailures: Object.freeze({ ...this._observerFailures }) }); }
+
   get alive(): boolean { return this._alive; }
   get externalSessionId(): string | undefined { return this._externalSessionId; }
-  get events(): readonly SessionEvent[] { return this._eventLog; }
+  get events(): readonly SessionEvent[] { return Object.freeze([...this._eventLog]); }
   get turns(): number { return this._turns; }
   get totalTokens(): Readonly<{ input: number; output: number }> {
     return { ...this._totalTokens };
@@ -246,6 +306,7 @@ export class ClaudeCodeSession implements HarnessSession {
   // ---------------------------------------------------------------------------
 
   async start(): Promise<void> {
+    if (this._attempts.some(a => a.dispatch === "attempted" && a.nativeOutcome === "unknown")) throw new Error("Native outcome unresolved; automatic resume is blocked");
     if (this._proc) throw new Error("Session already started");
 
     const args = this._buildSpawnArgs();
@@ -271,22 +332,25 @@ export class ClaudeCodeSession implements HarnessSession {
     }
 
     this._alive = true;
+    this._endEmitted = false;
     this._emit({ kind: "session_start", timestamp: Date.now() });
 
     // Background readers — run for session lifetime (don't await)
-    this._readStdout();
+    const proc = this._proc;
+    const stdoutDone = this._readStdout(proc);
     this._readStderr();
 
     // Monitor process exit for cleanup
-    this._proc.exited.then((code) => {
-      if (!this._alive) return;
+    proc.exited.then(async (code) => {
+      if (this._proc !== proc || !this._alive) return;
       this._alive = false;
+      await stdoutDone; // Drain buffered terminal evidence before interpreting process exit.
       const errMsg = this._stderr.trim()
         ? `Process exited (code ${code}): ${this._stderr.trim().slice(0, 500)}`
         : `Process exited with code ${code}`;
       this._rejectInflight(new Error(errMsg));
       this._rejectQueue(new Error("Session ended"));
-      this._emit({ kind: "session_end", timestamp: Date.now() });
+      this._emit({ kind: "session_end", timestamp: Date.now(), transportOutcome: "failed" });
     });
   }
 
@@ -296,11 +360,15 @@ export class ClaudeCodeSession implements HarnessSession {
 
   async send(
     message: string,
-    opts?: { timeout?: number },
+    opts?: SessionSendOptions,
   ): Promise<SessionResult> {
     // Auto-restart after interrupt / process death (crash recovery via --resume).
     // _externalSessionId persists across process lifetimes, so start() will
     // include --resume <id> in spawn args.
+    if (this._attempts.some(a => a.dispatch === "attempted" && a.nativeOutcome === "unknown" && (!this._alive || a.localOutcome !== "pending"))) {
+      const blocked = new TurnState(); this._attempts.push(blocked);
+      throw blocked.fail(new Error("Native outcome unresolved; send not dispatched"), "blocked");
+    }
     if (!this._proc && this._externalSessionId) {
       await this.start();
     }
@@ -319,7 +387,11 @@ export class ClaudeCodeSession implements HarnessSession {
     }
 
     return new Promise<SessionResult>((resolve, reject) => {
-      const turn: QueuedTurn = { message: transformed, timeout, resolve, reject };
+      const evidence = new TurnState(); this._attempts.push(evidence);
+      const turn: QueuedTurn = { evidence, message: transformed, timeout, resolve, reject, onAdmission: opts?.onAdmission };
+      if (!this._alive || (this._inflight && this._inflight.evidence.localOutcome !== "pending")) {
+        reject(evidence.fail(new Error("Previous native work unresolved; send not dispatched"), "blocked")); return;
+      }
 
       if (!this._inflight) {
         this._dispatchTurn(turn);
@@ -334,6 +406,7 @@ export class ClaudeCodeSession implements HarnessSession {
   // ---------------------------------------------------------------------------
 
   fork(opts?: { cwd?: string; baseContext?: string }): ClaudeCodeSession {
+    if (this._inflight) throw new Error("Cannot fork while native ownership is unresolved");
     if (!this._externalSessionId) {
       throw new Error(
         "Cannot fork — no external session ID yet (send at least one message first)",
@@ -357,16 +430,15 @@ export class ClaudeCodeSession implements HarnessSession {
   }
 
   // ---------------------------------------------------------------------------
-  // interrupt() — cancel the in-flight turn (best-effort)
+  // interrupt() — reject the local waiter; native cancellation is unacknowledged
   // ---------------------------------------------------------------------------
 
   interrupt(): void {
     if (!this._inflight) return;
 
-    this._rejectInflight(new Error("Turn interrupted"));
+    this._rejectInflight(new Error("Local waiter interrupted; native cancellation unacknowledged"), "interrupt-request");
 
-    // Process continues running. When it emits the orphaned result,
-    // _processLine dispatches the next queued turn (if any).
+    // Native ownership is retained. Waiting sends are rejected without dispatch.
   }
 
   // ---------------------------------------------------------------------------
@@ -382,7 +454,7 @@ export class ClaudeCodeSession implements HarnessSession {
       this._turnTimer = null;
     }
 
-    this._rejectInflight(new Error("Session killed"));
+    this._rejectInflight(new Error("Session killed; native outcome may remain unknown"), "killed");
     this._rejectQueue(new Error("Session killed"));
 
     try { this._proc.stdin.end(); } catch { /* already closed */ }
@@ -399,6 +471,7 @@ export class ClaudeCodeSession implements HarnessSession {
   artifact(): SessionArtifact {
     return {
       externalSessionId: this._externalSessionId,
+      attempts: this.attempts, accounting: "observed-only", diagnostics: this.diagnostics,
       events: [...this._eventLog],
       startedAt: this._startedAt,
       endedAt: this._alive ? undefined : Date.now(),
@@ -416,7 +489,22 @@ export class ClaudeCodeSession implements HarnessSession {
 
   private _dispatchTurn(turn: QueuedTurn): void {
     this._inflight = turn;
-    this._turnEvents = [];
+    if (turn.onAdmission) {
+      Promise.resolve().then(() => turn.onAdmission!(turn.evidence.snapshot())).then(() => {
+        if (this._inflight === turn && this._alive && turn.evidence.localOutcome === "pending") this._writeTurn(turn);
+        else if (this._inflight === turn && turn.evidence.dispatch === "not-dispatched") { this._inflight = null; this._processNextTurn(); }
+      }).catch(error => {
+        turn.reject(turn.evidence.fail(error instanceof Error ? error : new Error(String(error)), "registration"));
+        if (this._inflight === turn) { this._inflight = null; this._processNextTurn(); }
+      });
+      return;
+    }
+    this._writeTurn(turn);
+  }
+
+  private _writeTurn(turn: QueuedTurn): void {
+    turn.evidence.dispatch = "attempted";
+    this._turnEvents = turn.evidence.events;
     this._resultText = "";
 
     // Wire format validated empirically against claude 2.1.114:
@@ -429,16 +517,16 @@ export class ClaudeCodeSession implements HarnessSession {
         content: [{ type: "text", text: turn.message }],
       },
     }) + "\n";
-    this._proc!.stdin.write(payload);
-    this._proc!.stdin.flush();
+    try { this._proc!.stdin.write(payload); this._proc!.stdin.flush(); }
+    catch (err) { this._rejectInflight(err as Error); return; }
 
     // Timeout guard
     if (turn.timeout > 0) {
       this._turnTimer = setTimeout(() => {
         this._turnTimer = null;
-        this._rejectInflight(new Error(`Turn timed out after ${turn.timeout}ms`));
+        this._rejectInflight(new Error(`Turn timed out after ${turn.timeout}ms`), "timeout");
         // Don't dispatch next — process may still be working on this turn.
-        // Next queued turn dispatches when the orphaned result arrives.
+        // A late terminal updates this admission; waiting sends are not replayed.
       }, turn.timeout);
     }
   }
@@ -451,41 +539,44 @@ export class ClaudeCodeSession implements HarnessSession {
       this._turnTimer = null;
     }
 
+    const a = this._inflight.evidence;
+    if (a.nativeOutcome === "unknown") return;
     this._turns++;
-    const result: SessionResult = {
-      content: this._resultText,
-      events: [...this._turnEvents],
-      tokens: this._turnEvents.find((e) => e.tokens)?.tokens,
-      externalSessionId: this._externalSessionId,
-    };
-    this._inflight.resolve(result);
+    if (a.localOutcome === "pending") {
+      a.localOutcome = "resolved";
+      this._inflight.resolve(a.result(this._externalSessionId));
+    }
     this._inflight = null;
 
     this._processNextTurn();
   }
 
   private _processNextTurn(): void {
-    if (this._queue.length > 0 && this._alive) {
+    if (!this._inflight && this._queue.length > 0 && this._alive) {
       const next = this._queue.shift()!;
       this._dispatchTurn(next);
     }
   }
 
-  private _rejectInflight(err: Error): void {
+  private _rejectInflight(err: Error, reason: import("./harness-session").SessionAttempt["localFailure"] = "transport"): void {
     if (!this._inflight) return;
+    if (this._turnTimer) { clearTimeout(this._turnTimer); this._turnTimer = null; }
+    const a = this._inflight.evidence;
+    if ((reason === "transport" || reason === "killed") && a.transportOutcome === "open") a.transportOutcome = reason === "killed" ? "closed" : "failed";
+    if (a.localOutcome === "pending") this._inflight.reject(a.fail(err, reason));
+    this._rejectQueue(reason === "killed" ? err : new Error("Previous native work unresolved; queued send not dispatched"));
+  }
 
-    if (this._turnTimer) {
-      clearTimeout(this._turnTimer);
-      this._turnTimer = null;
-    }
-
-    this._inflight.reject(err);
-    this._inflight = null;
+  private _transportFailure(err: Error): void {
+    this._alive = false;
+    this._rejectInflight(err);
+    this._rejectQueue(err);
+    this._emit({ kind: "session_end", timestamp: Date.now(), transportOutcome: "failed" });
   }
 
   private _rejectQueue(err: Error): void {
     for (const turn of this._queue) {
-      turn.reject(err);
+      turn.reject(turn.evidence.fail(err, "blocked"));
     }
     this._queue = [];
   }
@@ -494,8 +585,8 @@ export class ClaudeCodeSession implements HarnessSession {
   // Private — stdout reader (background, runs for session lifetime)
   // ---------------------------------------------------------------------------
 
-  private async _readStdout(): Promise<void> {
-    const reader = this._proc!.stdout.getReader();
+  private async _readStdout(proc: PipedSubprocess): Promise<void> {
+    const reader = proc.stdout.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
 
@@ -510,16 +601,17 @@ export class ClaudeCodeSession implements HarnessSession {
 
         for (const line of lines) {
           if (!line.trim()) continue;
-          this._processLine(line);
+          if (this._proc === proc || !this._proc) this._processLine(line);
         }
       }
 
       // Flush remaining buffer
-      if (buffer.trim()) {
+      if (buffer.trim() && (this._proc === proc || !this._proc)) {
         this._processLine(buffer);
       }
+      if (this._proc === proc && this._alive) this._transportFailure(new Error(this._stderr.trim() ? `Native stdout closed: ${this._stderr.trim().slice(0, 500)}` : "Native stdout closed"));
     } catch (err) {
-      this._rejectInflight(err as Error);
+      if (this._proc === proc) this._transportFailure(err as Error);
     }
   }
 
@@ -553,6 +645,16 @@ export class ClaudeCodeSession implements HarnessSession {
 
     const raw = msg as Record<string, unknown>;
 
+    if (this._awaitingForkIdentity && raw.type === "system" && raw.subtype === "init" && typeof raw.session_id === "string") {
+      this._externalSessionId = raw.session_id;
+      this._awaitingForkIdentity = false;
+    }
+    // A foreign session or repeated result UUID cannot own the current admission.
+    if (typeof raw.session_id === "string" && this._externalSessionId && raw.session_id !== this._externalSessionId) {
+      this._unattributed(raw, "foreign-session"); return;
+    }
+    const terminalKey = raw.type === "result" && typeof raw.uuid === "string" ? raw.uuid : undefined;
+    if (terminalKey && this._seenTerminals.has(terminalKey)) { this._unattributed(raw, "duplicate-terminal"); return; }
     // Capture the runtime's native session ID the first time we see it.
     // Subsequent messages echo the same ID; we keep our initial capture
     // (for resumed sessions, the config-supplied ID should match).
@@ -560,55 +662,67 @@ export class ClaudeCodeSession implements HarnessSession {
       this._externalSessionId = raw.session_id;
     }
 
-    // Compaction detection: a system/init message arriving after we've
-    // already seen one means the Claude Code session was restarted mid-run.
-    // Auto-compact works by killing and resuming the session, which fires
-    // a new init event. This tells the FlowOrchestrator that the session's
-    // in-memory state was summarized — the Librarian ledger is stale.
-    if (raw.type === "system" && (raw.subtype === "init" || raw.subtype === "compact_boundary")) {
-      if (this._sawInit && raw.subtype === "init") {
-        this._emit({
-          kind: "session_compact",
-          timestamp: Date.now(),
-          externalSessionId: this._externalSessionId,
-          compactionSource: "claude-code",
-          raw,
-        });
-      } else if (raw.subtype === "compact_boundary") {
-        this._emit({
-          kind: "session_compact",
-          timestamp: Date.now(),
-          externalSessionId: this._externalSessionId,
-          compactionSource: "claude-code",
-          raw,
-        });
-      }
-      this._sawInit = true;
+    // Lifecycle/configuration envelopes belong to the session, not to whichever
+    // admission is in flight. Every init is preserved once with its binding; it is
+    // never attributed to a turn and never compared against an earlier init to infer
+    // compaction or restart. Only an explicit compact_boundary is a compaction, and
+    // it is emitted exactly once per native uuid with this session's provenance.
+    // Foreign bindings were already refused above and cannot invalidate this owner.
+    if (raw.type === "system" && raw.subtype === "init") {
+      this._unattributed(raw, "session-configuration"); return;
+    }
+    if (raw.type === "system" && raw.subtype === "compact_boundary") {
+      const boundaryKey = typeof raw.uuid === "string" ? raw.uuid : undefined;
+      if (boundaryKey && this._seenBoundaries.has(boundaryKey)) { this._unattributed(raw, "duplicate-boundary"); return; }
+      if (boundaryKey) this._seenBoundaries.add(boundaryKey);
+      this._emit({
+        kind: "session_compact",
+        timestamp: Date.now(),
+        correlation: "unknown",
+        nativeSessionId: typeof raw.session_id === "string" ? raw.session_id : this._externalSessionId,
+        externalSessionId: this._externalSessionId,
+        compactionSource: "claude-code",
+        raw,
+      });
+      return;
     }
 
+    const turn = this._inflight;
+    if (!turn) {
+      if (terminalKey) this._seenTerminals.add(terminalKey);
+      this._unattributed(raw, "no-admission"); return;
+    }
+    const a = turn.evidence;
+    a.identity = { ...a.identity, nativeSessionId: typeof raw.session_id === "string" ? raw.session_id : a.identity.nativeSessionId,
+      correlation: "ordered-stream" };
+    const terminal = raw.type === "result";
+    if (terminal) {
+      if (terminalKey) this._seenTerminals.add(terminalKey);
+      const subtype = typeof raw.subtype === "string" ? raw.subtype : undefined;
+      const reason = typeof raw.terminal_reason === "string" ? raw.terminal_reason : undefined;
+      const status = typeof raw.api_error_status === "number" && Number.isFinite(raw.api_error_status) ? raw.api_error_status : undefined;
+      // Match Foundry's provider precedence. An optimistic subtype cannot erase
+      // an explicit native error; local transport/RPC errors do not enter here.
+      const failed = raw.is_error === true || subtype?.startsWith("error_")
+        || (status !== undefined && status >= 400) || reason === "api_error";
+      a.nativeOutcome = failed ? "failed" : subtype === "success" ? "completed" : "unknown";
+      a.terminal = { type: "result", eventId: terminalKey, subtype, reason, apiErrorStatus: status };
+    }
+    const message = raw.message as Record<string, unknown> | undefined;
     const classified = this._classify(raw);
+    if (!classified.length) this._unattributed(raw, "unrecognized-event");
     for (const event of classified) {
-      this._emit(event);
-      this._turnEvents.push(event);
-
-      if (event.kind === "result") {
-        this._resultText = event.text ?? "";
-      }
-      if (event.tokens) {
-        this._totalTokens.input += event.tokens.input;
-        this._totalTokens.output += event.tokens.output;
-      }
+      const e = a.record({ ...event, messageId: typeof message?.id === "string" ? message.id : undefined,
+        ...(terminal ? { nativeOutcome: a.nativeOutcome, terminal: a.terminal } : {}) });
+      this._resultText = a.content;
+      if (e.tokens) { this._totalTokens.input += e.tokens.input; this._totalTokens.output += e.tokens.output; }
+      this._emit(e);
+    }
+    if (terminal) {
+      if (a.nativeOutcome !== "unknown") this._resolveTurn();
+      else this._rejectInflight(new Error("Native result has no recognized terminal status"), "unrecognized-terminal");
     }
 
-    // Result event resolves the pending turn (or dispatches next if orphaned)
-    if (raw.type === "result") {
-      if (this._inflight) {
-        this._resolveTurn();
-      } else {
-        // Orphaned result from interrupted/timed-out turn — dispatch next
-        this._processNextTurn();
-      }
-    }
   }
 
   // ---------------------------------------------------------------------------
@@ -625,7 +739,7 @@ export class ClaudeCodeSession implements HarnessSession {
       "--output-format", "stream-json",
       "--model", this._model,
       ...(this._effort ? ["--effort", this._effort] : []),
-      "--max-turns", String(this._maxTurns),
+      ...(this._maxTurns === null ? [] : ["--max-turns", String(this._maxTurns)]),
       "--permission-mode", this._permissionMode,
       "--include-hook-events",
     ];
@@ -637,6 +751,7 @@ export class ClaudeCodeSession implements HarnessSession {
       args.push("--resume", this._externalSessionId);
       if (this._forking) {
         args.push("--fork-session");
+        this._awaitingForkIdentity = true;
         this._forking = false;
       }
     }
@@ -678,6 +793,8 @@ export class ClaudeCodeSession implements HarnessSession {
           events.push({
             kind: "tool_use",
             timestamp: ts,
+            callId: typeof block.id === "string" ? block.id : undefined,
+            itemId: typeof block.id === "string" ? block.id : undefined,
             toolName: (block as Record<string, unknown>).name as string,
             toolInput: (block as Record<string, unknown>).input as Record<
               string,
@@ -694,6 +811,13 @@ export class ClaudeCodeSession implements HarnessSession {
             raw: block,
           });
         }
+      }
+    } else if (type === "user") {
+      const message = msg.message as Record<string, unknown> | undefined;
+      if (Array.isArray(message?.content)) for (const block of message.content) {
+        if (block?.type !== "tool_result") continue;
+        events.push({ kind: "tool_result", timestamp: ts, callId: typeof block.tool_use_id === "string" ? block.tool_use_id : undefined,
+          ...publicToolResultContent(block.content), toolError: block.is_error === true, raw: block });
       }
     } else if (type === "tool") {
       // Tool result — what the tool returned
@@ -732,10 +856,10 @@ export class ClaudeCodeSession implements HarnessSession {
         timestamp: ts,
         text: (msg.result as string) ?? "",
         externalSessionId: msg.session_id as string | undefined,
-        tokens: usage
+        tokens: usage && typeof usage.input_tokens === "number" && typeof usage.output_tokens === "number"
           ? {
-              input: usage.input_tokens ?? 0,
-              output: usage.output_tokens ?? 0,
+              input: usage.input_tokens,
+              output: usage.output_tokens,
             }
           : undefined,
         raw: msg,
@@ -763,17 +887,28 @@ export class ClaudeCodeSession implements HarnessSession {
   // Private — emit
   // ---------------------------------------------------------------------------
 
+  private _unattributed(raw: Record<string, unknown>, reason: NonNullable<SessionEvent["unattributedReason"]>): void {
+    const message = raw.message as Record<string, unknown> | undefined;
+    // Preserve the original envelope once, without synthesizing admission/native ownership.
+    this._emit({ kind: "native_status", timestamp: Date.now(), correlation: "unknown", unattributedReason: reason,
+      nativeSessionId: typeof raw.session_id === "string" ? raw.session_id : undefined,
+      messageId: typeof message?.id === "string" ? message.id : undefined, raw });
+  }
+
   private _emit(event: SessionEvent): void {
+    event = retainEvidence(event);
+    if (event.kind === "session_end") {
+      if (this._endEmitted) return;
+      this._endEmitted = true;
+    }
     this._eventLog.push(event);
     for (const handler of this._handlers) {
       try {
-        handler(event);
-      } catch (err) {
-        console.warn(
-          "[ClaudeCodeSession] handler error:",
-          (err as Error).message,
-        );
-      }
+        const observation: unknown = handler(event);
+        if (observation && typeof (observation as PromiseLike<unknown>).then === "function") {
+          void Promise.resolve(observation).catch(() => { this._observerFailures.asynchronous++; });
+        }
+      } catch { this._observerFailures.synchronous++; }
     }
   }
 }

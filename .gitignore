@@ -3,3 +3,7 @@ dist/
 *.log
 .DS_Store
 bun.lock
+.qa/
+.env
+.env.*
+!.env.example

@@ -1,0 +1,427 @@
+{
+  "exitCode": 0,
+  "records": [
+    {
+      "schema": "codex_app_server_protocol.schemas.json",
+      "types": [
+        "enterpriseManaged"
+      ],
+      "identityFields": {
+        "id": "string"
+      }
+    },
+    {
+      "schema": "codex_app_server_protocol.schemas.json",
+      "types": [
+        "message"
+      ],
+      "identityFields": {
+        "id": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    {
+      "schema": "codex_app_server_protocol.schemas.json",
+      "types": [
+        "agent_message"
+      ],
+      "identityFields": {
+        "id": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    {
+      "schema": "codex_app_server_protocol.schemas.json",
+      "types": [
+        "reasoning"
+      ],
+      "identityFields": {
+        "id": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    {
+      "schema": "codex_app_server_protocol.schemas.json",
+      "types": [
+        "local_shell_call"
+      ],
+      "identityFields": {
+        "call_id": [
+          "string",
+          "null"
+        ],
+        "id": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    {
+      "schema": "codex_app_server_protocol.schemas.json",
+      "types": [
+        "function_call"
+      ],
+      "identityFields": {
+        "call_id": "string",
+        "id": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    {
+      "schema": "codex_app_server_protocol.schemas.json",
+      "types": [
+        "tool_search_call"
+      ],
+      "identityFields": {
+        "call_id": [
+          "string",
+          "null"
+        ],
+        "id": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    {
+      "schema": "codex_app_server_protocol.schemas.json",
+      "types": [
+        "function_call_output"
+      ],
+      "identityFields": {
+        "call_id": [
+          "string",
+          "null"
+        ],
+        "id": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    {
+      "schema": "codex_app_server_protocol.schemas.json",
+      "types": [
+        "custom_tool_call"
+      ],
+      "identityFields": {
+        "call_id": "string",
+        "id": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    {
+      "schema": "codex_app_server_protocol.schemas.json",
+      "types": [
+        "custom_tool_call_output"
+      ],
+      "identityFields": {
+        "call_id": "string",
+        "id": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    {
+      "schema": "codex_app_server_protocol.schemas.json",
+      "types": [
+        "tool_search_output"
+      ],
+      "identityFields": {
+        "call_id": [
+          "string",
+          "null"
+        ],
+        "id": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    {
+      "schema": "codex_app_server_protocol.schemas.json",
+      "types": [
+        "web_search_call"
+      ],
+      "identityFields": {
+        "id": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    {
+      "schema": "codex_app_server_protocol.schemas.json",
+      "types": [
+        "image_generation_call"
+      ],
+      "identityFields": {
+        "id": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    {
+      "schema": "codex_app_server_protocol.schemas.json",
+      "types": [
+        "compaction"
+      ],
+      "identityFields": {
+        "id": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    {
+      "schema": "codex_app_server_protocol.schemas.json",
+      "types": [
+        "context_compaction"
+      ],
+      "identityFields": {
+        "id": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    {
+      "schema": "codex_app_server_protocol.schemas.json",
+      "types": [
+        "userMessage"
+      ],
+      "identityFields": {
+        "id": "string"
+      }
+    },
+    {
+      "schema": "codex_app_server_protocol.schemas.json",
+      "types": [
+        "hookPrompt"
+      ],
+      "identityFields": {
+        "id": "string"
+      }
+    },
+    {
+      "schema": "codex_app_server_protocol.schemas.json",
+      "types": [
+        "agentMessage"
+      ],
+      "identityFields": {
+        "id": "string"
+      }
+    },
+    {
+      "schema": "codex_app_server_protocol.schemas.json",
+      "types": [
+        "functionCallOutput"
+      ],
+      "identityFields": {
+        "id": "string"
+      }
+    },
+    {
+      "schema": "codex_app_server_protocol.schemas.json",
+      "types": [
+        "plan"
+      ],
+      "identityFields": {
+        "id": "string"
+      }
+    },
+    {
+      "schema": "codex_app_server_protocol.schemas.json",
+      "types": [
+        "reasoning"
+      ],
+      "identityFields": {
+        "id": "string"
+      }
+    },
+    {
+      "schema": "codex_app_server_protocol.schemas.json",
+      "types": [
+        "commandExecution"
+      ],
+      "identityFields": {
+        "id": "string"
+      }
+    },
+    {
+      "schema": "codex_app_server_protocol.schemas.json",
+      "types": [
+        "fileChange"
+      ],
+      "identityFields": {
+        "id": "string"
+      }
+    },
+    {
+      "schema": "codex_app_server_protocol.schemas.json",
+      "types": [
+        "mcpToolCall"
+      ],
+      "identityFields": {
+        "id": "string"
+      }
+    },
+    {
+      "schema": "codex_app_server_protocol.schemas.json",
+      "types": [
+        "dynamicToolCall"
+      ],
+      "identityFields": {
+        "id": "string"
+      }
+    },
+    {
+      "schema": "codex_app_server_protocol.schemas.json",
+      "types": [
+        "collabAgentToolCall"
+      ],
+      "identityFields": {
+        "id": "string"
+      }
+    },
+    {
+      "schema": "codex_app_server_protocol.schemas.json",
+      "types": [
+        "subAgentActivity"
+      ],
+      "identityFields": {
+        "id": "string"
+      }
+    },
+    {
+      "schema": "codex_app_server_protocol.schemas.json",
+      "types": [
+        "webSearch"
+      ],
+      "identityFields": {
+        "id": "string"
+      }
+    },
+    {
+      "schema": "codex_app_server_protocol.schemas.json",
+      "types": [
+        "imageView"
+      ],
+      "identityFields": {
+        "id": "string"
+      }
+    },
+    {
+      "schema": "codex_app_server_protocol.schemas.json",
+      "types": [
+        "sleep"
+      ],
+      "identityFields": {
+        "id": "string"
+      }
+    },
+    {
+      "schema": "codex_app_server_protocol.schemas.json",
+      "types": [
+        "imageGeneration"
+      ],
+      "identityFields": {
+        "id": "string"
+      }
+    },
+    {
+      "schema": "codex_app_server_protocol.schemas.json",
+      "types": [
+        "enteredReviewMode"
+      ],
+      "identityFields": {
+        "id": "string"
+      }
+    },
+    {
+      "schema": "codex_app_server_protocol.schemas.json",
+      "types": [
+        "exitedReviewMode"
+      ],
+      "identityFields": {
+        "id": "string"
+      }
+    },
+    {
+      "schema": "codex_app_server_protocol.schemas.json",
+      "types": [
+        "contextCompaction"
+      ],
+      "identityFields": {
+        "id": "string"
+      }
+    },
+    {
+      "schema": "codex_app_server_protocol.schemas.json",
+      "types": [
+        "bemItemPromoted"
+      ],
+      "identityFields": {
+        "turn_id": "string"
+      }
+    },
+    {
+      "schema": "codex_app_server_protocol.schemas.json",
+      "types": [
+        "existingCall"
+      ],
+      "identityFields": {
+        "callId": "string"
+      }
+    },
+    {
+      "schema": "codex_app_server_protocol.schemas.json",
+      "types": [
+        "item"
+      ],
+      "identityFields": {
+        "turnId": "string"
+      }
+    },
+    {
+      "schema": "codex_app_server_protocol.schemas.json",
+      "types": [
+        "turnStarted"
+      ],
+      "identityFields": {
+        "turn_id": "string"
+      }
+    },
+    {
+      "schema": "codex_app_server_protocol.schemas.json",
+      "types": [
+        "turnCompleted"
+      ],
+      "identityFields": {
+        "turn_id": "string"
+      }
+    }
+  ],
+  "cliVersion": "codex-cli 0.153.4",
+  "recordedAt": "2026-09-07T01:00:46.303762+00:00",
+  "command": [
+    "codex",
+    "app-server",
+    "generate-json-schema",
+    "--out",
+    "<owned-temporary-schema-dir>"
+  ],
+  "scope": "Public installed schema only; no native session or model call"
+}

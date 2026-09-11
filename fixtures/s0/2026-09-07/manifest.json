@@ -1,0 +1,15 @@
+{
+  "kind": "sanitized native recordings; integrity is not capability acceptance",
+  "recordings": {
+    "claude/recording.json": "79396aa97e75a15ced20f66222810e0467df1c78b29d93bff66bc4f2b8ace586",
+    "codex-mcp/recording.json": "8b13045b1af34d7954029198a5a1f2595b11a53ea97f94d0b8c506accdc6080f",
+    "codex-app-server/recording.json": "6c4a32edd9422e33d3ce8c463445385a1bad74682d43b95985c7d45bc776c524",
+    "app-server-preflight.json": "c6782e0fa04939439a63c23babc9a99711636bed75cb6bfc4e05449b926ca2ed"
+  },
+  "nativeProbeCounts": {
+    "claude": 1,
+    "codex-mcp": 1,
+    "codex-app-server": 1
+  },
+  "rawTapesPersisted": false
+}

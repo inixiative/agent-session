@@ -1,0 +1,23 @@
+{
+  "runId": "2026-09-07-correction-1",
+  "recordings": {
+    "claude/recording.json": "a4bcef3d7f9a73407a836057585eae624dc1cbc9459b29592e7fcf2c71bc8f40",
+    "codex-mcp/recording.json": "08cd9011bf2890a792c1dbe52c4c195a065c82ca04acbd258f3c4739c74688a3",
+    "schema-evidence.json": "7cd9e7e54def17fc787a4b39b8dd3e5e0a45d284a2255950f4168129e2ca103b",
+    "source-before/record.ts.txt": "cfff1ca19b4a0e0465389eba96609f086ab9e3166cafaba5017a24e8d40281f7",
+    "source-before/sanitize.ts.txt": "e260846c27bece68bfe20be95a5ae90b1c853dccb4b02ea8ee968cfd0a956951"
+  },
+  "previousRunUnchanged": {
+    "claude/recording.json": "79396aa97e75a15ced20f66222810e0467df1c78b29d93bff66bc4f2b8ace586",
+    "codex-mcp/recording.json": "8b13045b1af34d7954029198a5a1f2595b11a53ea97f94d0b8c506accdc6080f",
+    "codex-app-server/recording.json": "6c4a32edd9422e33d3ce8c463445385a1bad74682d43b95985c7d45bc776c524",
+    "app-server-preflight.json": "c6782e0fa04939439a63c23babc9a99711636bed75cb6bfc4e05449b926ca2ed"
+  },
+  "newProbeCounts": {
+    "claude": 1,
+    "codex-mcp": 1,
+    "codex-app-server": 0
+  },
+  "prerequisiteSiblingReport": ".qa/s0-2026-09-07T01-00-07.032Z/report.json",
+  "prerequisiteCrossRepositoryReport": ".qa/s0-cross-2026-09-07T00-59-28.763Z/report.json"
+}
