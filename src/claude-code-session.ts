@@ -39,7 +39,10 @@ import type {
   SessionEventHandler,
   SessionResult,
   SessionArtifact,
+  SessionTokens,
 } from "./harness-session";
+
+import { parseClaudeUsage } from "./claude-usage";
 
 // Re-export types so existing import paths keep working
 export type {
@@ -155,7 +158,7 @@ export class ClaudeCodeSession implements HarnessSession {
   private _handlers: SessionEventHandler[] = [];
   private _beforeSendHooks: BeforeSendHook[] = [];
   private _turns = 0;
-  private _totalTokens = { input: 0, output: 0 };
+  private _totalTokens: SessionTokens = { input: 0, output: 0 };
   private _startedAt: number;
   /**
    * Whether we've already seen a system/init event on the stream. If a second
@@ -199,7 +202,7 @@ export class ClaudeCodeSession implements HarnessSession {
   get externalSessionId(): string | undefined { return this._externalSessionId; }
   get events(): readonly SessionEvent[] { return this._eventLog; }
   get turns(): number { return this._turns; }
-  get totalTokens(): Readonly<{ input: number; output: number }> {
+  get totalTokens(): Readonly<SessionTokens> {
     return { ...this._totalTokens };
   }
 
@@ -455,7 +458,7 @@ export class ClaudeCodeSession implements HarnessSession {
     const result: SessionResult = {
       content: this._resultText,
       events: [...this._turnEvents],
-      tokens: this._turnEvents.find((e) => e.tokens)?.tokens,
+      tokens: this._turnEvents.find((e) => e.kind === "result")?.tokens,
       externalSessionId: this._externalSessionId,
     };
     this._inflight.resolve(result);
@@ -594,9 +597,13 @@ export class ClaudeCodeSession implements HarnessSession {
       if (event.kind === "result") {
         this._resultText = event.text ?? "";
       }
-      if (event.tokens) {
-        this._totalTokens.input += event.tokens.input;
-        this._totalTokens.output += event.tokens.output;
+      // Native result usage is authoritative for the whole turn. Request
+      // snapshots can repeat across content blocks and must not be added again.
+      if (event.kind === "result" && event.tokens) {
+        for (const key of ["input", "output", "cacheRead", "cacheWrite", "cacheWrite5m", "cacheWrite1h", "thinking"] as const) {
+          const value = event.tokens[key];
+          if (value !== undefined) this._totalTokens[key] = (this._totalTokens[key] ?? 0) + value;
+        }
       }
     }
 
@@ -661,6 +668,12 @@ export class ClaudeCodeSession implements HarnessSession {
 
     if (type === "assistant") {
       const message = msg.message as Record<string, unknown> | undefined;
+      const tokens = parseClaudeUsage(message?.usage);
+      if (tokens) {
+        // Preserve the envelope (message/request IDs, model and usage tags),
+        // including when a process dies before the terminal result arrives.
+        events.push({ kind: "usage", timestamp: ts, tokens, raw: msg });
+      }
       const content = message?.content;
       if (!Array.isArray(content)) return events;
 
@@ -724,20 +737,12 @@ export class ClaudeCodeSession implements HarnessSession {
         });
       }
     } else if (type === "result") {
-      const usage = msg.usage as
-        | Record<string, number>
-        | undefined;
       events.push({
         kind: "result",
         timestamp: ts,
         text: (msg.result as string) ?? "",
         externalSessionId: msg.session_id as string | undefined,
-        tokens: usage
-          ? {
-              input: usage.input_tokens ?? 0,
-              output: usage.output_tokens ?? 0,
-            }
-          : undefined,
+        tokens: parseClaudeUsage(msg.usage),
         raw: msg,
       });
     } else if (type === "error") {

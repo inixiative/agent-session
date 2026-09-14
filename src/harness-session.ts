@@ -25,8 +25,25 @@ export type SessionEventKind =
   | "tool_use"
   | "tool_result"
   | "thinking"
+  | "usage"
   | "result"
   | "error";
+
+/** Input excludes cache reads/writes when those disjoint counters are supplied.
+ * Thinking is a subset of output; TTL counters are subsets of cacheWrite.
+ * Missing optional counters mean the runtime did not report them.
+ */
+export interface SessionTokens {
+  input: number;
+  output: number;
+  cacheRead?: number;
+  cacheWrite?: number;
+  cacheWrite5m?: number;
+  cacheWrite1h?: number;
+  thinking?: number;
+  /** Original provider usage, including tags and future fields. Never summed. */
+  providerUsage?: Readonly<Record<string, unknown>>;
+}
 
 export interface SessionEvent {
   readonly kind: SessionEventKind;
@@ -49,8 +66,8 @@ export interface SessionEvent {
    * this is NOT the Foundry thread ID. A SessionAdapter maps between the two.
    */
   readonly externalSessionId?: string;
-  /** Token usage (for result). */
-  readonly tokens?: { input: number; output: number };
+  /** Turn totals on result; request snapshots on usage. Do not sum both. */
+  readonly tokens?: SessionTokens;
   /** Raw message from the stream (for Oracle introspection). */
   readonly raw?: unknown;
 }
@@ -59,7 +76,7 @@ export interface SessionEvent {
 export interface SessionResult {
   readonly content: string;
   readonly events: readonly SessionEvent[];
-  readonly tokens?: { input: number; output: number };
+  readonly tokens?: SessionTokens;
   /** The runtime's native session ID. See SessionEvent.externalSessionId. */
   readonly externalSessionId?: string;
 }
@@ -72,7 +89,7 @@ export interface SessionArtifact {
   readonly startedAt: number;
   readonly endedAt?: number;
   readonly turns: number;
-  readonly totalTokens: { input: number; output: number };
+  readonly totalTokens: SessionTokens;
   readonly toolCalls: number;
   readonly toolResults: number;
   readonly errors: number;
@@ -109,7 +126,7 @@ export interface HarnessSession {
   readonly externalSessionId: string | undefined;
   readonly events: readonly SessionEvent[];
   readonly turns: number;
-  readonly totalTokens: Readonly<{ input: number; output: number }>;
+  readonly totalTokens: Readonly<SessionTokens>;
 
   /** Spawn the underlying process. Must be called before send(). */
   start(): Promise<void>;

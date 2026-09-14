@@ -19,3 +19,5 @@ export {
   type CodexSessionConfig,
   type CodexSpawn,
 } from "./codex-session";
+
+export { parseClaudeUsage } from "./claude-usage";
