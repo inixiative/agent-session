@@ -394,7 +394,7 @@ for (const engine of ["claude", "mcp"] as const) {
       artifact.events.forEach(mutateEvent);
       expect(f.session.events).toHaveLength(count);
       for (const value of [result, snapshot, f.session.attempts[0]]) {
-        expect(value.content).toBe("completed output"); expect(value.tokens).toEqual({ input: 12, output: 3 });
+        expect(value.content).toBe("completed output"); expect(value.tokens).toEqual(engine === "claude" ? { input: 12, output: 3, providerUsage: { input_tokens: 12, output_tokens: 3 } } : { input: 12, output: 3 });
         expect(value.terminal?.type).toBe(engine === "claude" ? "result" : "task_complete");
         const tool = value.events.find(e => e.kind === "tool_use")!;
         const raw = tool.raw as any;

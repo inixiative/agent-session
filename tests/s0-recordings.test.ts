@@ -108,8 +108,10 @@ async function replay(recording: any, chunkSize: number) {
 function historicalProjection(events: any[], engine: string) {
   // Historical artifacts remain byte-for-byte. S1 intentionally adds native status,
   // terminals and Claude user/tool_result, and removes MCP's duplicate begin.
+  // Cache telemetry intentionally adds per-request usage events.
   let seenBegin = false;
   return events.filter(e => {
+    if (e.kind === "usage") return false;
     if (e.kind === "native_status" || (e.kind === "result" && e.raw?.type === "task_complete")) return false;
     if (engine === "claude" && e.kind === "tool_result") return false;
     if (engine === "codex-mcp" && e.kind === "tool_use") { if (seenBegin) return false; seenBegin = true; }
@@ -123,7 +125,9 @@ function observable(events: any[]) {
   return events.filter(e => e.kind !== "thinking" && e.type !== "thinking").map(e => ({
     kind: e.kind, text: typeof e.text === "string" ? s.text(e.text) : undefined,
     toolName: e.toolName, toolInput: s.clean(e.toolInput), toolOutput: e.toolOutput ? s.text(e.toolOutput) : undefined,
-    toolError: e.toolError, tokens: e.tokens,
+    toolError: e.toolError,
+    // Historical recordings predate cache counters and provider usage retention.
+    tokens: e.tokens ? { input: e.tokens.input, output: e.tokens.output } : undefined,
   }));
 }
 

@@ -22,7 +22,7 @@ await session.start();
 
 const result = await session.send("Build a CLI that …");
 console.log(result.content);          // final text
-console.log(result.tokens);           // { input, output }
+console.log(result.tokens);           // input/output + reported cache/thinking counters
 for (const e of result.events) {      // full classified event stream
   if (e.kind === "tool_use") console.log("tool:", e.toolName);
 }
@@ -50,6 +50,21 @@ session.kill();
 `HarnessSession` is the provider-agnostic contract (`start` / `send` / `kill` /
 `fork` / `interrupt` + an event handler). `ClaudeCodeSession` implements it over
 `claude --print --input-format stream-json --output-format stream-json`.
+
+## Usage telemetry
+
+Claude results preserve `cacheRead`, `cacheWrite`, `cacheWrite5m`, `cacheWrite1h`,
+and `thinking` alongside `input`/`output`. Input excludes the disjoint cache
+counters; thinking is already included in output and TTL counts are included in
+cacheWrite. Unreported optional counters remain absent. `providerUsage` retains
+the entire original usage object, including service tier and future tags.
+
+`result` events and `send().tokens` carry the native turn aggregate. Session
+`totalTokens` and artifact totals sum these completed results once. `usage`
+events carry request snapshots with the original envelope (request/message IDs,
+model and tags) in `raw`; they may repeat across content blocks. Do not sum
+request snapshots together with result totals. Interrupted turns retain request
+snapshots in the artifact but do not fabricate a completed-turn total.
 
 ## Roadmap
 

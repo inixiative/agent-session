@@ -1,4 +1,4 @@
-import { SessionTurnError, type SessionAttempt, type SessionEvent, type SessionIdentity, type SessionResult } from "./harness-session";
+import { SessionTurnError, type SessionAttempt, type SessionEvent, type SessionIdentity, type SessionResult, type SessionTokens } from "./harness-session";
 import { retainEvidence } from "./retained-evidence";
 /** Per-admission evidence. Caller settlement never transfers native ownership. */
 export class TurnState {
@@ -13,9 +13,9 @@ export class TurnState {
   set terminal(value: SessionAttempt["terminal"]) { this._terminal = retainEvidence(value); }
   events: SessionEvent[] = [];
   content = "";
-  private _tokens?: { input: number; output: number };
+  private _tokens?: SessionTokens;
   get tokens() { return this._tokens; }
-  set tokens(value: { input: number; output: number } | undefined) { this._tokens = retainEvidence(value); }
+  set tokens(value: SessionTokens | undefined) { this._tokens = retainEvidence(value); }
   localFailure?: SessionAttempt["localFailure"];
   rpcSettled = false;
   rpcOutcome?: SessionAttempt["rpcOutcome"];
@@ -35,7 +35,8 @@ export class TurnState {
     this.events.push(e);
     if ((e.kind === "text" || e.kind === "result") && e.text) this.content = e.text;
     if (e.kind === "text_delta" && e.text) this.content += e.text;
-    if (e.tokens) this.tokens = e.tokens;
+    // Usage events are per-request snapshots; the terminal result carries the turn total.
+    if (e.tokens && e.kind !== "usage") this.tokens = e.tokens;
     return e;
   }
 }

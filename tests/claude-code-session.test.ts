@@ -130,7 +130,7 @@ describe("ClaudeCodeSession", () => {
     const result = await session.send("hello");
 
     expect(result.content).toBe("ok");
-    expect(result.tokens).toEqual({ input: 10, output: 2 });
+    expect(result.tokens).toMatchObject({ input: 10, output: 2 });
     expect(result.externalSessionId).toBe("test-session-1");
 
     const kinds = result.events.map((e) => e.kind);
@@ -387,5 +387,56 @@ describe("ClaudeCodeSession", () => {
     await session.send("again");
     // No additional events received after unsubscribe
     expect(received.length).toBe(countAfterFirst);
+  });
+});
+
+
+describe("Claude usage telemetry", () => {
+  const usage = {
+    input_tokens: 10, output_tokens: 20,
+    cache_read_input_tokens: 1000, cache_creation_input_tokens: 200,
+    cache_creation: { ephemeral_5m_input_tokens: 50, ephemeral_1h_input_tokens: 150 },
+    output_tokens_details: { thinking_tokens: 12 },
+    service_tier: "standard", inference_geo: "us", future_tag: { retained: true },
+  };
+
+  test("preserves tags and disjoint cache counters through results, totals and artifacts", async () => {
+    const fake = makeFakeProc({ autoReplyOnSend: false });
+    const session = makeSession(fake);
+    fake.onStdin(() => queueMicrotask(() => {
+      // The same request can appear once per content block. Result is the
+      // authoritative aggregate, not an additional billable request.
+      for (let i = 0; i < 2; i++) fake.emit({ type: "assistant", requestId: "request-1",
+        message: { id: "message-1", model: "test-model", usage, content: [{ type: "text", text: "ok" }] } });
+      fake.emit({ type: "result", subtype: "success", result: "done", usage });
+    }));
+    await session.start();
+    try {
+      const result = await session.send("hello");
+      expect(result.tokens).toEqual({ input: 10, output: 20, cacheRead: 1000,
+        cacheWrite: 200, cacheWrite5m: 50, cacheWrite1h: 150, thinking: 12, providerUsage: usage });
+      expect(result.events.filter(e => e.kind === "usage")).toHaveLength(2);
+      expect(result.events.find(e => e.kind === "usage")?.raw).toMatchObject({ requestId: "request-1", message: { id: "message-1", usage } });
+      await session.send("again");
+      expect(session.totalTokens).toEqual({ input: 20, output: 40, cacheRead: 2000,
+        cacheWrite: 400, cacheWrite5m: 100, cacheWrite1h: 300, thinking: 24 });
+      const artifact = JSON.parse(JSON.stringify(session.artifact()));
+      expect(artifact.totalTokens).toEqual(session.totalTokens);
+      expect(artifact.events.find((e: SessionEvent) => e.kind === "result").tokens.providerUsage).toEqual(usage);
+    } finally { session.kill(); }
+  });
+
+  test("keeps request usage available after an interrupted turn without fabricating turn totals", async () => {
+    const fake = makeFakeProc({ autoReplyOnSend: false });
+    const session = makeSession(fake);
+    await session.start();
+    const pending = session.send("hello");
+    const rejected = pending.catch(error => error);
+    fake.emit({ type: "assistant", message: { id: "partial", usage, content: [] } });
+    await new Promise<void>(resolve => session.onEvent(e => { if (e.kind === "usage") resolve(); }));
+    session.kill();
+    expect(await rejected).toBeInstanceOf(Error);
+    expect(session.artifact().events.find(e => e.kind === "usage")?.tokens?.providerUsage).toEqual(usage);
+    expect(session.totalTokens).toEqual({ input: 0, output: 0 });
   });
 });
