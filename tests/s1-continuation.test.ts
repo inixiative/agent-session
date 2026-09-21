@@ -3,7 +3,7 @@ import { mkdtempSync, readdirSync, readFileSync, writeFileSync, rmSync, symlinkS
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { ContinuationCapture } from "../scripts/s0/continuation";
-import { continuationPlan, CONTINUATION_TASKS, type ActivePath } from "../scripts/s0/continuation-plan";
+import { continuationPlan, CONTINUATION_TASKS, PINNED_BUN_VERSION, type ActivePath } from "../scripts/s0/continuation-plan";
 import { reserveOutput, sampleManifest } from "../scripts/s0/continuation-record";
 import { Sanitizer } from "../scripts/s0/sanitize";
 const runId = "s1-continuation-20260907T040000Z";
@@ -29,7 +29,7 @@ function fixture(path: ActivePath, scenario = "success", fault?: "stdin" | "stdo
   const tool = (index: number) => {
     const task = CONTINUATION_TASKS[index];
     const command = `bun --version && cat ${task.file}` + (scenario === "extra-command" ? " && PRIVATE_UNRELATED_COMMAND" : "");
-    const content = `1.3.14\n${task.content}`;
+    const content = `${PINNED_BUN_VERSION}\n${task.content}`;
     if (path === "claude") {
       emit({ type: "assistant", session_id: nativeSession, message: { id: `PRIVATE_MESSAGE_${index}`, content: [
         { type: "thinking", thinking: "PRIVATE_REASONING_SENTINEL" },

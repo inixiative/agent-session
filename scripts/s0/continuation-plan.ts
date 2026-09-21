@@ -13,7 +13,7 @@ export const REQUESTED = { claude: { model: "claude-fable-5-1", effort: "max" },
  * the same value in tool output. This is a deliberate portability limit, not a general
  * version policy.
  */
-export const PINNED_BUN_VERSION = "1.3.14";
+export const PINNED_BUN_VERSION = "1.4.2";
 export function continuationPlan(path: string, runId: string) {
   if (path !== "claude" && path !== "codex-mcp") throw Error("Choose claude or codex-mcp; app-server is excluded");
   if (!/^s1-continuation-\d{8}T\d{6}Z$/.test(runId)) throw Error("Use a new s1-continuation-YYYYMMDDTHHMMSSZ run ID");

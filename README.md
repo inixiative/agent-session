@@ -73,3 +73,7 @@ and the inixiative bench.
 ## License
 
 MIT
+
+## Runtime
+
+Development and new continuation captures use Bun 1.4.2, pinned in `.bun-version` and `package.json`. Historical S0 recordings retain their original Bun 1.3.14 evidence; they are not new 1.4.2 captures.

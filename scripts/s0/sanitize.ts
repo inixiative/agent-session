@@ -1,5 +1,5 @@
 // S0 observation only. No raw transcript, reasoning, environment or auth values leave memory.
-import { CONTINUATION_TASKS } from "./continuation-plan";
+import { PINNED_BUN_VERSION, CONTINUATION_TASKS } from "./continuation-plan";
 export const PROMPT = "Disposable protocol probe. Use a shell tool to run exactly: bun --version && cat sentinel.txt . Read only this controlled directory. Do not edit files, inspect other directories, use agents, or do other work. Then respond briefly with S0_PROBE_OK and the two observed outputs.";
 const tags = new Set(`native_status system init assistant user tool tool_use tool_result text thinking reasoning result success error stream_error session_start session_end session_compact codex/event session_configured task_started task_complete turn_started turn_complete item_started item_completed agent_message agent_message_delta agent_reasoning agent_reasoning_delta agent_reasoning_section_break agent_reasoning_raw_content agent_reasoning_raw_content_delta exec_command_begin exec_command_end exec_command_output_delta token_count token_usage usage tokenUsage command_execution commandExecution agentMessage mcp_tool_call_begin mcp_tool_call_end raw_response_item function_call function_call_output message completed failed interrupted in_progress cancelled initialize initialized notifications/initialized tools/list tools/call thread/start turn/start turn/started turn/completed item/started item/completed thread/tokenUsage/updated notification`.split(" "));
 // Installed codex0.153.4 generated schema variants; unknown types still lose payload.
@@ -53,6 +53,7 @@ export class Sanitizer {
     // Only controlled literals are retained, even inside tool output or errors.
     // Every other character is redacted; reasoning blocks never reach this branch.
     const literals = ["bun --version", "cat sentinel.txt", "S0_SENTINEL_OK", "S0_PROBE_OK", "1.3.14"];
+    if (this.profile === "continuation") literals.push(PINNED_BUN_VERSION);
     if (this.profile === "continuation") for (const task of CONTINUATION_TASKS) literals.push(`cat ${task.file}`, task.content.trim(), task.marker);
     const found = literals.filter(t => value.includes(t));
     return found.length ? found.join("\n") : "[redacted]";
