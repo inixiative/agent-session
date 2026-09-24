@@ -115,6 +115,8 @@ export interface CodexPrimedConfig {
    * with no tier, and a tighter tail. May consume subscription usage faster; off when omitted.
    */
   serviceTier?: string;
+  /** Extra per-thread configuration merged over CODEX_DECISION_THREAD_CONFIG (e.g. provider transport settings). */
+  threadConfig?: Readonly<Record<string, unknown>>;
   clientName?: string;
   onEvent?: (event: PrimedEvent) => void;
 }
@@ -136,6 +138,7 @@ interface Primed {
 
 interface KeyState {
   lastHash?: string;
+  touched: number;
   volatile: boolean;
   priming?: { hash: string; done: Promise<void> };
 }
@@ -151,6 +154,8 @@ interface Branch {
   usage?: Record<string, unknown>;
   violation?: string;
   error?: string;
+  /** The runtime fell back from its websocket transport to HTTPS during this turn. */
+  transportFallback?: boolean;
   terminal?: { status: string; error?: Record<string, unknown> };
   lost?: boolean;
   /** Resolves on the native terminal. */
@@ -443,7 +448,14 @@ export class CodexPrimedSessions implements PrimedSessions {
       case "item/agentMessage/delta": if (typeof params?.delta === "string") branch.partial += params.delta; break;
       case "thread/tokenUsage/updated": branch.usage = object(object(params?.tokenUsage)?.last); break;
       case "mcpServer/startupStatus/updated": this._violation(conn, threadId, branch, "mcp server started"); break;
-      case "error": branch.error ??= typeof object(params?.error)?.message === "string" ? String(object(params?.error)?.message) : "native error"; break;
+      case "error": case "warning": {
+        const message = String(object(params?.error)?.message ?? params?.message ?? "");
+        // Transport notices are not failures: the runtime retries and falls back on its own.
+        if (/falling back from websockets/i.test(message)) {
+          if (!branch.transportFallback) { branch.transportFallback = true; this._emit({ type: "transport-fallback", key: branch.key }); }
+        } else if (method === "error") branch.error ??= message || "native error";
+        break;
+      }
       case "turn/completed":
         if (turn && (!branch.turnId || turn.id === branch.turnId)) {
           branch.turnId ??= typeof turn.id === "string" ? turn.id : undefined;
@@ -470,77 +482,129 @@ export class CodexPrimedSessions implements PrimedSessions {
     if (typeof turnId === "string") branch.turnId ??= turnId;
   }
 
-  /** Interrupt a losing hedge branch and release it, off the result path. Never recycles the shared process. */
-  private async _settleLoser(conn: JsonRpcConnection, threadId: string, branch: Branch, key: string): Promise<void> {
-    if (!branch.terminal && !branch.lost && branch.turnId)
+  /**
+   * Stop a branch this decision no longer needs and wait (bounded) for its terminal.
+   * True once its turn is settled; a violation or an unacknowledged interrupt recycles
+   * the process, and then settlement is its observed exit.
+   */
+  private async _stopBranch(conn: JsonRpcConnection, leg: { threadId: string; branch: Branch }): Promise<boolean> {
+    const { threadId, branch } = leg;
+    if (!branch.terminal && !branch.lost && branch.turnId) {
       await conn.request("turn/interrupt", { threadId, turnId: branch.turnId }, 2_000).catch(() => undefined);
-    await Promise.race([branch.done, Bun.sleep(5_000)]);
+      await Promise.race([branch.done, Bun.sleep(2_000)]);
+    }
+    let settled = !!branch.terminal || !!branch.lost;
+    if (branch.violation || !settled) settled = await this._recycle(conn, branch.violation ? `violation: ${branch.violation}` : "unacknowledged interrupt") || settled;
     this._branches.delete(threadId);
     if (this._conn === conn) void conn.request("thread/unsubscribe", { threadId }, 10_000).catch(() => undefined);
-    this._emit({ type: "hedge-settled", key, settled: !!branch.terminal || !!branch.lost });
+    return settled;
   }
 
   /**
    * Run one turn on a thread and wait for its terminal. With a hedge, a second branch
-   * starts once `hedge.afterMs` passes without an answer; the first to finish wins.
-   * On deadline, interrupt and wait briefly for acknowledgment; without it, recycle
-   * the process. A violation always recycles: the launch policy did not hold.
+   * starts in a free slot once `hedge.afterMs` passes without an answer. Only a completed
+   * turn, a violation or process loss decides the race; a branch that fails natively
+   * leaves the other running. The decision is settled only when every branch it started
+   * is: the other branch is interrupted before this returns. On deadline or abort, every
+   * branch is interrupted; without acknowledgment the process is recycled. A violation
+   * always recycles: the launch policy did not hold.
    */
   private async _turn(conn: JsonRpcConnection, threadId: string, branch: Branch, input: string, deadline: number,
     extra: Record<string, unknown>, signal?: AbortSignal,
     hedge?: { afterMs: number; open(): Promise<{ threadId: string; branch: Branch }>; key: string },
+    options: { recycleUnsettled?: boolean } = {},
   ): Promise<{ timedOut: boolean; aborted: boolean; settled: boolean; threadId: string; branch: Branch; hedged: boolean }> {
+    type Leg = { threadId: string; branch: Branch };
+    type Signal = { kind: "leg"; leg: Leg } | { kind: "timeout" } | { kind: "aborted" } | { kind: "hedge" }
+      | { kind: "started"; leg: Leg; release: () => void } | { kind: "hedge-failed"; unknown: boolean; release: () => void };
     const remaining = () => Math.max(1, deadline - Date.now());
     await this._startTurn(conn, threadId, branch, input, deadline, extra);
-    let winner = { threadId, branch }, hedged = false, second: { threadId: string; branch: Branch } | undefined;
+    const primary: Leg = { threadId, branch };
+    const legs: Leg[] = [primary];
+    let hedged = false, hedgeRelease: (() => void) | undefined, hedgeUnknown = false;
     let timer: ReturnType<typeof setTimeout> | undefined, hedgeTimer: ReturnType<typeof setTimeout> | undefined, onAbort: (() => void) | undefined;
-    const abort = new Promise<"aborted">(resolve => { onAbort = () => resolve("aborted"); if (signal?.aborted) onAbort(); else signal?.addEventListener("abort", onAbort, { once: true }); });
-    const expiry = new Promise<"timeout">(resolve => { timer = setTimeout(() => resolve("timeout"), remaining()); });
-    let stop = await Promise.race([branch.attention.then(() => "attention" as const), expiry, abort,
-      ...(hedge && hedge.afterMs < remaining() ? [new Promise<"hedge">(resolve => { hedgeTimer = setTimeout(() => resolve("hedge"), hedge.afterMs); })] : [])]);
-    clearTimeout(hedgeTimer);
-    if (stop === "hedge") {
-      try {
-        second = await hedge!.open();
-        await this._startTurn(conn, second.threadId, second.branch, input, deadline, extra);
-        hedged = true;
-        this._emit({ type: "hedged", key: hedge!.key, afterMs: hedge!.afterMs });
-      } catch {
-        // The hedge is an optimization: if it cannot start, keep waiting on the original.
-        if (second) { this._branches.delete(second.threadId); second = undefined; }
+    const waits = new Map<string, Promise<Signal>>();
+    const watch = (leg: Leg) => waits.set(`leg:${leg.threadId}`, leg.branch.attention.then(() => ({ kind: "leg", leg } as Signal)));
+    watch(primary);
+    waits.set("timeout", new Promise<Signal>(resolve => { timer = setTimeout(() => resolve({ kind: "timeout" }), remaining()); }));
+    waits.set("aborted", new Promise<Signal>(resolve => { onAbort = () => resolve({ kind: "aborted" }); if (signal?.aborted) onAbort(); else signal?.addEventListener("abort", onAbort, { once: true }); }));
+    if (hedge && hedge.afterMs < remaining()) waits.set("hedge", new Promise<Signal>(resolve => { hedgeTimer = setTimeout(() => resolve({ kind: "hedge" }), hedge.afterMs); }));
+    let winner: Leg | undefined, stop: "timeout" | "aborted" | undefined;
+    try {
+      while (!winner && !stop) {
+        const next = await Promise.race(waits.values());
+        switch (next.kind) {
+          case "timeout": case "aborted": stop = next.kind; break;
+          case "hedge": {
+            waits.delete("hedge");
+            if (primary.branch.terminal || primary.branch.violation || primary.branch.lost) break;
+            // Never beyond maxConcurrent: hedge only when a slot is free, and hold it until the branch settles.
+            const release = this._slots.tryAcquire();
+            if (!release) break;
+            let opened: Leg | undefined;
+            waits.set("start", (async (): Promise<Signal> => {
+              try {
+                opened = await hedge!.open();
+                await this._startTurn(conn, opened.threadId, opened.branch, input, deadline, extra);
+                return { kind: "started", leg: opened, release };
+              } catch (error) {
+                // A refused start wrote nothing that runs; any other failure may have started a turn we cannot see.
+                if (opened) this._branches.delete(opened.threadId);
+                return { kind: "hedge-failed", unknown: !!opened && !(error instanceof JsonRpcError), release };
+              }
+            })());
+            break;
+          }
+          case "started":
+            waits.delete("start");
+            hedgeRelease = next.release; hedged = true;
+            legs.push(next.leg); watch(next.leg);
+            this._emit({ type: "hedged", key: hedge!.key, afterMs: hedge!.afterMs });
+            break;
+          case "hedge-failed":
+            waits.delete("start");
+            next.release();
+            hedgeUnknown ||= next.unknown;
+            break;
+          case "leg": {
+            waits.delete(`leg:${next.leg.threadId}`);
+            const b = next.leg.branch;
+            const others = legs.filter(l => l !== next.leg && !l.branch.terminal && !l.branch.lost);
+            // A native failure on one branch leaves the other to answer; completion, violation or loss decides.
+            if (b.terminal && b.terminal.status !== "completed" && !b.violation && !b.lost && others.length) break;
+            winner = next.leg;
+            break;
+          }
+        }
       }
-      const raced = await Promise.race([branch.attention.then(() => "first" as const),
-        ...(second ? [second.branch.attention.then(() => "second" as const)] : []), expiry, abort]);
-      if (raced === "second") winner = second!;
-      stop = raced === "first" || raced === "second" ? "attention" : raced;
+    } finally {
+      clearTimeout(timer); clearTimeout(hedgeTimer);
+      if (onAbort) signal?.removeEventListener("abort", onAbort);
     }
-    clearTimeout(timer);
-    if (onAbort) signal?.removeEventListener("abort", onAbort);
     const timedOut = stop === "timeout", aborted = stop === "aborted";
-    const loser = second && (winner === second ? { threadId, branch } : second);
-    // A violation on either branch fails the decision; both run on the process being recycled.
-    if (loser && !loser.branch.violation) void this._settleLoser(conn, loser.threadId, loser.branch, hedge!.key);
-    if (loser?.branch.violation) {
-      winner.branch.violation ??= loser.branch.violation;
-      this._branches.delete(loser.threadId); // the recycle below ends it with the process
+    const chosen = winner ?? primary;
+    // Every other branch this decision started is stopped before the decision reports.
+    let othersSettled = true;
+    for (const leg of legs) if (leg !== chosen) othersSettled = await this._stopBranch(conn, leg) && othersSettled;
+    const loserViolation = legs.find(l => l !== chosen && l.branch.violation)?.branch.violation;
+    if (loserViolation) chosen.branch.violation ??= loserViolation;
+    hedgeRelease?.();
+    let settled = !!chosen.branch.terminal;
+    if (!chosen.branch.terminal && !chosen.branch.lost && chosen.branch.turnId) {
+      await conn.request("turn/interrupt", { threadId: chosen.threadId, turnId: chosen.branch.turnId }, 2_000).catch(() => undefined);
+      await Promise.race([chosen.branch.done, Bun.sleep(2_000)]);
+      settled = !!chosen.branch.terminal;
     }
-    branch = winner.branch; threadId = winner.threadId;
-    let settled = !!branch.terminal;
-    if (!branch.terminal && !branch.lost && branch.turnId) {
-      await conn.request("turn/interrupt", { threadId, turnId: branch.turnId }, 2_000).catch(() => undefined);
-      await Promise.race([branch.done, Bun.sleep(2_000)]);
-      settled = !!branch.terminal;
+    if (chosen.branch.violation || hedgeUnknown || (!settled && options.recycleUnsettled !== false)) {
+      const reason = chosen.branch.violation ? `violation: ${chosen.branch.violation}` : hedgeUnknown ? "hedge turn/start unsettled" : "unacknowledged interrupt";
+      settled = await this._recycle(conn, reason) || settled;
     }
-    if (branch.violation || !settled) {
-      const exited = await this._recycle(conn, branch.violation ? `violation: ${branch.violation}` : "unacknowledged interrupt");
-      settled ||= exited;
-    }
-    return { timedOut, aborted, settled, threadId, branch, hedged };
+    return { timedOut, aborted, settled: settled && othersSettled, threadId: chosen.threadId, branch: chosen.branch, hedged };
   }
 
   private _threadParams(instructions: string): Record<string, unknown> {
     return { model: this._config.model, cwd: this._config.cwd, approvalPolicy: "never", sandbox: "read-only",
-      baseInstructions: this._config.baseInstructions, developerInstructions: instructions, config: { ...CODEX_DECISION_THREAD_CONFIG },
+      baseInstructions: this._config.baseInstructions, developerInstructions: instructions, config: { ...CODEX_DECISION_THREAD_CONFIG, ...this._config.threadConfig },
       ...(this._config.serviceTier ? { serviceTier: this._config.serviceTier } : {}) };
   }
 
@@ -555,7 +619,8 @@ export class CodexPrimedSessions implements PrimedSessions {
     let ok = false;
     try {
       let outcome: { timedOut: boolean; aborted: boolean; settled: boolean };
-      try { outcome = await this._turn(conn, baseId, branch, `${spec.context}${PRIMER_SUFFIX}`, deadline, {}, signal); }
+      // A primer is background work: an unacknowledged interrupt must not recycle the process every decision shares.
+      try { outcome = await this._turn(conn, baseId, branch, `${spec.context}${PRIMER_SUFFIX}`, deadline, {}, signal, undefined, { recycleUnsettled: false }); }
       catch (error) {
         // A primer turn/start without the runtime's own answer may still run: recycle before reporting.
         const settled = error instanceof JsonRpcError || await this._recycle(conn, "primer turn/start unsettled");
@@ -580,7 +645,8 @@ export class CodexPrimedSessions implements PrimedSessions {
 
   private _keyState(key: string): KeyState {
     let state = this._keys.get(key);
-    if (!state) { state = { volatile: false }; this._keys.set(key, state); }
+    if (!state) { state = { volatile: false, touched: Date.now() }; this._keys.set(key, state); }
+    state.touched = Date.now();
     return state;
   }
 
@@ -601,8 +667,10 @@ export class CodexPrimedSessions implements PrimedSessions {
         await this._makeRoom(spec.key);
         const primed = await this._prime(conn, spec, hash, Date.now() + this._config.timeoutMs);
         const current = this._sessions.get(spec.key);
-        // A newer context arrived, or the process changed, while priming: this one is already stale.
-        if (this._closed || state.lastHash !== hash || primed.generation !== this._generation) {
+        // Stale by the time it is ready: the key was evicted, a newer context arrived, the process changed,
+        // or the same context is already primed.
+        if (this._closed || this._keys.get(spec.key) !== state || state.lastHash !== hash || primed.generation !== this._generation
+          || (current && current.hash === hash && current.generation === this._generation)) {
           void conn.request("thread/delete", { threadId: primed.baseThreadId }, 10_000).catch(() => undefined);
           return;
         }
@@ -636,6 +704,8 @@ export class CodexPrimedSessions implements PrimedSessions {
     const cutoff = Date.now() - this._config.idleMs;
     for (const session of [...this._sessions.values()])
       if (session.inUse === 0 && session.lastUsed < cutoff) this._retire(session, "idle");
+    for (const [key, state] of this._keys)
+      if (!state.priming && !this._sessions.has(key) && state.touched < cutoff) this._keys.delete(key);
   }
 
   private async _makeRoom(except: string): Promise<void> {
@@ -666,7 +736,7 @@ export class CodexPrimedSessions implements PrimedSessions {
     if (!session && spec.context) void this._primeInBackground(conn, spec, hash, state);
     state.lastHash = hash;
     if (session) { session.inUse++; session.lastUsed = Date.now(); }
-    let threadId: string | undefined, admissionId: string | undefined, dispatched = false;
+    let threadId: string | undefined, admissionId: string | undefined, dispatched = false, hedgedDecision = false;
     // A miss runs inline: the stable context travels with this decision's input on a fresh thread.
     const input = session || !spec.context ? request.input : `${spec.context}\n\n${request.input}`;
     const params = this._threadParams(spec.instructions);
@@ -685,8 +755,9 @@ export class CodexPrimedSessions implements PrimedSessions {
       if (Date.now() >= deadline || signal?.aborted) throw expired();
       const t1 = performance.now();
       const opened = await openBranch().catch(error => {
-        // A lost primed thread is recoverable: retire it and prime again off-path.
-        if (session) this._retire(session, "reprime");
+        // The runtime refusing the fork means the primed thread is gone: retire it and prime again off-path.
+        // A timeout proves nothing about the primed thread.
+        if (session && error instanceof JsonRpcError) this._retire(session, "reprime");
         throw new DecisionError(`Branching ${spec.key} failed: ${(error as Error).message}`, "transport", "not-dispatched", true, undefined, { cause: error });
       });
       threadId = opened.threadId;
@@ -712,6 +783,7 @@ export class CodexPrimedSessions implements PrimedSessions {
         throw new DecisionError(`Codex turn/start failed: ${(error as Error).message}`, "transport", "attempted", settled, admissionId, { cause: error });
       }
       const turnMs = Math.round(performance.now() - t2);
+      hedgedDecision = outcome.hedged;
       if (outcome.threadId !== threadId) threadId = outcome.threadId; // the losing branch is settled by _settleLoser
       branch = outcome.branch;
       if (branch.violation) throw new DecisionError(`Decision violated the text-only policy (${branch.violation})`, "violation", "attempted", outcome.settled, admissionId);
@@ -732,10 +804,13 @@ export class CodexPrimedSessions implements PrimedSessions {
         ...(count(branch.usage?.inputTokens) !== undefined ? { input: count(branch.usage?.inputTokens) } : {}) });
       if (session) { session.servedWarm = true; state.volatile = false; }
       return { key: spec.key, admissionId, content, ...(tokens ? { tokens } : {}), ...(model ? { model } : {}),
-        threadId, ...(branch.turnId ? { turnId: branch.turnId } : {}), prime, ...(outcome.hedged ? { hedged: true } : {}), timing: { waitMs, primeMs, branchMs, turnMs } };
+        threadId, ...(branch.turnId ? { turnId: branch.turnId } : {}), prime, ...(outcome.hedged ? { hedged: true } : {}),
+        ...(branch.transportFallback ? { transportFallback: true } : {}), timing: { waitMs, primeMs, branchMs, turnMs } };
     } catch (error) {
-      if (error instanceof DecisionError) throw error;
-      throw new DecisionError((error as Error).message, "transport", dispatched ? "attempted" : "not-dispatched", !dispatched, admissionId, { cause: error });
+      const failure = error instanceof DecisionError ? error
+        : new DecisionError((error as Error).message, "transport", dispatched ? "attempted" : "not-dispatched", !dispatched, admissionId, { cause: error });
+      if (hedgedDecision) failure.hedged = true;
+      throw failure;
     } finally {
       if (session) {
         session.inUse--; session.lastUsed = Date.now();

@@ -61,6 +61,8 @@ export interface DecisionResult {
   readonly prime: "warm" | "cold";
   /** A second branch was started for this slow decision; the result is the first to finish. */
   readonly hedged?: boolean;
+  /** The runtime fell back from websockets to HTTPS during this decision's turn. */
+  readonly transportFallback?: boolean;
   readonly timing: { readonly waitMs: number; readonly primeMs: number; readonly branchMs: number; readonly turnMs: number };
 }
 
@@ -83,6 +85,8 @@ export class DecisionError extends Error {
     super(message, options);
     this.name = "DecisionError";
   }
+  /** A second branch was started for this decision before it failed; both were stopped. */
+  hedged?: boolean;
 }
 
 export type PrimedEvent =
@@ -94,7 +98,7 @@ export type PrimedEvent =
   | { readonly type: "limits"; readonly limits: LimitSnapshot }
   | { readonly type: "violation"; readonly key: string; readonly detail: string }
   | { readonly type: "hedged"; readonly key: string; readonly afterMs: number }
-  | { readonly type: "hedge-settled"; readonly key: string; readonly settled: boolean };
+  | { readonly type: "transport-fallback"; readonly key: string };
 
 export interface PrimedSnapshot {
   readonly runtime: "codex" | "claude";
@@ -144,6 +148,7 @@ export class Slots {
     return new Promise((resolve, reject) => {
       const leave = (error: DecisionError) => {
         const index = this._waiters.indexOf(waiter);
+        signal?.removeEventListener("abort", onAbort);
         if (index >= 0) { this._waiters.splice(index, 1); clearTimeout(waiter.timer); reject(error); }
       };
       const onAbort = () => leave(new DecisionError("Decision aborted before dispatch", "aborted", "not-dispatched", true));
@@ -156,6 +161,18 @@ export class Slots {
       this._waiters.push(waiter);
     });
   }
+  /** A slot only if one is free now (never queues). */
+  tryAcquire(): (() => void) | undefined {
+    if (this._active >= this._limit || this._waiters.length) return undefined;
+    this._active++;
+    let released = false;
+    return () => {
+      if (released) return; released = true;
+      const next = this._waiters.shift();
+      if (next) { clearTimeout(next.timer); next.grant(); } else this._active--;
+    };
+  }
+
   /** Reject every waiter (close). Held slots are released by their owners. */
   drain(error: Error): void {
     for (const waiter of this._waiters.splice(0)) { clearTimeout(waiter.timer); waiter.fail(error); }

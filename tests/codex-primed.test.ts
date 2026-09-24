@@ -5,7 +5,7 @@ import { fakeProcess, tick } from "./helpers/fake-process";
 const cleanup: Array<() => Promise<void> | void> = [];
 afterEach(async () => { for (const fn of cleanup.splice(0)) await fn(); });
 
-type Behavior = "answer" | "hold" | "tool" | "rate-limit" | "fail" | "server-request";
+type Behavior = "answer" | "slow-answer" | "hold" | "hold-ignore" | "tool" | "rate-limit" | "fail" | "server-request";
 interface DoubleOptions { account?: string; blocked?: boolean; orphans?: string[]; behavior?: (input: string, occurrence: number) => Behavior; forkError?: boolean }
 
 /** codex app-server double: persisted threads, forks, turns and account reads. */
@@ -14,6 +14,7 @@ function appServer(opts: DoubleOptions = {}) {
   const argvs: string[][] = [], envs: Record<string, string | undefined>[] = [];
   let threads = 0, turns = 0;
   const seen = new Map<string, number>();
+  const ignoreInterrupt = new Set<string>();
   const threadMeta = new Map<string, { ephemeral: boolean; parent?: string; lastTurnId?: string; developer?: string; base?: string }>();
   const spawn = (argv: string[], options: { env: Record<string, string | undefined> }) => {
     argvs.push(argv); envs.push(options.env);
@@ -49,6 +50,7 @@ function appServer(opts: DoubleOptions = {}) {
           const occurrence = (seen.get(input) ?? 0) + 1; seen.set(input, occurrence);
           const behavior = input.includes("standing context") ? "answer" : opts.behavior?.(input, occurrence) ?? "answer";
           if (behavior === "hold") return;
+          if (behavior === "hold-ignore") { ignoreInterrupt.add(turnId); return; }
           if (behavior === "tool") { emit("item/started", { item: { id: "cmd", type: "commandExecution", command: "ls" } }); return; }
           if (behavior === "server-request") { io.emit({ id: "srv-1", method: "item/commandExecution/requestApproval", params: { threadId, turnId } }); return; }
           if (behavior === "rate-limit" || behavior === "fail") {
@@ -57,14 +59,18 @@ function appServer(opts: DoubleOptions = {}) {
             return;
           }
           const text = input.includes("standing context") ? "OK" : `decided: ${input}`;
-          emit("item/completed", { item: { id: `a${turnId}`, type: "agentMessage", text, phase: "final_answer" } });
-          emit("thread/tokenUsage/updated", { tokenUsage: { last: { inputTokens: 100, cachedInputTokens: 80, outputTokens: 5, reasoningOutputTokens: 1 } } });
-          emit("turn/completed", { turn: { id: turnId, status: "completed", items: [], error: null } });
+          const answer = () => {
+            emit("item/completed", { item: { id: `a${turnId}`, type: "agentMessage", text, phase: "final_answer" } });
+            emit("thread/tokenUsage/updated", { tokenUsage: { last: { inputTokens: 100, cachedInputTokens: 80, outputTokens: 5, reasoningOutputTokens: 1 } } });
+            emit("turn/completed", { turn: { id: turnId, status: "completed", items: [], error: null } });
+          };
+          if (behavior === "slow-answer") setTimeout(answer, 150); else answer();
           return;
         }
         case "turn/interrupt": {
           reply({});
-          io.emit({ method: "turn/completed", params: { threadId: p.threadId, turn: { id: p.turnId, status: "interrupted", items: [], error: null } } });
+          if (!ignoreInterrupt.has(p.turnId))
+            io.emit({ method: "turn/completed", params: { threadId: p.threadId, turn: { id: p.turnId, status: "interrupted", items: [], error: null } } });
           return;
         }
       }
@@ -326,10 +332,9 @@ describe("CodexPrimedSessions hedging", () => {
     expect(result).toMatchObject({ content: "decided: slow", prime: "warm", hedged: true });
     expect(Date.now() - started).toBeLessThan(1_000);
     expect(d.requests("thread/fork")).toHaveLength(2);
-    await tick(20);
+    // The other branch was interrupted and settled before the decision reported.
     expect(d.requests("turn/interrupt")).toHaveLength(1);
     expect(events.filter(e => e.type === "hedged")).toHaveLength(1);
-    expect(events.find(e => e.type === "hedge-settled")).toMatchObject({ settled: true });
     expect(d.processes[0]!.killed).toBe(false);
   });
 
@@ -350,5 +355,43 @@ describe("CodexPrimedSessions hedging", () => {
     expect(error).toMatchObject({ reason: "timeout", dispatch: "attempted", settled: true });
     await tick(20);
     expect(d.requests("turn/interrupt")).toHaveLength(2);
+  });
+});
+
+describe("CodexPrimedSessions hedging review regressions", () => {
+  test("a hedge never exceeds maxConcurrent", async () => {
+    const d = appServer({ behavior: (input, n) => input === "slow" && n === 1 ? "hold" : "answer" });
+    const { h, events } = host(d, { hedgeAfterMs: 40, maxConcurrent: 1, timeoutMs: 400 });
+    await h.prime(spec);
+    const error = await h.decide(spec, { input: "slow" }).catch(e => e);
+    expect(error.reason).toBe("timeout");
+    expect(events.some(e => e.type === "hedged")).toBe(false);
+    expect(d.requests("thread/fork")).toHaveLength(1);
+  });
+
+  test("a hedge that fails natively does not beat a healthy original", async () => {
+    const d = appServer({ behavior: (input, n) => input === "q" ? (n === 1 ? "slow-answer" : "rate-limit") : "answer" });
+    const { h } = host(d, { hedgeAfterMs: 30 });
+    await h.prime(spec);
+    const result = await h.decide(spec, { input: "q" });
+    expect(result).toMatchObject({ content: "decided: q", hedged: true });
+    expect(h.limits()?.blocked).toBeFalsy();
+  });
+
+  test("an evicted key is not brought back by a prime that was already running", async () => {
+    const d = appServer(); const { h } = host(d);
+    await h.decide(spec, { input: "q1" }); // miss: priming starts in the background
+    await h.evict(spec.key);
+    await tick(30);
+    expect(h.snapshot().sessions).toBe(0);
+  });
+
+  test("an interrupt the runtime never acknowledges on the other branch makes the decision recycle before reporting settled", async () => {
+    const d = appServer({ behavior: (input, n) => input === "slow" ? (n === 1 ? "hold" : "hold-ignore") : "answer" });
+    const { h } = host(d, { hedgeAfterMs: 40, timeoutMs: 300 });
+    await h.prime(spec);
+    const error = await h.decide(spec, { input: "slow" }).catch(e => e);
+    expect(error).toMatchObject({ reason: "timeout", settled: true, hedged: true });
+    expect(d.processes[0]!.killed).toBe(true);
   });
 });
