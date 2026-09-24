@@ -110,6 +110,9 @@ decision in flight on it fails at once (`transport`), and the next decision on
 each key re-primes on a fresh process.
 
 Decisions are serialized per key and bounded across keys (`maxConcurrent`).
+`DecisionRequest.signal` cancels: a waiting decision is refused before dispatch,
+a running one is interrupted and reports settlement from the acknowledgment or
+the process exit.
 `onAdmission` runs before the native write; `DecisionError` states whether
 anything was dispatched and whether the turn is settled (terminal observed or
 process exit observed). Blocked limits refuse before dispatch; there is no
