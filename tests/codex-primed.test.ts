@@ -263,3 +263,20 @@ describe("CodexPrimedSessions review regressions", () => {
     expect(d.processes.length).toBe(2);
   });
 });
+
+describe("CodexPrimedSessions cancellation", () => {
+  test("an abort refuses queued work before dispatch and interrupts a running turn", async () => {
+    const d = appServer({ behavior: input => input === "slow" ? "hold" : "answer" }); const { h } = host(d, { maxConcurrent: 1, timeoutMs: 5_000 });
+    await h.decide(spec, { input: "q1" });
+    const controller = new AbortController();
+    const running = h.decide(spec, { input: "slow", signal: controller.signal }).catch(e => e);
+    const waiting = h.decide({ ...spec, key: "other" }, { input: "q2", signal: controller.signal }).catch(e => e);
+    await tick(10);
+    controller.abort();
+    expect(await running).toMatchObject({ reason: "aborted", dispatch: "attempted", settled: true });
+    expect(await waiting).toMatchObject({ reason: "aborted", dispatch: "not-dispatched" });
+    expect(d.requests("turn/interrupt")).toHaveLength(1);
+    await expect(h.decide(spec, { input: "q3", signal: AbortSignal.abort() })).rejects.toMatchObject({ reason: "aborted", dispatch: "not-dispatched" });
+    expect((await h.decide(spec, { input: "q4" })).content).toBe("decided: q4");
+  });
+});

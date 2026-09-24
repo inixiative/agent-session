@@ -44,6 +44,8 @@ export interface DecisionRequest {
   readonly onAdmission?: (admission: DecisionAdmission) => void | Promise<void>;
   /** JSON Schema constraining the final message (Codex only). */
   readonly outputSchema?: Readonly<Record<string, unknown>>;
+  /** Cancel: refused before dispatch, or the running turn is interrupted and settled. */
+  readonly signal?: AbortSignal;
 }
 
 export interface DecisionResult {
@@ -61,7 +63,7 @@ export interface DecisionResult {
 }
 
 export type DecisionFailure =
-  | "closed" | "busy" | "admission" | "rate-limited" | "auth" | "timeout" | "violation" | "transport" | "native-failed" | "prime-failed";
+  | "closed" | "busy" | "admission" | "rate-limited" | "auth" | "timeout" | "aborted" | "violation" | "transport" | "native-failed" | "prime-failed";
 
 /**
  * `dispatch: "not-dispatched"`: no model input was written for this decision.
@@ -124,7 +126,8 @@ export class Slots {
   }
   get active() { return this._active; }
   get waiting() { return this._waiters.length; }
-  acquire(deadline: number): Promise<() => void> {
+  acquire(deadline: number, signal?: AbortSignal): Promise<() => void> {
+    if (signal?.aborted) return Promise.reject(new DecisionError("Decision aborted before dispatch", "aborted", "not-dispatched", true));
     const release = () => {
       let released = false;
       return () => {
@@ -135,11 +138,17 @@ export class Slots {
     };
     if (this._active < this._limit) { this._active++; return Promise.resolve(release()); }
     return new Promise((resolve, reject) => {
-      const waiter = { grant: () => resolve(release()), fail: reject, timer: setTimeout(() => {
+      const leave = (error: DecisionError) => {
         const index = this._waiters.indexOf(waiter);
-        if (index >= 0) this._waiters.splice(index, 1);
-        reject(new DecisionError("Decision expired waiting for a session slot", "busy", "not-dispatched", true));
-      }, Math.max(0, deadline - Date.now())) };
+        if (index >= 0) { this._waiters.splice(index, 1); clearTimeout(waiter.timer); reject(error); }
+      };
+      const onAbort = () => leave(new DecisionError("Decision aborted before dispatch", "aborted", "not-dispatched", true));
+      const waiter = {
+        grant: () => { signal?.removeEventListener("abort", onAbort); resolve(release()); },
+        fail: (error: Error) => { signal?.removeEventListener("abort", onAbort); reject(error); },
+        timer: setTimeout(() => leave(new DecisionError("Decision expired waiting for a session slot", "busy", "not-dispatched", true)), Math.max(0, deadline - Date.now())),
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
       this._waiters.push(waiter);
     });
   }

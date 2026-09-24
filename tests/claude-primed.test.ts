@@ -148,3 +148,16 @@ describe("ClaudePrimedSessions", () => {
     await expect(h.decide(spec, { input: "q2" })).rejects.toMatchObject({ reason: "closed" });
   });
 });
+
+describe("ClaudePrimedSessions cancellation", () => {
+  test("an abort interrupts the running decision through the control protocol", async () => {
+    const cli = claudeCli({ behavior: input => input === "slow" ? "hold" : "answer" }); const { h } = host(cli, { spare: false, timeoutMs: 5_000 });
+    await h.decide(spec, { input: "q1" });
+    const controller = new AbortController();
+    const running = h.decide(spec, { input: "slow", signal: controller.signal }).catch(e => e);
+    await tick(20);
+    controller.abort();
+    expect(await running).toMatchObject({ reason: "aborted", dispatch: "attempted", settled: true });
+    await expect(h.decide(spec, { input: "q2", signal: AbortSignal.abort() })).rejects.toMatchObject({ reason: "aborted", dispatch: "not-dispatched" });
+  });
+});

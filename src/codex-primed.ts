@@ -208,7 +208,7 @@ export class CodexPrimedSessions implements PrimedSessions {
       return Promise.reject(new DecisionError("Invalid decision request", "admission", "not-dispatched", true));
     const started = Date.now(), deadline = started + (request.timeoutMs ?? this._config.timeoutMs);
     return this._queue.run(spec.key, async () => {
-      const release = await this._slots.acquire(deadline);
+      const release = await this._slots.acquire(deadline, request.signal);
       try { return await this._decide(spec, request, started, deadline); }
       finally { release(); }
     });
@@ -421,16 +421,19 @@ export class CodexPrimedSessions implements PrimedSessions {
    * always recycles: the launch policy did not hold.
    */
   private async _turn(conn: JsonRpcConnection, threadId: string, branch: Branch, input: string, deadline: number,
-    extra: Record<string, unknown>): Promise<{ timedOut: boolean; settled: boolean }> {
+    extra: Record<string, unknown>, signal?: AbortSignal): Promise<{ timedOut: boolean; aborted: boolean; settled: boolean }> {
     const remaining = () => Math.max(1, deadline - Date.now());
     const response = object(await conn.request("turn/start", { threadId, input: [{ type: "text", text: input }],
       ...(this._config.effort ? { effort: this._config.effort } : {}), ...extra }, remaining()));
     const turnId = object(response?.turn)?.id;
     if (typeof turnId === "string") branch.turnId ??= turnId;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timedOut = await Promise.race([branch.attention.then(() => false),
-      new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(true), remaining()); })]);
+    let timer: ReturnType<typeof setTimeout> | undefined, onAbort: (() => void) | undefined;
+    const stop = await Promise.race([branch.attention.then(() => "attention" as const),
+      new Promise<"timeout">(resolve => { timer = setTimeout(() => resolve("timeout"), remaining()); }),
+      new Promise<"aborted">(resolve => { onAbort = () => resolve("aborted"); if (signal?.aborted) onAbort(); else signal?.addEventListener("abort", onAbort, { once: true }); })]);
     clearTimeout(timer);
+    if (onAbort) signal?.removeEventListener("abort", onAbort);
+    const timedOut = stop === "timeout", aborted = stop === "aborted";
     let settled = !!branch.terminal;
     if (!branch.terminal && !branch.lost && branch.turnId) {
       await conn.request("turn/interrupt", { threadId, turnId: branch.turnId }, 2_000).catch(() => undefined);
@@ -441,7 +444,7 @@ export class CodexPrimedSessions implements PrimedSessions {
       const exited = await this._recycle(conn, branch.violation ? `violation: ${branch.violation}` : "unacknowledged interrupt");
       settled ||= exited;
     }
-    return { timedOut, settled };
+    return { timedOut, aborted, settled };
   }
 
   private _threadParams(instructions: string): Record<string, unknown> {
@@ -449,7 +452,7 @@ export class CodexPrimedSessions implements PrimedSessions {
       baseInstructions: this._config.baseInstructions, developerInstructions: instructions, config: { ...CODEX_DECISION_THREAD_CONFIG } };
   }
 
-  private async _prime(conn: JsonRpcConnection, spec: PrimeSpec, hash: string, deadline: number): Promise<Primed> {
+  private async _prime(conn: JsonRpcConnection, spec: PrimeSpec, hash: string, deadline: number, signal?: AbortSignal): Promise<Primed> {
     const generation = this._generation, t0 = performance.now();
     if (!spec.context) {
       // Nothing to prime beyond instructions: each decision starts a fresh thread with the same prefix.
@@ -465,16 +468,16 @@ export class CodexPrimedSessions implements PrimedSessions {
     const branch = this._branch(conn, baseId, spec.key);
     let ok = false;
     try {
-      let outcome: { timedOut: boolean; settled: boolean };
-      try { outcome = await this._turn(conn, baseId, branch, `${spec.context}${PRIMER_SUFFIX}`, deadline, {}); }
+      let outcome: { timedOut: boolean; aborted: boolean; settled: boolean };
+      try { outcome = await this._turn(conn, baseId, branch, `${spec.context}${PRIMER_SUFFIX}`, deadline, {}, signal); }
       catch (error) {
         // A primer turn/start without the runtime's own answer may still run: recycle before reporting.
         const settled = error instanceof JsonRpcError || await this._recycle(conn, "primer turn/start unsettled");
         throw new DecisionError(`Priming ${spec.key} failed: ${(error as Error).message}`, "prime-failed", "not-dispatched", settled, undefined, { cause: error });
       }
-      ok = !outcome.timedOut && !branch.violation && branch.terminal?.status === "completed" && !!branch.turnId;
+      ok = !outcome.timedOut && !outcome.aborted && !branch.violation && branch.terminal?.status === "completed" && !!branch.turnId;
       if (!ok) {
-        const reason = branch.violation ? "violation" : outcome.timedOut ? "timeout"
+        const reason = branch.violation ? "violation" : outcome.aborted ? "aborted" : outcome.timedOut ? "timeout"
           : branch.terminal?.status === "failed" ? failureReason(branch.terminal.error) : branch.lost ? "transport" : "prime-failed";
         throw new DecisionError(`Priming ${spec.key} failed (${branch.violation ?? branch.terminal?.status ?? branch.error ?? "no terminal"})`,
           reason === "native-failed" ? "prime-failed" : reason, "not-dispatched", outcome.settled);
@@ -514,8 +517,10 @@ export class CodexPrimedSessions implements PrimedSessions {
 
   private async _decide(spec: PrimeSpec, request: DecisionRequest, started: number, deadline: number): Promise<DecisionResult> {
     const waitMs = Date.now() - started;
-    const expired = () => new DecisionError("Decision deadline passed before dispatch", "timeout", "not-dispatched", true);
-    if (Date.now() >= deadline) throw expired();
+    const signal = request.signal;
+    const expired = () => signal?.aborted ? new DecisionError("Decision aborted before dispatch", "aborted", "not-dispatched", true)
+      : new DecisionError("Decision deadline passed before dispatch", "timeout", "not-dispatched", true);
+    if (Date.now() >= deadline || signal?.aborted) throw expired();
     const conn = await this._process();
     await this._checkLimits();
     const hash = primeHash(spec);
@@ -524,7 +529,7 @@ export class CodexPrimedSessions implements PrimedSessions {
     if (!session) {
       await this._makeRoom(spec.key);
       const t = performance.now();
-      try { session = await this._prime(conn, spec, hash, deadline); }
+      try { session = await this._prime(conn, spec, hash, deadline, signal); }
       catch (error) {
         if (error instanceof DecisionError) throw error;
         throw new DecisionError(`Priming ${spec.key} failed: ${(error as Error).message}`, "prime-failed", "not-dispatched", true, undefined, { cause: error });
@@ -534,7 +539,7 @@ export class CodexPrimedSessions implements PrimedSessions {
     session.busy = true; session.lastUsed = Date.now();
     let threadId: string | undefined, admissionId: string | undefined, dispatched = false;
     try {
-      if (Date.now() >= deadline) throw expired();
+      if (Date.now() >= deadline || signal?.aborted) throw expired();
       const t1 = performance.now();
       const params = this._threadParams(spec.instructions);
       const response = object(await (session.baseThreadId
@@ -553,12 +558,12 @@ export class CodexPrimedSessions implements PrimedSessions {
       admissionId = crypto.randomUUID();
       try { await request.onAdmission?.({ admissionId, key: spec.key, runtime: "codex", threadId }); }
       catch (cause) { throw new DecisionError("Decision admission refused before dispatch", "admission", "not-dispatched", true, admissionId, { cause }); }
-      if (Date.now() >= deadline) throw expired();
+      if (Date.now() >= deadline || signal?.aborted) throw expired();
       if (this._conn !== conn || this._closed) throw new DecisionError("Codex process lost before dispatch", "transport", "not-dispatched", true, admissionId);
       const t2 = performance.now();
       dispatched = true;
-      let outcome: { timedOut: boolean; settled: boolean };
-      try { outcome = await this._turn(conn, threadId, branch, request.input, deadline, request.outputSchema ? { outputSchema: request.outputSchema } : {}); }
+      let outcome: { timedOut: boolean; aborted: boolean; settled: boolean };
+      try { outcome = await this._turn(conn, threadId, branch, request.input, deadline, request.outputSchema ? { outputSchema: request.outputSchema } : {}, signal); }
       catch (error) {
         // A JSON-RPC error is the runtime's own refusal. Anything else (timeout, loss) leaves the turn unknown until the process is gone.
         const settled = error instanceof JsonRpcError || await this._recycle(conn, "turn/start unsettled");
@@ -566,7 +571,10 @@ export class CodexPrimedSessions implements PrimedSessions {
       }
       const turnMs = Math.round(performance.now() - t2);
       if (branch.violation) throw new DecisionError(`Decision violated the text-only policy (${branch.violation})`, "violation", "attempted", outcome.settled, admissionId);
-      if (outcome.timedOut) throw new DecisionError("Decision deadline passed; turn interrupted", "timeout", "attempted", outcome.settled, admissionId);
+      if (outcome.aborted && !branch.terminal) throw new DecisionError("Decision aborted; turn interrupted", "aborted", "attempted", outcome.settled, admissionId);
+      if (outcome.timedOut && !branch.terminal) throw new DecisionError("Decision deadline passed; turn interrupted", "timeout", "attempted", outcome.settled, admissionId);
+      if ((outcome.aborted || outcome.timedOut) && branch.terminal?.status === "interrupted")
+        throw new DecisionError(`Decision ${outcome.aborted ? "aborted" : "deadline passed"}; turn interrupted`, outcome.aborted ? "aborted" : "timeout", "attempted", true, admissionId);
       const terminal = branch.terminal;
       const content = branch.finalText ?? branch.text;
       if (terminal?.status !== "completed" || content === undefined) {

@@ -119,7 +119,7 @@ export class ClaudePrimedSessions implements PrimedSessions {
     this._idleTimer ??= setInterval(() => void this._evictIdle(), Math.min(this._config.idleMs, 60_000));
     (this._idleTimer as { unref?: () => void }).unref?.();
     return this._queue.run(spec.key, async () => {
-      const release = await this._slots.acquire(deadline);
+      const release = await this._slots.acquire(deadline, request.signal);
       try { return await this._decide(spec, request, started, deadline); }
       finally { release(); }
     });
@@ -265,8 +265,10 @@ export class ClaudePrimedSessions implements PrimedSessions {
 
   private async _decide(spec: PrimeSpec, request: DecisionRequest, started: number, deadline: number): Promise<DecisionResult> {
     const waitMs = Date.now() - started;
-    const closed = () => new DecisionError("Primed sessions closed", "closed", "not-dispatched", true);
-    if (this._closed) throw closed();
+    const signal = request.signal;
+    const closed = () => signal?.aborted && !this._closed ? new DecisionError("Decision aborted before dispatch", "aborted", "not-dispatched", true)
+      : new DecisionError("Primed sessions closed", "closed", "not-dispatched", true);
+    if (this._closed || signal?.aborted) throw closed();
     if (Date.now() >= deadline) throw new DecisionError("Decision deadline passed before dispatch", "timeout", "not-dispatched", true);
     await this._checkLimits();
     this._sweepTranscripts();
@@ -279,13 +281,13 @@ export class ClaudePrimedSessions implements PrimedSessions {
         if (!idle) break;
         await this._drop(idle, "capacity");
       }
-      if (this._closed) throw closed();
+      if (this._closed || signal?.aborted) throw closed();
       const t = performance.now();
       session = await this._prime(spec, hash, deadline);
       primeMs = Math.round(performance.now() - t); prime = "cold";
     }
     await session.cleanup;
-    if (this._closed) throw closed();
+    if (this._closed || signal?.aborted) throw closed();
     session.busy = true; session.lastUsed = Date.now();
     const t1 = performance.now();
     let branch = session.spare;
@@ -302,19 +304,22 @@ export class ClaudePrimedSessions implements PrimedSessions {
       const t2 = performance.now();
       let result: SessionResult;
       try {
-        let refusal: "timeout" | "closed" | "admission" | undefined;
+        let refusal: "timeout" | "closed" | "aborted" | "admission" | undefined;
+        const live = branch;
+        const onAbort = () => { void live.session.interruptNative?.({ timeoutMs: 2_000 }); };
+        signal?.addEventListener("abort", onAbort, { once: true });
         result = await branch.session.send(request.input, { timeout: Math.max(1, deadline - Date.now()), onAdmission: async attempt => {
           admissionId = attempt.admissionId;
-          const expired = () => { refusal = this._closed ? "closed" : "timeout"; return Error("Decision deadline passed or host closed before dispatch"); };
-          if (Date.now() >= deadline || this._closed) throw expired();
+          const expired = () => { refusal = this._closed ? "closed" : signal?.aborted ? "aborted" : "timeout"; return Error("Decision deadline passed, aborted or host closed before dispatch"); };
+          if (Date.now() >= deadline || this._closed || signal?.aborted) throw expired();
           refusal = "admission";
           await request.onAdmission?.({ admissionId: attempt.admissionId!, key: spec.key, runtime: "claude" });
           refusal = undefined;
-          if (Date.now() >= deadline || this._closed) throw expired();
-        } }).catch(error => {
+          if (Date.now() >= deadline || this._closed || signal?.aborted) throw expired();
+        } }).finally(() => signal?.removeEventListener("abort", onAbort)).catch(error => {
           const attempt = error instanceof SessionTurnError ? error.attempt : undefined;
           if (attempt?.dispatch === "not-dispatched" && attempt.localFailure === "registration" && refusal)
-            throw new DecisionError(refusal === "admission" ? "Decision admission refused before dispatch" : "Decision deadline passed or host closed before dispatch",
+            throw new DecisionError(refusal === "admission" ? "Decision admission refused before dispatch" : "Decision deadline passed, aborted or host closed before dispatch",
               refusal, "not-dispatched", true, admissionId, { cause: error });
           throw error;
         });
@@ -334,6 +339,8 @@ export class ClaudePrimedSessions implements PrimedSessions {
         this._emit({ type: "violation", key: spec.key, detail: "tool activity" });
         throw new DecisionError("Decision violated the text-only policy (tool activity)", "violation", "attempted", true, admissionId);
       }
+      if (signal?.aborted && result.nativeOutcome !== "completed")
+        throw new DecisionError("Decision aborted; turn interrupted", "aborted", "attempted", result.nativeOutcome !== "unknown", admissionId);
       if (result.nativeOutcome !== "completed") {
         const limited = result.terminal?.apiErrorStatus === 429 || /rate.?limit|usage.?limit/i.test(result.terminal?.reason ?? result.content);
         throw new DecisionError(`Claude decision failed (${result.terminal?.subtype ?? "unknown"})`, limited ? "rate-limited" : "native-failed", "attempted", true, admissionId);
