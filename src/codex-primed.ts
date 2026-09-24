@@ -342,7 +342,8 @@ export class CodexPrimedSessions implements PrimedSessions {
         if (this._config.requireSubscription) {
           const account = object(object(await conn.request("account/read", {}, 15_000))?.account);
           if (account?.type !== "chatgpt")
-            throw new DecisionError("Codex decisions require a ChatGPT subscription login; API-key login refused", "auth", "not-dispatched", true);
+            throw new DecisionError(`Codex decisions require a ChatGPT subscription login (found ${typeof account?.type === "string" ? account.type : "no login"}); no fallback`,
+              "auth", "not-dispatched", true);
         }
         try {
           const limits = codexLimitSnapshot(await conn.request("account/rateLimits/read", { excludeResetCreditDetails: true }, 15_000), "poll");
@@ -370,8 +371,9 @@ export class CodexPrimedSessions implements PrimedSessions {
   private async _sweep(conn: JsonRpcConnection): Promise<void> {
     let cursor: string | undefined;
     for (let page = 0; page < 20; page++) {
+      // The private cwd identifies this host's threads (the local app-server refuses originator filtering).
       const listed = object(await conn.request("thread/list", { cwd: this._config.cwd, sourceKinds: ["appServer"],
-        originators: [this._config.clientName], limit: 100, ...(cursor ? { cursor } : {}) }, 15_000).catch(() => undefined));
+        limit: 100, ...(cursor ? { cursor } : {}) }, 15_000).catch(() => undefined));
       const data = Array.isArray(listed?.data) ? listed.data : [];
       for (const entry of data) {
         const id = object(entry)?.id;

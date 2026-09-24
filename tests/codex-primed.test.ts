@@ -241,7 +241,8 @@ describe("CodexPrimedSessions", () => {
   test("start sweeps orphaned primed threads in its private directory only", async () => {
     const d = appServer({ orphans: ["old-1", "old-2"] }); const { h } = host(d);
     await h.start();
-    expect(d.requests("thread/list")[0]!.params).toMatchObject({ cwd: "/private/decisions", sourceKinds: ["appServer"], originators: ["agent-session-primed"] });
+    expect(d.requests("thread/list")[0]!.params).toMatchObject({ cwd: "/private/decisions", sourceKinds: ["appServer"] });
+    expect(d.requests("thread/list")[0]!.params.originators).toBeUndefined();
     expect(d.requests("thread/delete").map(r => r.params.threadId)).toEqual(["old-1", "old-2"]);
   });
 
