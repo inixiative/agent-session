@@ -1,5 +1,7 @@
 import { TurnState } from "./turn-state";
 import { retainEvidence } from "./retained-evidence";
+import { TRANSPORTS } from "./transport";
+import { codexLimitSnapshot, mergeLimits, type LimitSnapshot } from "./limits";
 import { isDeepStrictEqual } from "node:util";
 // ---------------------------------------------------------------------------
 // CodexSession — long-lived OpenAI Codex CLI process with full event capture
@@ -33,6 +35,7 @@ import { isDeepStrictEqual } from "node:util";
 import type {
   BeforeSendHook,
   HarnessSession,
+  NativeInterruptOutcome,
   SessionEvent,
   SessionEventHandler,
   SessionResult,
@@ -104,6 +107,8 @@ export interface CodexSessionConfig {
    * `thread/resume` on app-server. Only app-server supports cold resume by ID.
    */
   externalSessionId?: string;
+  /** Environment merged over process.env (e.g. CODEX_HOME for a profile). */
+  env?: Record<string, string | undefined>;
   /**
    * Override for the process spawner. Defaults to Bun.spawn. Tests inject a fake
    * subprocess that emulates the codex JSON-RPC protocol; the docker-spawn helper
@@ -147,6 +152,7 @@ abstract class BaseCodexSession implements HarnessSession {
   protected _defaultTimeout: number;
   protected _baseContext?: string;
   protected _spawn?: CodexSpawn;
+  protected _env?: Record<string, string | undefined>;
 
   // -- Process --
   protected _proc: PipedSubprocess | null = null;
@@ -204,6 +210,7 @@ abstract class BaseCodexSession implements HarnessSession {
     this._baseContext = config?.baseContext;
     this._externalSessionId = config?.externalSessionId;
     this._spawn = config?.spawn;
+    this._env = config?.env;
     this._startedAt = Date.now();
   }
 
@@ -314,6 +321,7 @@ abstract class BaseCodexSession implements HarnessSession {
     const args = this._buildSpawnArgs();
     const env: Record<string, string | undefined> = {
       ...process.env,
+      ...this._env,
       DISABLE_AUTOUPDATER: "1",
     };
 
@@ -688,6 +696,7 @@ abstract class BaseCodexSession implements HarnessSession {
       baseContext: opts?.baseContext ?? this._baseContext,
       externalSessionId: this._externalSessionId,
       spawn: this._spawn,
+      env: this._env,
     });
     forked._forking = true;
     return forked;
@@ -708,6 +717,7 @@ abstract class BaseCodexSession implements HarnessSession {
 // multi-turn + fork).
 
 export class CodexMcpSession extends BaseCodexSession {
+  get transport() { return TRANSPORTS["codex-mcp"]; }
   private _mcpAdmission?: string;
   private _mcpCalls = new Map<string, { invocation: Record<string, unknown>; ended: boolean }>();
   protected _buildSpawnArgs(): string[] {
@@ -892,7 +902,58 @@ export class CodexMcpSession extends BaseCodexSession {
 class NativeValidationError extends Error {}
 
 export class CodexAppServerSession extends BaseCodexSession {
+  get transport() { return TRANSPORTS["codex-app-server"]; }
   readonly appServerProtocol = "owned-thread-v1";
+  private _limits?: LimitSnapshot;
+
+  /** Latest account limits observed on this session (stream or poll). */
+  get limits(): LimitSnapshot | undefined { return this._limits; }
+
+  private _observeLimits(snapshot: LimitSnapshot): SessionEvent {
+    this._limits = mergeLimits(this._limits, snapshot);
+    return { kind: "rate_limit", timestamp: Date.now(), correlation: "unknown", unattributedReason: "account-status", limits: this._limits };
+  }
+
+  /** account/rateLimits/read — no model turn. Requires a started session. */
+  async readLimits(opts?: { timeoutMs?: number }): Promise<LimitSnapshot | undefined> {
+    if (!this._proc || !this._alive) throw Error("Session not running");
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const result = await Promise.race([this._rpcRequest("account/rateLimits/read", { excludeResetCreditDetails: true }),
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(Error("account/rateLimits/read timed out")), opts?.timeoutMs ?? 10_000); })])
+      .finally(() => clearTimeout(timer));
+    const snapshot = codexLimitSnapshot(result, "poll");
+    if (snapshot) this._emit(this._observeLimits(snapshot));
+    return snapshot;
+  }
+
+  /**
+   * turn/interrupt for the owned in-flight turn. "acknowledged" once the turn's
+   * own turn/completed arrives; the send() then settles through that terminal.
+   */
+  async interruptNative(opts?: { timeoutMs?: number }): Promise<NativeInterruptOutcome> {
+    const a = this._inflight?.evidence;
+    if (!a || a.dispatch !== "attempted" || a.nativeOutcome !== "unknown" || !a.identity.turnId || !this._externalSessionId) return "no-turn";
+    const deadline = Date.now() + (opts?.timeoutMs ?? 5_000);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([this._rpcRequest("turn/interrupt", { threadId: this._externalSessionId, turnId: a.identity.turnId }),
+        new Promise<never>((_, reject) => { timer = setTimeout(() => reject(Error("turn/interrupt timed out")), Math.max(1, deadline - Date.now())); })]);
+    } catch { return "unacknowledged"; }
+    finally { clearTimeout(timer); }
+    while (a.nativeOutcome === "unknown" && this._alive && Date.now() < deadline) await Bun.sleep(10);
+    return a.nativeOutcome === "unknown" ? "unacknowledged" : "acknowledged";
+  }
+
+  /** Mid-turn steer (turn/steer) into the owned in-flight turn; otherwise records push_ignored. */
+  override async push(payload: { kind: string; text: string }): Promise<void> {
+    const a = this._inflight?.evidence;
+    const ignored = (reason: string) => this._emit({ kind: "error", timestamp: Date.now(), text: `push_ignored: kind=${payload.kind} — ${reason}`, raw: { kind: payload.kind } });
+    if (!a || a.dispatch !== "attempted" || a.nativeOutcome !== "unknown" || !a.identity.turnId || !this._externalSessionId) return ignored("no owned in-flight turn");
+    try {
+      await this._rpcRequest("turn/steer", { threadId: this._externalSessionId, expectedTurnId: a.identity.turnId, input: [{ type: "text", text: payload.text }] });
+      this._emit({ ...a.identity, admissionId: a.admissionId, kind: "native_status", timestamp: Date.now(), raw: { type: "push-steered", kind: payload.kind } });
+    } catch (error) { ignored(`turn/steer refused: ${(error as Error).message.slice(0, 200)}`); }
+  }
   private readonly _options: NonNullable<CodexSessionConfig["appServer"]>;
   private readonly _onThreadReady?: (binding: string) => void | Promise<void>;
   private _startedOnce = false;
@@ -1069,6 +1130,10 @@ export class CodexAppServerSession extends BaseCodexSession {
   protected _classify(msg: Record<string, unknown>): SessionEvent[] {
     const method = typeof msg.method === "string" ? msg.method : undefined;
     if (!method) return [];
+    if (method === "account/rateLimits/updated") {
+      const snapshot = codexLimitSnapshot(msg.params, "stream");
+      return snapshot ? [this._observeLimits(snapshot)] : [];
+    }
     const params = object(msg.params), turn = this._turn(params?.turn), item = object(params?.item);
     const str = (value: unknown) => typeof value === "string" && value ? value : undefined;
     const threadId = str(params?.threadId), turnId = turn?.id ?? str(params?.turnId), itemId = str(item?.id) ?? str(params?.itemId);

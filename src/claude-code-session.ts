@@ -1,5 +1,7 @@
 import { TurnState } from "./turn-state";
 import { retainEvidence } from "./retained-evidence";
+import { TRANSPORTS } from "./transport";
+import { claudeRateLimitSnapshot, claudeUsageSnapshot, mergeLimits, type LimitSnapshot } from "./limits";
 // ---------------------------------------------------------------------------
 // ClaudeCodeSession — long-lived Claude Code process with full event capture
 // ---------------------------------------------------------------------------
@@ -37,6 +39,7 @@ import { retainEvidence } from "./retained-evidence";
 import type {
   BeforeSendHook,
   HarnessSession,
+  NativeInterruptOutcome,
   SessionEvent,
   SessionEventHandler,
   SessionResult,
@@ -92,6 +95,19 @@ export interface ClaudeCodeSessionConfig {
    * Foundry thread that was previously mapped to this external ID.
    */
   externalSessionId?: string;
+  /**
+   * Environment merged over process.env (e.g. CLAUDE_CONFIG_DIR for a profile).
+   * ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN are always removed: this
+   * transport runs on the CLI's subscription login.
+   */
+  env?: Record<string, string | undefined>;
+  /**
+   * Launch without callable tools, MCP servers, slash commands or user
+   * settings (`--safe-mode --tools "" --strict-mcp-config …`). For decisions.
+   */
+  textOnly?: boolean;
+  /** False adds `--no-session-persistence` (nothing written to history; cannot be resumed). Default true. */
+  persistSession?: boolean;
   /**
    * Override for the process spawner. Defaults to Bun.spawn. Tests inject a
    * fake subprocess that emulates the claude CLI's stream-json protocol.
@@ -169,7 +185,12 @@ function publicToolResultContent(content: unknown): Pick<SessionEvent, "toolOutp
   };
 }
 
+/** Claude CLI flags for a tool-free session (the same launch Foundry uses for text-only auxiliaries). */
+export const CLAUDE_TEXT_ONLY_ARGS: readonly string[] = ["--safe-mode", "--tools", "", "--strict-mcp-config",
+  "--mcp-config", '{"mcpServers":{}}', "--disable-slash-commands", "--no-chrome"];
+
 export class ClaudeCodeSession implements HarnessSession {
+  get transport() { return TRANSPORTS["claude-cli"]; }
   // -- Config --
   private _bin: string;
   private _model: string;
@@ -185,6 +206,12 @@ export class ClaudeCodeSession implements HarnessSession {
   private _forking = false;
   private _awaitingForkIdentity = false;
   private _spawn?: ClaudeCodeSessionConfig["spawn"];
+  private _env?: ClaudeCodeSessionConfig["env"];
+  private _textOnly: boolean;
+  private _persistSession: boolean;
+  private _limits?: LimitSnapshot;
+  private _controlSeq = 0;
+  private _control = new Map<string, { resolve(response: Record<string, unknown>): void; reject(error: Error): void }>();
 
   // -- Process --
   // Bun.spawn's return type is a union; we always use stdin:"pipe"/stdout:"pipe"/stderr:"pipe"
@@ -247,8 +274,14 @@ export class ClaudeCodeSession implements HarnessSession {
     this._baseContext = config?.baseContext;
     this._externalSessionId = config?.externalSessionId;
     this._spawn = config?.spawn;
+    this._env = config?.env;
+    this._textOnly = config?.textOnly ?? false;
+    this._persistSession = config?.persistSession ?? true;
     this._startedAt = Date.now();
   }
+
+  /** Latest account limits observed on this session (stream or poll). */
+  get limits(): LimitSnapshot | undefined { return this._limits; }
 
   // ---------------------------------------------------------------------------
   // Accessors
@@ -317,6 +350,7 @@ export class ClaudeCodeSession implements HarnessSession {
     // Strip API key env vars — CLI uses subscription auth
     const env: Record<string, string | undefined> = {
       ...process.env,
+      ...this._env,
       DISABLE_AUTOUPDATER: "1",
     };
     delete env.ANTHROPIC_API_KEY;
@@ -408,7 +442,7 @@ export class ClaudeCodeSession implements HarnessSession {
   // fork() — branch from current conversation state
   // ---------------------------------------------------------------------------
 
-  fork(opts?: { cwd?: string; baseContext?: string }): ClaudeCodeSession {
+  fork(opts?: { cwd?: string; baseContext?: string; persistSession?: boolean; spawn?: ClaudeCodeSessionConfig["spawn"] }): ClaudeCodeSession {
     if (this._inflight) throw new Error("Cannot fork while native ownership is unresolved");
     if (!this._externalSessionId) {
       throw new Error(
@@ -416,7 +450,7 @@ export class ClaudeCodeSession implements HarnessSession {
       );
     }
 
-    const forked = new ClaudeCodeSession({
+    const forked = this._construct({
       bin: this._bin,
       model: this._model,
       effort: this._effort,
@@ -426,11 +460,17 @@ export class ClaudeCodeSession implements HarnessSession {
       timeout: this._defaultTimeout,
       baseContext: opts?.baseContext ?? this._baseContext,
       externalSessionId: this._externalSessionId,
-      spawn: this._spawn,
+      spawn: opts?.spawn ?? this._spawn,
+      env: this._env,
+      textOnly: this._textOnly,
+      persistSession: opts?.persistSession ?? this._persistSession,
     });
     forked._forking = true;
     return forked;
   }
+
+  /** Construct a sibling session (fork). Subclasses keep their own transport. */
+  protected _construct(config: ClaudeCodeSessionConfig): ClaudeCodeSession { return new ClaudeCodeSession(config); }
 
   // ---------------------------------------------------------------------------
   // interrupt() — reject the local waiter; native cancellation is unacknowledged
@@ -442,6 +482,51 @@ export class ClaudeCodeSession implements HarnessSession {
     this._rejectInflight(new Error("Local waiter interrupted; native cancellation unacknowledged"), "interrupt-request");
 
     // Native ownership is retained. Waiting sends are rejected without dispatch.
+  }
+
+  /**
+   * Native interrupt through the CLI control protocol. Resolves "acknowledged"
+   * once the CLI confirms and the turn's own terminal arrives (the send()
+   * settles through that terminal, normally as a failed/interrupted outcome).
+   */
+  async interruptNative(opts?: { timeoutMs?: number }): Promise<NativeInterruptOutcome> {
+    const turn = this._inflight;
+    if (!turn || turn.evidence.dispatch !== "attempted" || turn.evidence.nativeOutcome !== "unknown") return "no-turn";
+    const deadline = Date.now() + (opts?.timeoutMs ?? 5_000);
+    try {
+      await this._controlRequest({ subtype: "interrupt" }, Math.max(1, deadline - Date.now()));
+    } catch { return "unacknowledged"; }
+    while (turn.evidence.nativeOutcome === "unknown" && this._alive && Date.now() < deadline) await Bun.sleep(10);
+    return turn.evidence.nativeOutcome === "unknown" ? "unacknowledged" : "acknowledged";
+  }
+
+  /** Account limits via the CLI control protocol (`get_usage`); no model turn. Requires a started session. */
+  async readLimits(opts?: { timeoutMs?: number }): Promise<LimitSnapshot | undefined> {
+    const response = await this._controlRequest({ subtype: "get_usage" }, opts?.timeoutMs ?? 10_000);
+    const snapshot = claudeUsageSnapshot(response.response);
+    if (snapshot) this._observeLimits(snapshot);
+    return snapshot;
+  }
+
+  private _controlRequest(request: Record<string, unknown>, timeoutMs: number): Promise<Record<string, unknown>> {
+    if (!this._proc || !this._alive) return Promise.reject(new Error("Session not running"));
+    const requestId = `agent-session-${++this._controlSeq}-${crypto.randomUUID()}`;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { this._control.delete(requestId); reject(new Error(`Control request ${String(request.subtype)} timed out`)); }, timeoutMs);
+      this._control.set(requestId, {
+        resolve: value => { clearTimeout(timer); resolve(value); },
+        reject: error => { clearTimeout(timer); reject(error); },
+      });
+      try {
+        this._proc!.stdin.write(JSON.stringify({ type: "control_request", request_id: requestId, request }) + "\n");
+        this._proc!.stdin.flush();
+      } catch (error) { this._control.delete(requestId); clearTimeout(timer); reject(error as Error); }
+    });
+  }
+
+  private _observeLimits(snapshot: LimitSnapshot): void {
+    this._limits = mergeLimits(this._limits, snapshot);
+    this._emit({ kind: "rate_limit", timestamp: Date.now(), correlation: "unknown", unattributedReason: "account-status", limits: this._limits });
   }
 
   // ---------------------------------------------------------------------------
@@ -459,6 +544,8 @@ export class ClaudeCodeSession implements HarnessSession {
 
     this._rejectInflight(new Error("Session killed; native outcome may remain unknown"), "killed");
     this._rejectQueue(new Error("Session killed"));
+    for (const pending of this._control.values()) pending.reject(new Error("Session killed"));
+    this._control.clear();
 
     try { this._proc.stdin.end(); } catch { /* already closed */ }
     try { this._proc.kill(); } catch { /* already dead */ }
@@ -648,6 +735,30 @@ export class ClaudeCodeSession implements HarnessSession {
 
     const raw = msg as Record<string, unknown>;
 
+    // Control-protocol traffic belongs to the local client, never to an admission.
+    if (raw.type === "control_response") {
+      const response = raw.response as Record<string, unknown> | undefined;
+      const id = typeof response?.request_id === "string" ? response.request_id : undefined;
+      const pending = id ? this._control.get(id) : undefined;
+      if (pending && id) {
+        this._control.delete(id);
+        if (response?.subtype === "success") pending.resolve(response);
+        else pending.reject(new Error(typeof response?.error === "string" ? response.error : "Control request failed"));
+      }
+      return;
+    }
+    if (raw.type === "control_request") {
+      // No client-side handlers (can_use_tool, hooks) are registered on this transport.
+      const id = typeof raw.request_id === "string" ? raw.request_id : undefined;
+      if (id && this._proc) {
+        try {
+          this._proc.stdin.write(JSON.stringify({ type: "control_response", response: { subtype: "error", request_id: id, error: "Unsupported by this client" } }) + "\n");
+          this._proc.stdin.flush();
+        } catch { /* transport failure surfaces on the stream */ }
+      }
+      this._unattributed(raw, "unrecognized-event"); return;
+    }
+
     if (this._awaitingForkIdentity && raw.type === "system" && raw.subtype === "init" && typeof raw.session_id === "string") {
       this._externalSessionId = raw.session_id;
       this._awaitingForkIdentity = false;
@@ -687,6 +798,14 @@ export class ClaudeCodeSession implements HarnessSession {
         compactionSource: "claude-code",
         raw,
       });
+      return;
+    }
+
+    // Account limits are account-level evidence, never part of an admission's output.
+    if (raw.type === "rate_limit_event") {
+      const snapshot = claudeRateLimitSnapshot(raw.rate_limit_info);
+      if (snapshot) this._observeLimits(snapshot);
+      else this._unattributed(raw, "account-status");
       return;
     }
 
@@ -757,6 +876,9 @@ export class ClaudeCodeSession implements HarnessSession {
     // Resume for fork or crash recovery. _externalSessionId is set from
     // config (crash recovery / fork) or from the stream. Either way, if
     // it's present at spawn time, we --resume.
+    if (this._textOnly) args.push(...CLAUDE_TEXT_ONLY_ARGS);
+    if (!this._persistSession) args.push("--no-session-persistence");
+
     if (this._externalSessionId) {
       args.push("--resume", this._externalSessionId);
       if (this._forking) {
