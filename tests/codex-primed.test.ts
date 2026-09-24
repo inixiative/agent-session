@@ -6,13 +6,14 @@ const cleanup: Array<() => Promise<void> | void> = [];
 afterEach(async () => { for (const fn of cleanup.splice(0)) await fn(); });
 
 type Behavior = "answer" | "hold" | "tool" | "rate-limit" | "fail" | "server-request";
-interface DoubleOptions { account?: string; blocked?: boolean; orphans?: string[]; behavior?: (input: string) => Behavior; forkError?: boolean }
+interface DoubleOptions { account?: string; blocked?: boolean; orphans?: string[]; behavior?: (input: string, occurrence: number) => Behavior; forkError?: boolean }
 
 /** codex app-server double: persisted threads, forks, turns and account reads. */
 function appServer(opts: DoubleOptions = {}) {
   const processes: ReturnType<typeof fakeProcess>[] = [];
   const argvs: string[][] = [], envs: Record<string, string | undefined>[] = [];
   let threads = 0, turns = 0;
+  const seen = new Map<string, number>();
   const threadMeta = new Map<string, { ephemeral: boolean; parent?: string; lastTurnId?: string; developer?: string; base?: string }>();
   const spawn = (argv: string[], options: { env: Record<string, string | undefined> }) => {
     argvs.push(argv); envs.push(options.env);
@@ -38,12 +39,15 @@ function appServer(opts: DoubleOptions = {}) {
           return reply({ thread: { id, status: { type: "idle" }, turns: [] }, model: "gpt-observed" });
         }
         case "turn/start": {
-          const turnId = `turn-${++turns}`, threadId = p.threadId, input = p.input[0].text as string;
+          const turnId = `turn-${++turns}`, threadId = p.threadId, raw = p.input[0].text as string;
+          // An inline (unprimed) decision carries the context before its input; judge the cycle input only.
+          const input = raw.includes("standing context") ? raw : raw.split("\n\n").at(-1)!;
           reply({ turn: { id: turnId, status: "inProgress", items: [] } });
           const emit = (method: string, params: Record<string, unknown>) => io.emit({ method, params: { threadId, ...params } });
           emit("turn/started", { turn: { id: turnId, status: "inProgress", items: [] } });
           emit("item/started", { item: { id: `u${turnId}`, type: "userMessage" } });
-          const behavior = input.includes("standing context") ? "answer" : opts.behavior?.(input) ?? "answer";
+          const occurrence = (seen.get(input) ?? 0) + 1; seen.set(input, occurrence);
+          const behavior = input.includes("standing context") ? "answer" : opts.behavior?.(input, occurrence) ?? "answer";
           if (behavior === "hold") return;
           if (behavior === "tool") { emit("item/started", { item: { id: "cmd", type: "commandExecution", command: "ls" } }); return; }
           if (behavior === "server-request") { io.emit({ id: "srv-1", method: "item/commandExecution/requestApproval", params: { threadId, turnId } }); return; }
@@ -101,34 +105,43 @@ describe("CodexPrimedSessions", () => {
     await expect(refused.decide(spec, { input: "x" })).rejects.toMatchObject({ reason: "auth", dispatch: "not-dispatched" });
   });
 
-  test("prime once, then every cycle forks the primed thread with the same instructions", async () => {
+  test("a miss decides inline at once and primes off-path; later cycles fork the primed thread", async () => {
     const d = appServer(); const { h, events } = host(d);
     const first = await h.decide(spec, { input: "q1" });
-    const second = await h.decide(spec, { input: "q2" });
     expect(first).toMatchObject({ content: "decided: q1", prime: "cold", model: "gpt-observed", tokens: { input: 20, cacheRead: 80, output: 5, thinking: 1 } });
-    expect(second).toMatchObject({ content: "decided: q2", prime: "warm" });
-    const starts = d.requests("thread/start");
-    expect(starts).toHaveLength(1);
-    expect(starts[0]!.params).toMatchObject({ ephemeral: false, developerInstructions: "ROLE", baseInstructions: "BASE", sandbox: "read-only", approvalPolicy: "never",
+    // The inline decision carried the context itself, on an ephemeral thread with the role instructions.
+    const inline = d.requests("thread/start").find(r => r.params.ephemeral === true)!;
+    expect(inline.params).toMatchObject({ developerInstructions: "ROLE", baseInstructions: "BASE", sandbox: "read-only", approvalPolicy: "never",
       config: { "mcp_servers.node_repl.enabled": false, notify: [], include_environment_context: false } });
-    const primer = d.requests("turn/start")[0]!.params;
-    expect(primer.threadId).toBe("thread-1");
+    expect(d.requests("turn/start").find(r => !String(r.params.input[0].text).includes("standing context"))!.params.input[0].text).toBe("DOMAIN CACHE\n\nq1");
+    await h.prime(spec); // joins the background priming started by the miss
+    const persisted = d.requests("thread/start").filter(r => r.params.ephemeral === false);
+    expect(persisted).toHaveLength(1);
+    const second = await h.decide(spec, { input: "q2" });
+    const third = await h.decide(spec, { input: "q3" });
+    expect([second.prime, third.prime]).toEqual(["warm", "warm"]);
+    const primer = d.requests("turn/start").find(r => String(r.params.input[0].text).includes("standing context"))!.params;
     expect(primer.input[0].text).toStartWith("DOMAIN CACHE");
     const forks = d.requests("thread/fork");
     expect(forks).toHaveLength(2);
-    for (const fork of forks) expect(fork.params).toMatchObject({ threadId: "thread-1", lastTurnId: "turn-1", ephemeral: true, developerInstructions: "ROLE", baseInstructions: "BASE",
-      config: { "mcp_servers.node_repl.enabled": false } });
-    // Decisions never run on the primed thread itself.
-    expect(d.requests("turn/start").slice(1).every(r => r.params.threadId.startsWith("fork-"))).toBe(true);
-    expect(d.requests("thread/unsubscribe").map(r => r.params.threadId)).toEqual([first.threadId, second.threadId]);
+    const primerTurn = d.requests("turn/start").indexOf(d.requests("turn/start").find(r => r.params === primer)!) + 1;
+    for (const fork of forks) expect(fork.params).toMatchObject({ lastTurnId: `turn-${primerTurn}`,
+      ephemeral: true, developerInstructions: "ROLE", baseInstructions: "BASE", config: { "mcp_servers.node_repl.enabled": false } });
+    expect(new Set(forks.map(f => f.params.threadId))).toEqual(new Set([primer.threadId]));
+    // Warm decisions send only the cycle input and never run on the primed thread itself.
+    const warmTurns = d.requests("turn/start").filter(r => String(r.params.threadId).startsWith("fork-"));
+    expect(warmTurns.map(r => r.params.input[0].text)).toEqual(["q2", "q3"]);
+    expect(d.requests("thread/unsubscribe").map(r => r.params.threadId)).toEqual([first.threadId, second.threadId, third.threadId]);
     expect(events.filter(e => e.type === "primed")).toHaveLength(1);
   });
 
-  test("a changed prime hash deletes the old primed thread and re-primes; empty context needs no primer", async () => {
+  test("a changed context retires the old primed thread and runs inline; empty context needs no primer", async () => {
     const d = appServer(); const { h, events } = host(d);
-    await h.decide(spec, { input: "q1" });
+    await h.prime(spec);
+    expect((await h.decide(spec, { input: "q1" })).prime).toBe("warm");
     const again = await h.decide({ ...spec, context: "NEW CACHE" }, { input: "q2" });
     expect(again.prime).toBe("cold");
+    await tick(5);
     expect(d.requests("thread/delete").map(r => r.params.threadId)).toContain("thread-1");
     expect(events.some(e => e.type === "evicted" && e.reason === "reprime")).toBe(true);
     const plain = await h.decide({ key: "t1:aux:agent:classifier", instructions: "CLASSIFY" }, { input: "hello" });
@@ -139,6 +152,7 @@ describe("CodexPrimedSessions", () => {
 
   test("admission runs before the native write; a refusal dispatches nothing", async () => {
     const d = appServer(); const { h } = host(d);
+    await h.prime(spec);
     let seen: unknown;
     await h.decide(spec, { input: "q1", onAdmission: a => { seen = a; expect(d.requests("turn/start")).toHaveLength(1); } });
     expect(seen).toMatchObject({ key: spec.key, runtime: "codex", threadId: expect.stringMatching(/^fork-/) });
@@ -150,7 +164,7 @@ describe("CodexPrimedSessions", () => {
 
   test("tool activity is a violation: interrupted, process recycled, next decision re-primes on a fresh process", async () => {
     const d = appServer({ behavior: input => input === "bad" ? "tool" : "answer" }); const { h, events } = host(d);
-    await h.decide(spec, { input: "q1" });
+    await h.prime(spec);
     const error = await h.decide(spec, { input: "bad" }).catch(e => e);
     expect(error).toMatchObject({ reason: "violation", dispatch: "attempted", settled: true });
     expect(d.requests("turn/interrupt")).toHaveLength(1);
@@ -170,7 +184,7 @@ describe("CodexPrimedSessions", () => {
 
   test("deadline interrupts the turn and reports acknowledged settlement", async () => {
     const d = appServer({ behavior: input => input === "slow" ? "hold" : "answer" }); const { h } = host(d);
-    await h.decide(spec, { input: "q1" });
+    await h.prime(spec);
     const error = await h.decide(spec, { input: "slow", timeoutMs: 150 }).catch(e => e);
     expect(error).toMatchObject({ reason: "timeout", dispatch: "attempted", settled: true });
     expect(d.requests("turn/interrupt")).toHaveLength(1);
@@ -186,18 +200,36 @@ describe("CodexPrimedSessions", () => {
     await expect(h.decide(spec, { input: "q2" })).rejects.toMatchObject({ reason: "rate-limited", dispatch: "not-dispatched" });
   });
 
-  test("a lost primed thread fails the branch before dispatch and the key re-primes next time", async () => {
+  test("a lost primed thread fails the branch before dispatch and is retired", async () => {
     const d = appServer({ forkError: true }); const { h } = host(d);
+    await h.prime(spec);
+    expect(h.snapshot().sessions).toBe(1);
     await expect(h.decide(spec, { input: "q1" })).rejects.toMatchObject({ reason: "transport", dispatch: "not-dispatched" });
     expect(h.snapshot().sessions).toBe(0);
   });
 
-  test("keys serialize per key and run concurrently across keys within the slot limit", async () => {
-    const d = appServer(); const { h } = host(d, { maxConcurrent: 2 });
+  test("decisions on one key run concurrently; priming is deduplicated per key and context", async () => {
+    const d = appServer(); const { h } = host(d, { maxConcurrent: 3 });
     const results = await Promise.all([h.decide(spec, { input: "a" }), h.decide(spec, { input: "b" }),
       h.decide({ ...spec, key: "t2:aux:domain:api" }, { input: "c" })]);
     expect(results.map(r => r.content)).toEqual(["decided: a", "decided: b", "decided: c"]);
-    expect(d.requests("thread/start")).toHaveLength(2);
+    await Promise.all([h.prime(spec), h.prime({ ...spec, key: "t2:aux:domain:api" })]);
+    expect(d.requests("thread/start").filter(r => r.params.ephemeral === false)).toHaveLength(2);
+    const warm = await Promise.all([h.decide(spec, { input: "d" }), h.decide(spec, { input: "e" })]);
+    expect(warm.map(r => r.prime)).toEqual(["warm", "warm"]);
+  });
+
+  test("a key whose context changes every cycle stops priming until its context repeats", async () => {
+    const d = appServer(); const { h } = host(d);
+    const persisted = () => d.requests("thread/start").filter(r => r.params.ephemeral === false).length;
+    await h.decide({ ...spec, context: "C1" }, { input: "a" }); await h.prime({ ...spec, context: "C1" });
+    await h.decide({ ...spec, context: "C2" }, { input: "b" }); await tick(5); // C1 replaced unused: the key is volatile
+    const afterVolatile = persisted();
+    await h.decide({ ...spec, context: "C3" }, { input: "c" }); await tick(5);
+    expect(persisted()).toBe(afterVolatile); // no primer spent on a context seen once
+    await h.decide({ ...spec, context: "C3" }, { input: "d" }); await tick(5);
+    expect(persisted()).toBe(afterVolatile + 1); // repeated context primes again
+    expect((await h.decide({ ...spec, context: "C3" }, { input: "e" })).prime).toBe("warm");
   });
 
   test("start sweeps orphaned primed threads in its private directory only", async () => {
@@ -209,9 +241,11 @@ describe("CodexPrimedSessions", () => {
 
   test("eviction and close delete primed threads; closed hosts refuse", async () => {
     const d = appServer(); const { h, events } = host(d);
+    await h.prime(spec);
     await h.decide(spec, { input: "q1" });
     await h.evict(spec.key);
     expect(d.requests("thread/delete").map(r => r.params.threadId)).toEqual(["thread-1"]);
+    await h.prime(spec);
     await h.decide(spec, { input: "q2" });
     await h.close();
     expect(events.filter(e => e.type === "evicted").map(e => (e as { reason: string }).reason)).toEqual(["requested", "close"]);
@@ -220,6 +254,7 @@ describe("CodexPrimedSessions", () => {
 
   test("process loss drops primed sessions; the next decision starts a new process and re-primes", async () => {
     const d = appServer(); const { h, events } = host(d);
+    await h.prime(spec);
     await h.decide(spec, { input: "q1" });
     d.processes[0]!.io.exit(1);
     await tick(10);
@@ -247,8 +282,8 @@ describe("CodexPrimedSessions review regressions", () => {
   test("a recycle fails every in-flight branch on that process at once, even after a new process started", async () => {
     const d = appServer({ behavior: input => input === "bad" ? "tool" : input === "slow" ? "hold" : "answer" });
     const { h } = host(d, { maxConcurrent: 4, timeoutMs: 5_000 });
-    await h.decide({ ...spec, key: "b" }, { input: "warm b" });
-    await h.decide({ ...spec, key: "a" }, { input: "warm a" });
+    await h.prime({ ...spec, key: "b" });
+    await h.prime({ ...spec, key: "a" });
     const started = Date.now();
     const slow = h.decide({ ...spec, key: "b" }, { input: "slow" }).catch(e => e);
     await tick(10);
@@ -267,7 +302,7 @@ describe("CodexPrimedSessions review regressions", () => {
 describe("CodexPrimedSessions cancellation", () => {
   test("an abort refuses queued work before dispatch and interrupts a running turn", async () => {
     const d = appServer({ behavior: input => input === "slow" ? "hold" : "answer" }); const { h } = host(d, { maxConcurrent: 1, timeoutMs: 5_000 });
-    await h.decide(spec, { input: "q1" });
+    await h.prime(spec);
     const controller = new AbortController();
     const running = h.decide(spec, { input: "slow", signal: controller.signal }).catch(e => e);
     const waiting = h.decide({ ...spec, key: "other" }, { input: "q2", signal: controller.signal }).catch(e => e);
@@ -278,5 +313,42 @@ describe("CodexPrimedSessions cancellation", () => {
     expect(d.requests("turn/interrupt")).toHaveLength(1);
     await expect(h.decide(spec, { input: "q3", signal: AbortSignal.abort() })).rejects.toMatchObject({ reason: "aborted", dispatch: "not-dispatched" });
     expect((await h.decide(spec, { input: "q4" })).content).toBe("decided: q4");
+  });
+});
+
+describe("CodexPrimedSessions hedging", () => {
+  test("a slow decision is hedged on a second branch; the first to finish wins and the other is interrupted", async () => {
+    const d = appServer({ behavior: (input, occurrence) => input === "slow" && occurrence === 1 ? "hold" : "answer" });
+    const { h, events } = host(d, { hedgeAfterMs: 60, timeoutMs: 2_000 });
+    await h.prime(spec);
+    const started = Date.now();
+    const result = await h.decide(spec, { input: "slow" });
+    expect(result).toMatchObject({ content: "decided: slow", prime: "warm", hedged: true });
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(d.requests("thread/fork")).toHaveLength(2);
+    await tick(20);
+    expect(d.requests("turn/interrupt")).toHaveLength(1);
+    expect(events.filter(e => e.type === "hedged")).toHaveLength(1);
+    expect(events.find(e => e.type === "hedge-settled")).toMatchObject({ settled: true });
+    expect(d.processes[0]!.killed).toBe(false);
+  });
+
+  test("a decision that answers before the hedge threshold is never duplicated", async () => {
+    const d = appServer(); const { h, events } = host(d, { hedgeAfterMs: 500 });
+    await h.prime(spec);
+    const result = await h.decide(spec, { input: "fast" });
+    expect(result.hedged).toBeUndefined();
+    expect(d.requests("thread/fork")).toHaveLength(1);
+    expect(events.some(e => e.type === "hedged")).toBe(false);
+  });
+
+  test("if both branches stall, the deadline still interrupts and settles the decision", async () => {
+    const d = appServer({ behavior: input => input === "stuck" ? "hold" : "answer" });
+    const { h } = host(d, { hedgeAfterMs: 40, timeoutMs: 300 });
+    await h.prime(spec);
+    const error = await h.decide(spec, { input: "stuck" }).catch(e => e);
+    expect(error).toMatchObject({ reason: "timeout", dispatch: "attempted", settled: true });
+    await tick(20);
+    expect(d.requests("turn/interrupt")).toHaveLength(2);
   });
 });

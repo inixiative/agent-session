@@ -87,7 +87,22 @@ tag when one role runs under several instructions.
   branch. One cycle never sees another's turns.
 - **Re-prime** only when the prime hash changes (default: sha256 of
   instructions and context; callers pass layer content hashes), after idle
-  eviction, or after process loss. Those are the only cold paths.
+  eviction, or after process loss. Those are the only cold paths, and on Codex
+  they stay off the decision's critical path: a miss runs the decision inline on
+  a fresh thread (context + input, same instructions) and primes in the
+  background. A key whose primed context is replaced before it ever served is
+  volatile and primes again only once its context repeats. `prime(spec)` primes
+  a key ahead of its first decision.
+- **Concurrency**: decisions on one key run concurrently (forks are independent);
+  priming is deduplicated per key and context. `maxBackgroundPrimes` bounds
+  primer turns outside the decision slots.
+- **Hedging** (`hedgeAfterMs`, Codex): a decision still running after the
+  threshold starts the same input on a second branch; the first to finish wins
+  and the other is interrupted off the result path (`hedged` / `hedge-settled`
+  events). It trims per-request tails for a duplicate request on the slow
+  fraction; it cannot help when the provider stalls every request at once.
+- **Service tier** (`serviceTier`, Codex, opt-in): gpt-6-luna `fast` measured
+  p50 2.23 s vs 2.52 s with no tier; it may consume usage faster.
 
 | | Codex (`CodexPrimedSessions`) | Claude (`ClaudePrimedSessions`) |
 |---|---|---|
@@ -129,7 +144,13 @@ a 150-rule domain context and a one-line question per decision:
 | Codex primed (fork per cycle) | 2.45 s (2.4–4.0 s) | 7,416 | 1,792–6,912 |
 | Claude primed, haiku (spare fork per cycle) | 1.95 s (1.8–2.4 s) | 7,110 | 7,100 |
 
-Cold primes: Codex 2.8–12.8 s, Claude 4.6–6.7 s (one extra model turn).
+Cold primes: Codex 2.8–12.8 s, Claude 4.6–6.7 s (one extra model turn; on Codex
+now off the critical path).
+
+Under a full fan-out (Foundry: classifier, router, Cartographer and six experts
+at once on one process), a warm Codex decision takes p50 3.5 s, p95 5.5 s; a
+round costs its slowest decision. One process vs three made no difference
+(turn p50 2.6 s either way), so the tail is provider-side.
 Codex turn time is dominated by the model (≈2.3–2.6 s at `low`); the branch
 itself costs 55–90 ms. Codex prefix-cache hits vary between runs (the provider
 keys its cache per conversation); Claude reads the whole primed prefix every time.

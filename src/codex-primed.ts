@@ -10,8 +10,13 @@
 //   decide  thread/fork (ephemeral, through the primer turn, same instructions)
 //           + turn/start with the cycle input, then thread/unsubscribe.
 //           The primed thread never receives a decision, so each cycle starts
-//           from exactly the primed state.
-//   evict   thread/delete of the primed thread; the next decision re-primes.
+//           from exactly the primed state. Decisions on one key run concurrently.
+//   miss    no primed session for this context yet: the decision runs inline on
+//           a fresh thread (context + input) and priming happens in the
+//           background, never on the decision's critical path. A key whose
+//           primed context is replaced before it ever served is volatile and
+//           primes only once its context repeats.
+//   evict   thread/delete of the primed thread.
 //
 // Verified against codex-cli 0.155.1: ephemeral threads refuse rollback and
 // fork, and persisted threads refuse thread/rollback ("paginated threads"), so
@@ -30,7 +35,7 @@ import type { PipedSubprocess } from "./codex-session";
 import type { SessionTokens } from "./harness-session";
 import { codexLimitSnapshot, mergeLimits, type LimitSnapshot } from "./limits";
 import {
-  DecisionError, KeyedQueue, primeHash, Slots,
+  DecisionError, primeHash, Slots,
   type DecisionRequest, type DecisionResult, type PrimedEvent, type PrimedSessions, type PrimedSnapshot, type PrimeSpec,
 } from "./primed";
 
@@ -96,6 +101,20 @@ export interface CodexPrimedConfig {
   requireSubscription?: boolean;
   /** Delete primed threads left in `cwd` by a crashed host at process start. Default true. */
   sweepOrphans?: boolean;
+  /** Background primer turns at once, outside the decision slots. Default 2. */
+  maxBackgroundPrimes?: number;
+  /**
+   * Hedge a slow decision: when it has not finished after this many ms, the same
+   * input starts on a second branch, the first to finish wins and the other is
+   * interrupted. Cuts backend tail latency at the cost of a duplicate request for
+   * the slow fraction. Off when omitted.
+   */
+  hedgeAfterMs?: number;
+  /**
+   * Codex service tier for decision threads (e.g. "fast"). Measured on gpt-6-luna: p50 2.23 s vs 2.52 s
+   * with no tier, and a tighter tail. May consume subscription usage faster; off when omitted.
+   */
+  serviceTier?: string;
   clientName?: string;
   onEvent?: (event: PrimedEvent) => void;
 }
@@ -104,11 +123,21 @@ interface Primed {
   readonly key: string;
   readonly hash: string;
   readonly generation: number;
-  readonly baseThreadId?: string;
+  readonly baseThreadId: string;
   readonly primedTurnId?: string;
   model?: string;
   lastUsed: number;
-  busy: boolean;
+  /** Decisions currently forked from this session. */
+  inUse: number;
+  servedWarm: boolean;
+  /** Replaced or evicted while in use: deleted when the last decision finishes. */
+  stale?: "idle" | "capacity" | "reprime" | "requested" | "close";
+}
+
+interface KeyState {
+  lastHash?: string;
+  volatile: boolean;
+  priming?: { hash: string; done: Promise<void> };
 }
 
 interface Branch {
@@ -159,9 +188,10 @@ export class CodexPrimedSessions implements PrimedSessions {
   private _starting?: Promise<JsonRpcConnection>;
   private _generation = 0;
   private _sessions = new Map<string, Primed>();
+  private _keys = new Map<string, KeyState>();
   private _branches = new Map<string, Branch>();
-  private _queue = new KeyedQueue();
   private _slots: Slots;
+  private _primeSlots: Slots;
   private _limits?: LimitSnapshot;
   private _lastPoll = 0;
   private _closed = false;
@@ -181,6 +211,7 @@ export class CodexPrimedSessions implements PrimedSessions {
     for (const [name, value] of [["maxSessions", this._config.maxSessions], ["idleMs", this._config.idleMs], ["timeoutMs", this._config.timeoutMs]] as const)
       if (!Number.isSafeInteger(value) || value < 1) throw Error(`${name} must be a positive integer`);
     this._slots = new Slots(this._config.maxConcurrent);
+    this._primeSlots = new Slots(config.maxBackgroundPrimes ?? 2);
   }
 
   /** Start the process ahead of the first decision (optional). */
@@ -207,15 +238,31 @@ export class CodexPrimedSessions implements PrimedSessions {
     if (!spec.key || typeof spec.instructions !== "string" || typeof request.input !== "string")
       return Promise.reject(new DecisionError("Invalid decision request", "admission", "not-dispatched", true));
     const started = Date.now(), deadline = started + (request.timeoutMs ?? this._config.timeoutMs);
-    return this._queue.run(spec.key, async () => {
+    return (async () => {
       const release = await this._slots.acquire(deadline, request.signal);
       try { return await this._decide(spec, request, started, deadline); }
       finally { release(); }
-    });
+    })();
+  }
+
+  /**
+   * Prime a key ahead of its first decision (e.g. when a thread starts). Resolves
+   * when the primed session is installed; a failure leaves the key unprimed.
+   */
+  async prime(spec: PrimeSpec): Promise<void> {
+    if (this._closed || !spec.context) return;
+    const conn = await this._process();
+    const hash = primeHash(spec), state = this._keyState(spec.key);
+    state.lastHash = hash;
+    const current = this._sessions.get(spec.key);
+    if (current && current.hash === hash && current.generation === this._generation) return;
+    await this._primeInBackground(conn, spec, hash, state, true);
   }
 
   async evict(key: string): Promise<void> {
-    await this._queue.run(key, async () => { const s = this._sessions.get(key); if (s) await this._drop(s, "requested"); });
+    this._keys.delete(key);
+    const s = this._sessions.get(key);
+    if (s) await this._drop(s, "requested");
   }
 
   async close(): Promise<void> {
@@ -224,6 +271,7 @@ export class CodexPrimedSessions implements PrimedSessions {
     clearInterval(this._idleTimer);
     const closed = new DecisionError("Primed sessions closed", "closed", "not-dispatched", true);
     this._slots.drain(closed);
+    this._primeSlots.drain(closed);
     const conn = this._conn;
     await Promise.race([Promise.all([...this._sessions.values()].map(s => this._drop(s, "close"))), Bun.sleep(2_000)]);
     this._conn = undefined;
@@ -415,25 +463,68 @@ export class CodexPrimedSessions implements PrimedSessions {
     return branch;
   }
 
-  /**
-   * Run one turn on a thread and wait for its terminal. On deadline, interrupt and
-   * wait briefly for acknowledgment; without it, recycle the process. A violation
-   * always recycles: the launch policy did not hold.
-   */
-  private async _turn(conn: JsonRpcConnection, threadId: string, branch: Branch, input: string, deadline: number,
-    extra: Record<string, unknown>, signal?: AbortSignal): Promise<{ timedOut: boolean; aborted: boolean; settled: boolean }> {
-    const remaining = () => Math.max(1, deadline - Date.now());
+  private async _startTurn(conn: JsonRpcConnection, threadId: string, branch: Branch, input: string, deadline: number, extra: Record<string, unknown>): Promise<void> {
     const response = object(await conn.request("turn/start", { threadId, input: [{ type: "text", text: input }],
-      ...(this._config.effort ? { effort: this._config.effort } : {}), ...extra }, remaining()));
+      ...(this._config.effort ? { effort: this._config.effort } : {}), ...extra }, Math.max(1, deadline - Date.now())));
     const turnId = object(response?.turn)?.id;
     if (typeof turnId === "string") branch.turnId ??= turnId;
-    let timer: ReturnType<typeof setTimeout> | undefined, onAbort: (() => void) | undefined;
-    const stop = await Promise.race([branch.attention.then(() => "attention" as const),
-      new Promise<"timeout">(resolve => { timer = setTimeout(() => resolve("timeout"), remaining()); }),
-      new Promise<"aborted">(resolve => { onAbort = () => resolve("aborted"); if (signal?.aborted) onAbort(); else signal?.addEventListener("abort", onAbort, { once: true }); })]);
+  }
+
+  /** Interrupt a losing hedge branch and release it, off the result path. Never recycles the shared process. */
+  private async _settleLoser(conn: JsonRpcConnection, threadId: string, branch: Branch, key: string): Promise<void> {
+    if (!branch.terminal && !branch.lost && branch.turnId)
+      await conn.request("turn/interrupt", { threadId, turnId: branch.turnId }, 2_000).catch(() => undefined);
+    await Promise.race([branch.done, Bun.sleep(5_000)]);
+    this._branches.delete(threadId);
+    if (this._conn === conn) void conn.request("thread/unsubscribe", { threadId }, 10_000).catch(() => undefined);
+    this._emit({ type: "hedge-settled", key, settled: !!branch.terminal || !!branch.lost });
+  }
+
+  /**
+   * Run one turn on a thread and wait for its terminal. With a hedge, a second branch
+   * starts once `hedge.afterMs` passes without an answer; the first to finish wins.
+   * On deadline, interrupt and wait briefly for acknowledgment; without it, recycle
+   * the process. A violation always recycles: the launch policy did not hold.
+   */
+  private async _turn(conn: JsonRpcConnection, threadId: string, branch: Branch, input: string, deadline: number,
+    extra: Record<string, unknown>, signal?: AbortSignal,
+    hedge?: { afterMs: number; open(): Promise<{ threadId: string; branch: Branch }>; key: string },
+  ): Promise<{ timedOut: boolean; aborted: boolean; settled: boolean; threadId: string; branch: Branch; hedged: boolean }> {
+    const remaining = () => Math.max(1, deadline - Date.now());
+    await this._startTurn(conn, threadId, branch, input, deadline, extra);
+    let winner = { threadId, branch }, hedged = false, second: { threadId: string; branch: Branch } | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined, hedgeTimer: ReturnType<typeof setTimeout> | undefined, onAbort: (() => void) | undefined;
+    const abort = new Promise<"aborted">(resolve => { onAbort = () => resolve("aborted"); if (signal?.aborted) onAbort(); else signal?.addEventListener("abort", onAbort, { once: true }); });
+    const expiry = new Promise<"timeout">(resolve => { timer = setTimeout(() => resolve("timeout"), remaining()); });
+    let stop = await Promise.race([branch.attention.then(() => "attention" as const), expiry, abort,
+      ...(hedge && hedge.afterMs < remaining() ? [new Promise<"hedge">(resolve => { hedgeTimer = setTimeout(() => resolve("hedge"), hedge.afterMs); })] : [])]);
+    clearTimeout(hedgeTimer);
+    if (stop === "hedge") {
+      try {
+        second = await hedge!.open();
+        await this._startTurn(conn, second.threadId, second.branch, input, deadline, extra);
+        hedged = true;
+        this._emit({ type: "hedged", key: hedge!.key, afterMs: hedge!.afterMs });
+      } catch {
+        // The hedge is an optimization: if it cannot start, keep waiting on the original.
+        if (second) { this._branches.delete(second.threadId); second = undefined; }
+      }
+      const raced = await Promise.race([branch.attention.then(() => "first" as const),
+        ...(second ? [second.branch.attention.then(() => "second" as const)] : []), expiry, abort]);
+      if (raced === "second") winner = second!;
+      stop = raced === "first" || raced === "second" ? "attention" : raced;
+    }
     clearTimeout(timer);
     if (onAbort) signal?.removeEventListener("abort", onAbort);
     const timedOut = stop === "timeout", aborted = stop === "aborted";
+    const loser = second && (winner === second ? { threadId, branch } : second);
+    // A violation on either branch fails the decision; both run on the process being recycled.
+    if (loser && !loser.branch.violation) void this._settleLoser(conn, loser.threadId, loser.branch, hedge!.key);
+    if (loser?.branch.violation) {
+      winner.branch.violation ??= loser.branch.violation;
+      this._branches.delete(loser.threadId); // the recycle below ends it with the process
+    }
+    branch = winner.branch; threadId = winner.threadId;
     let settled = !!branch.terminal;
     if (!branch.terminal && !branch.lost && branch.turnId) {
       await conn.request("turn/interrupt", { threadId, turnId: branch.turnId }, 2_000).catch(() => undefined);
@@ -444,23 +535,18 @@ export class CodexPrimedSessions implements PrimedSessions {
       const exited = await this._recycle(conn, branch.violation ? `violation: ${branch.violation}` : "unacknowledged interrupt");
       settled ||= exited;
     }
-    return { timedOut, aborted, settled };
+    return { timedOut, aborted, settled, threadId, branch, hedged };
   }
 
   private _threadParams(instructions: string): Record<string, unknown> {
     return { model: this._config.model, cwd: this._config.cwd, approvalPolicy: "never", sandbox: "read-only",
-      baseInstructions: this._config.baseInstructions, developerInstructions: instructions, config: { ...CODEX_DECISION_THREAD_CONFIG } };
+      baseInstructions: this._config.baseInstructions, developerInstructions: instructions, config: { ...CODEX_DECISION_THREAD_CONFIG },
+      ...(this._config.serviceTier ? { serviceTier: this._config.serviceTier } : {}) };
   }
 
+  /** Run the primer on a new persisted thread. The caller decides whether to install it. */
   private async _prime(conn: JsonRpcConnection, spec: PrimeSpec, hash: string, deadline: number, signal?: AbortSignal): Promise<Primed> {
     const generation = this._generation, t0 = performance.now();
-    if (!spec.context) {
-      // Nothing to prime beyond instructions: each decision starts a fresh thread with the same prefix.
-      const primed: Primed = { key: spec.key, hash, generation, lastUsed: Date.now(), busy: false };
-      this._sessions.set(spec.key, primed);
-      this._emit({ type: "primed", key: spec.key, hash, ms: Math.round(performance.now() - t0) });
-      return primed;
-    }
     const started = object(await conn.request("thread/start", { ...this._threadParams(spec.instructions), ephemeral: false },
       Math.max(1, deadline - Date.now())));
     const baseId = object(started?.thread)?.id;
@@ -487,31 +573,76 @@ export class CodexPrimedSessions implements PrimedSessions {
       if (!ok) void conn.request("thread/delete", { threadId: baseId }, 10_000).catch(() => undefined);
     }
     const primed: Primed = { key: spec.key, hash, generation, baseThreadId: baseId, primedTurnId: branch.turnId,
-      model: typeof started?.model === "string" ? started.model : undefined, lastUsed: Date.now(), busy: false };
-    this._sessions.set(spec.key, primed);
+      model: typeof started?.model === "string" ? started.model : undefined, lastUsed: Date.now(), inUse: 0, servedWarm: false };
     this._emit({ type: "primed", key: spec.key, hash, ms: Math.round(performance.now() - t0) });
     return primed;
   }
 
-  private async _drop(session: Primed, reason: "idle" | "capacity" | "reprime" | "requested" | "close"): Promise<void> {
+  private _keyState(key: string): KeyState {
+    let state = this._keys.get(key);
+    if (!state) { state = { volatile: false }; this._keys.set(key, state); }
+    return state;
+  }
+
+  /**
+   * Prime `hash` for a key off the decision path and install it if it is still the
+   * key's current context. A volatile key primes only when its context repeats.
+   */
+  private _primeInBackground(conn: JsonRpcConnection, spec: PrimeSpec, hash: string, state: KeyState, force = false): Promise<void> {
+    if (state.priming?.hash === hash) return state.priming.done;
+    if (!force && state.volatile && state.lastHash !== hash) return Promise.resolve();
+    let done!: Promise<void>;
+    done = (async () => {
+      await null; // `done` is assigned before this body runs
+      let release: (() => void) | undefined;
+      try {
+        release = await this._primeSlots.acquire(Date.now() + this._config.timeoutMs);
+        if (this._closed || this._conn !== conn || state.lastHash !== hash) return;
+        await this._makeRoom(spec.key);
+        const primed = await this._prime(conn, spec, hash, Date.now() + this._config.timeoutMs);
+        const current = this._sessions.get(spec.key);
+        // A newer context arrived, or the process changed, while priming: this one is already stale.
+        if (this._closed || state.lastHash !== hash || primed.generation !== this._generation) {
+          void conn.request("thread/delete", { threadId: primed.baseThreadId }, 10_000).catch(() => undefined);
+          return;
+        }
+        if (current) this._retire(current, "reprime", state);
+        this._sessions.set(spec.key, primed);
+      } catch { /* priming is best-effort: decisions keep running inline */ }
+      finally { release?.(); if (state.priming?.done === done) state.priming = undefined; }
+    })();
+    state.priming = { hash, done };
+    return done;
+  }
+
+  /** Remove a session from service; delete it now, or when its last decision finishes. */
+  private _retire(session: Primed, reason: NonNullable<Primed["stale"]>, state?: KeyState): void {
+    if (this._sessions.get(session.key) === session) this._sessions.delete(session.key);
+    // Replaced before it ever served a decision: this key's context changes faster than priming pays off.
+    if (reason === "reprime" && state && !session.servedWarm) state.volatile = true;
+    session.stale = reason;
+    if (session.inUse === 0) void this._drop(session, reason);
+  }
+
+  private async _drop(session: Primed, reason: NonNullable<Primed["stale"]>): Promise<void> {
     if (this._sessions.get(session.key) === session) this._sessions.delete(session.key);
     this._emit({ type: "evicted", key: session.key, reason });
     const conn = this._conn;
-    if (conn && session.baseThreadId && session.generation === this._generation)
+    if (conn && session.generation === this._generation)
       await conn.request("thread/delete", { threadId: session.baseThreadId }, 10_000).catch(() => undefined);
   }
 
   private async _evictIdle(): Promise<void> {
     const cutoff = Date.now() - this._config.idleMs;
     for (const session of [...this._sessions.values()])
-      if (!session.busy && session.lastUsed < cutoff) await this._drop(session, "idle");
+      if (session.inUse === 0 && session.lastUsed < cutoff) this._retire(session, "idle");
   }
 
   private async _makeRoom(except: string): Promise<void> {
     while (this._sessions.size >= this._config.maxSessions) {
-      const idle = [...this._sessions.values()].filter(s => !s.busy && s.key !== except).sort((a, b) => a.lastUsed - b.lastUsed)[0];
+      const idle = [...this._sessions.values()].filter(s => s.inUse === 0 && s.key !== except).sort((a, b) => a.lastUsed - b.lastUsed)[0];
       if (!idle) return;
-      await this._drop(idle, "capacity");
+      this._retire(idle, "capacity");
     }
   }
 
@@ -523,38 +654,45 @@ export class CodexPrimedSessions implements PrimedSessions {
     if (Date.now() >= deadline || signal?.aborted) throw expired();
     const conn = await this._process();
     await this._checkLimits();
-    const hash = primeHash(spec);
-    let session = this._sessions.get(spec.key), prime: "warm" | "cold" = "warm", primeMs = 0;
-    if (session && (session.hash !== hash || session.generation !== this._generation)) { await this._drop(session, "reprime"); session = undefined; }
-    if (!session) {
-      await this._makeRoom(spec.key);
-      const t = performance.now();
-      try { session = await this._prime(conn, spec, hash, deadline, signal); }
-      catch (error) {
-        if (error instanceof DecisionError) throw error;
-        throw new DecisionError(`Priming ${spec.key} failed: ${(error as Error).message}`, "prime-failed", "not-dispatched", true, undefined, { cause: error });
-      }
-      primeMs = Math.round(performance.now() - t); prime = "cold";
+    const hash = primeHash(spec), state = this._keyState(spec.key);
+    let session = this._sessions.get(spec.key);
+    if (session && (session.hash !== hash || session.generation !== this._generation)) {
+      // The context changed: the old primed session no longer matches. Retire it; prime the new one off-path.
+      if (session.generation === this._generation) this._retire(session, "reprime", state);
+      else this._sessions.delete(spec.key);
+      session = undefined;
     }
-    session.busy = true; session.lastUsed = Date.now();
+    const prime: "warm" | "cold" = session ? "warm" : "cold", primeMs = 0;
+    if (!session && spec.context) void this._primeInBackground(conn, spec, hash, state);
+    state.lastHash = hash;
+    if (session) { session.inUse++; session.lastUsed = Date.now(); }
     let threadId: string | undefined, admissionId: string | undefined, dispatched = false;
+    // A miss runs inline: the stable context travels with this decision's input on a fresh thread.
+    const input = session || !spec.context ? request.input : `${spec.context}\n\n${request.input}`;
+    const params = this._threadParams(spec.instructions);
+    let model = session?.model;
+    /** A fresh branch for this decision: a fork of the primed state, or an inline thread. */
+    const openBranch = async (): Promise<{ threadId: string; branch: Branch }> => {
+      const response = object(await (session
+        ? conn.request("thread/fork", { threadId: session.baseThreadId, lastTurnId: session.primedTurnId, ephemeral: true, excludeTurns: true, ...params }, Math.max(1, deadline - Date.now()))
+        : conn.request("thread/start", { ...params, ephemeral: true }, Math.max(1, deadline - Date.now()))));
+      const id = object(response?.thread)?.id;
+      if (typeof id !== "string" || !id) throw Error("Codex returned no decision thread");
+      model ??= typeof response?.model === "string" ? response.model : undefined;
+      return { threadId: id, branch: this._branch(conn, id, spec.key) };
+    };
     try {
       if (Date.now() >= deadline || signal?.aborted) throw expired();
       const t1 = performance.now();
-      const params = this._threadParams(spec.instructions);
-      const response = object(await (session.baseThreadId
-        ? conn.request("thread/fork", { threadId: session.baseThreadId, lastTurnId: session.primedTurnId, ephemeral: true, excludeTurns: true, ...params }, Math.max(1, deadline - Date.now()))
-        : conn.request("thread/start", { ...params, ephemeral: true }, Math.max(1, deadline - Date.now()))).catch(error => {
-        // A lost primed thread is recoverable by re-priming on the next call.
-        this._sessions.delete(spec.key);
+      const opened = await openBranch().catch(error => {
+        // A lost primed thread is recoverable: retire it and prime again off-path.
+        if (session) this._retire(session, "reprime");
         throw new DecisionError(`Branching ${spec.key} failed: ${(error as Error).message}`, "transport", "not-dispatched", true, undefined, { cause: error });
-      }));
-      const thread = object(response?.thread);
-      threadId = typeof thread?.id === "string" && thread.id ? thread.id : undefined;
-      if (!threadId) throw new DecisionError("Codex returned no decision thread", "transport", "not-dispatched", true);
-      session.model ??= typeof response?.model === "string" ? response.model : undefined;
+      });
+      threadId = opened.threadId;
+      if (session) session.model ??= model;
       const branchMs = Math.round(performance.now() - t1);
-      const branch = this._branch(conn, threadId, spec.key);
+      let branch = opened.branch;
       admissionId = crypto.randomUUID();
       try { await request.onAdmission?.({ admissionId, key: spec.key, runtime: "codex", threadId }); }
       catch (cause) { throw new DecisionError("Decision admission refused before dispatch", "admission", "not-dispatched", true, admissionId, { cause }); }
@@ -562,14 +700,20 @@ export class CodexPrimedSessions implements PrimedSessions {
       if (this._conn !== conn || this._closed) throw new DecisionError("Codex process lost before dispatch", "transport", "not-dispatched", true, admissionId);
       const t2 = performance.now();
       dispatched = true;
-      let outcome: { timedOut: boolean; aborted: boolean; settled: boolean };
-      try { outcome = await this._turn(conn, threadId, branch, request.input, deadline, request.outputSchema ? { outputSchema: request.outputSchema } : {}, signal); }
+      let outcome: Awaited<ReturnType<CodexPrimedSessions["_turn"]>>;
+      const hedgeAfterMs = this._config.hedgeAfterMs;
+      try {
+        outcome = await this._turn(conn, threadId, branch, input, deadline, request.outputSchema ? { outputSchema: request.outputSchema } : {}, signal,
+          hedgeAfterMs !== undefined ? { afterMs: hedgeAfterMs, open: openBranch, key: spec.key } : undefined);
+      }
       catch (error) {
         // A JSON-RPC error is the runtime's own refusal. Anything else (timeout, loss) leaves the turn unknown until the process is gone.
         const settled = error instanceof JsonRpcError || await this._recycle(conn, "turn/start unsettled");
         throw new DecisionError(`Codex turn/start failed: ${(error as Error).message}`, "transport", "attempted", settled, admissionId, { cause: error });
       }
       const turnMs = Math.round(performance.now() - t2);
+      if (outcome.threadId !== threadId) threadId = outcome.threadId; // the losing branch is settled by _settleLoser
+      branch = outcome.branch;
       if (branch.violation) throw new DecisionError(`Decision violated the text-only policy (${branch.violation})`, "violation", "attempted", outcome.settled, admissionId);
       if (outcome.aborted && !branch.terminal) throw new DecisionError("Decision aborted; turn interrupted", "aborted", "attempted", outcome.settled, admissionId);
       if (outcome.timedOut && !branch.terminal) throw new DecisionError("Decision deadline passed; turn interrupted", "timeout", "attempted", outcome.settled, admissionId);
@@ -586,13 +730,17 @@ export class CodexPrimedSessions implements PrimedSessions {
       const tokens = codexTokens(branch.usage);
       this._emit({ type: "decision", key: spec.key, prime, ms: Date.now() - started, ...(tokens?.cacheRead !== undefined ? { cacheRead: tokens.cacheRead } : {}),
         ...(count(branch.usage?.inputTokens) !== undefined ? { input: count(branch.usage?.inputTokens) } : {}) });
-      return { key: spec.key, admissionId, content, ...(tokens ? { tokens } : {}), ...(session.model ? { model: session.model } : {}),
-        threadId, ...(branch.turnId ? { turnId: branch.turnId } : {}), prime, timing: { waitMs, primeMs, branchMs, turnMs } };
+      if (session) { session.servedWarm = true; state.volatile = false; }
+      return { key: spec.key, admissionId, content, ...(tokens ? { tokens } : {}), ...(model ? { model } : {}),
+        threadId, ...(branch.turnId ? { turnId: branch.turnId } : {}), prime, ...(outcome.hedged ? { hedged: true } : {}), timing: { waitMs, primeMs, branchMs, turnMs } };
     } catch (error) {
       if (error instanceof DecisionError) throw error;
       throw new DecisionError((error as Error).message, "transport", dispatched ? "attempted" : "not-dispatched", !dispatched, admissionId, { cause: error });
     } finally {
-      session.busy = false; session.lastUsed = Date.now();
+      if (session) {
+        session.inUse--; session.lastUsed = Date.now();
+        if (session.stale && session.inUse === 0) void this._drop(session, session.stale);
+      }
       if (threadId) {
         this._branches.delete(threadId);
         if (this._conn === conn) void conn.request("thread/unsubscribe", { threadId }, 10_000).catch(() => undefined);

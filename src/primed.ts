@@ -57,8 +57,10 @@ export interface DecisionResult {
   readonly model?: string;
   readonly threadId?: string;
   readonly turnId?: string;
-  /** `cold`: this call (re)primed the key. */
+  /** `warm`: forked from the key's primed state; `cold`: ran inline (no primed session for this context yet). */
   readonly prime: "warm" | "cold";
+  /** A second branch was started for this slow decision; the result is the first to finish. */
+  readonly hedged?: boolean;
   readonly timing: { readonly waitMs: number; readonly primeMs: number; readonly branchMs: number; readonly turnMs: number };
 }
 
@@ -90,7 +92,9 @@ export type PrimedEvent =
   | { readonly type: "evicted"; readonly key: string; readonly reason: "idle" | "capacity" | "reprime" | "requested" | "process-lost" | "close" }
   | { readonly type: "decision"; readonly key: string; readonly prime: "warm" | "cold"; readonly ms: number; readonly cacheRead?: number; readonly input?: number }
   | { readonly type: "limits"; readonly limits: LimitSnapshot }
-  | { readonly type: "violation"; readonly key: string; readonly detail: string };
+  | { readonly type: "violation"; readonly key: string; readonly detail: string }
+  | { readonly type: "hedged"; readonly key: string; readonly afterMs: number }
+  | { readonly type: "hedge-settled"; readonly key: string; readonly settled: boolean };
 
 export interface PrimedSnapshot {
   readonly runtime: "codex" | "claude";
