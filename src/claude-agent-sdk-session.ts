@@ -22,8 +22,9 @@ import { TRANSPORTS } from "./transport";
 
 /** The subset of the SDK's Query this transport uses. */
 export interface ClaudeAgentSdkQuery extends AsyncIterable<unknown> {
-  interrupt(): Promise<void>;
-  close?(): void;
+  interrupt(): Promise<unknown>;
+  /** Stops the underlying CLI. The bridge reports exit only after the message stream ends. */
+  close(): void;
 }
 export type ClaudeAgentSdkQueryFunction = (params: { prompt: AsyncIterable<unknown>; options: Record<string, unknown> }) => ClaudeAgentSdkQuery;
 export type ClaudeAgentSdkCanUseTool = (toolName: string, input: Record<string, unknown>, context: unknown) => Promise<unknown>;
@@ -113,15 +114,16 @@ function bridge(config: ClaudeAgentSdkSessionConfig): NonNullable<ClaudeCodeSess
     const options: Record<string, unknown> = { ...config.sdkOptions, ...sdkOptionsFromArgv(cmd.slice(1)), cwd, env: stringEnv,
       ...(config.canUseTool ? { canUseTool: config.canUseTool } : {}),
       ...(config.bundledCli ? {} : { pathToClaudeCodeExecutable: Bun.which(cmd[0]!) ?? cmd[0] }) };
-    let query: ClaudeAgentSdkQuery;
+    let query: ClaudeAgentSdkQuery, killed = false;
     try { query = config.query({ prompt, options }); }
     catch (error) {
       queueMicrotask(() => { err.enqueue(encoder.encode(String((error as Error).message ?? error))); end(1); });
-      query = { interrupt: async () => {}, async *[Symbol.asyncIterator]() {} };
+      query = { interrupt: async () => {}, close() {}, async *[Symbol.asyncIterator]() {} };
     }
+    // `exited` resolves only when the SDK's message stream has ended, so it is evidence that the CLI stopped.
     void (async () => {
-      try { for await (const message of query) emit(message); end(0); }
-      catch (error) { if (!finished) err.enqueue(encoder.encode(String((error as Error)?.message ?? error))); end(1); }
+      try { for await (const message of query) if (!killed) emit(message); end(killed ? 143 : 0); }
+      catch (error) { if (!finished && !killed) err.enqueue(encoder.encode(String((error as Error)?.message ?? error))); end(killed ? 143 : 1); }
     })();
 
     const respond = (requestId: string, error?: string) => emit({ type: "control_response",
@@ -148,9 +150,9 @@ function bridge(config: ClaudeAgentSdkSessionConfig): NonNullable<ClaudeCodeSess
       },
       stdout, stderr, exited,
       kill() {
-        inputEnded = true; wake?.(); wake = undefined;
-        try { query.close?.(); } catch { /* already closed */ }
-        end(143);
+        if (killed) return;
+        killed = true; inputEnded = true; wake?.(); wake = undefined;
+        try { query.close(); } catch { /* already closed */ }
       },
     };
     return process;

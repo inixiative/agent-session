@@ -355,6 +355,7 @@ export class ClaudeCodeSession implements HarnessSession {
     };
     delete env.ANTHROPIC_API_KEY;
     delete env.ANTHROPIC_AUTH_TOKEN;
+    for (const key of Object.keys(env)) if (env[key] === undefined) delete env[key];
 
     if (this._spawn) {
       this._proc = this._spawn([this._bin, ...args], { cwd: this._cwd, env });
@@ -387,8 +388,14 @@ export class ClaudeCodeSession implements HarnessSession {
         : `Process exited with code ${code}`;
       this._rejectInflight(new Error(errMsg));
       this._rejectQueue(new Error("Session ended"));
+      this._rejectControl(new Error("Session ended"));
       this._emit({ kind: "session_end", timestamp: Date.now(), transportOutcome: "failed" });
     });
+  }
+
+  private _rejectControl(error: Error): void {
+    for (const pending of this._control.values()) pending.reject(error);
+    this._control.clear();
   }
 
   // ---------------------------------------------------------------------------
@@ -544,8 +551,7 @@ export class ClaudeCodeSession implements HarnessSession {
 
     this._rejectInflight(new Error("Session killed; native outcome may remain unknown"), "killed");
     this._rejectQueue(new Error("Session killed"));
-    for (const pending of this._control.values()) pending.reject(new Error("Session killed"));
-    this._control.clear();
+    this._rejectControl(new Error("Session killed"));
 
     try { this._proc.stdin.end(); } catch { /* already closed */ }
     try { this._proc.kill(); } catch { /* already dead */ }
@@ -661,6 +667,7 @@ export class ClaudeCodeSession implements HarnessSession {
     this._alive = false;
     this._rejectInflight(err);
     this._rejectQueue(err);
+    this._rejectControl(err);
     this._emit({ kind: "session_end", timestamp: Date.now(), transportOutcome: "failed" });
   }
 

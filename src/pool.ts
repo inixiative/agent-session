@@ -119,6 +119,8 @@ interface InstanceState {
   limits?: LimitSnapshot;
   unavailableUntil?: number;
   failures: number;
+  /** Last poll that failed or returned nothing; not repeated within the probe cooldown. */
+  emptyProbeAt?: number;
 }
 
 export interface SubscriptionPoolOptions {
@@ -129,6 +131,8 @@ export interface SubscriptionPoolOptions {
   readonly failureCooldownMs?: number;
   /** Utilization reserved per active lease when ranking. Default 0. */
   readonly reservationPercent?: number;
+  /** A poll that failed or returned no limits is not repeated for this long. Default 60 s. */
+  readonly probeCooldownMs?: number;
   /** Limit poll for one instance. Default: probeCodexLimits / probeClaudeLimits with the instance profile. */
   readonly probe?: (instance: InstanceStatus & { readonly env: Readonly<Record<string, string | undefined>> }) => Promise<LimitSnapshot | undefined>;
   readonly now?: () => number;
@@ -156,8 +160,10 @@ export class SubscriptionPool {
         throw Error(`Instance ${config.id}: transport "${config.transport}" cannot be pooled`);
       const runtime = descriptor.runtime;
       const variable = PROFILE_VARIABLE[runtime];
-      const env: Record<string, string | undefined> = { ...config.env, ...(config.profileDirectory ? { [variable]: config.profileDirectory } : {}) };
-      const home = resolve(config.profileDirectory ?? env[variable] ?? process.env[variable] ?? join(homedir(), runtime === "codex" ? ".codex" : ".claude"));
+      // The profile variable is always pinned: a directory selects it, undefined selects the default login.
+      // Caller env can never move a leased session to a different login.
+      const env: Record<string, string | undefined> = { ...config.env, [variable]: config.profileDirectory ?? config.env?.[variable] };
+      const home = resolve(env[variable] ?? join(homedir(), runtime === "codex" ? ".codex" : ".claude"));
       const limit = config.concurrencyLimit ?? 1;
       if (!Number.isSafeInteger(limit) || limit < 1) throw Error(`Instance ${config.id}: concurrencyLimit must be a positive integer`);
       this._instances.set(config.id, { config, runtime, env, leases: new Set(), failures: 0,
@@ -188,8 +194,9 @@ export class SubscriptionPool {
         const limits = this._options.probe ? await this._options.probe({ ...this._status(state), env })
           : state.runtime === "codex" ? await probeCodexLimits({ env, bin: state.config.session?.bin as string | undefined })
           : await probeClaudeLimits({ env, bin: state.config.session?.bin as string | undefined });
-        if (limits) this.observeLimits(state.config.id, limits);
-      } catch { this.reportFailure(state.config.id, "probe"); }
+        if (limits) { state.emptyProbeAt = undefined; this.observeLimits(state.config.id, limits); }
+        else state.emptyProbeAt = this._now();
+      } catch { state.emptyProbeAt = this._now(); this.reportFailure(state.config.id, "probe"); }
     }));
   }
 
@@ -207,7 +214,7 @@ export class SubscriptionPool {
         models: state.config.models ?? { [request.model]: [effort] },
         activeRuns: state.leases.size, concurrencyLimit: state.config.concurrencyLimit ?? 1,
         windows: (limits?.windows ?? []).map(w => ({ usedPercent: w.usedPercent, reservedPercent: reserved,
-          observedAt: limits!.observedAt, resetsAt: w.resetsAt ?? Number.NaN })),
+          observedAt: limits!.observedAt, resetsAt: w.resetsAt ?? Number.POSITIVE_INFINITY })),
         blocked: this._blocked(state, now),
         ...(state.unavailableUntil !== undefined ? { unavailableUntil: state.unavailableUntil } : {}),
       };
@@ -246,11 +253,12 @@ export class SubscriptionPool {
       this._emit({ type: "handoff-refused", from: binding.instanceId, reason });
       throw new ContinuityError(message, reason, excluded);
     };
+    const unresolved = () => binding.session?.attempts?.some(a => a.dispatch === "attempted" && a.nativeOutcome === "unknown");
     const from = this._instances.get(binding.instanceId);
     if (!from) return refuse("unknown-instance", `Unknown instance ${binding.instanceId}`);
     if (TRANSPORTS[from.config.transport].capabilities.resume !== "native")
       return refuse("resume-unsupported", `${from.config.transport} cannot resume a thread in another process`);
-    if (binding.session?.attempts?.some(a => a.dispatch === "attempted" && a.nativeOutcome === "unknown"))
+    if (unresolved())
       return refuse("unresolved-native-work", "The session has native work of unknown outcome; continuing elsewhere could repeat or fork it");
     const shared = [...this._instances.values()].filter(s => s !== from && s.continuationKey === from.continuationKey
       && s.runtime === from.runtime && TRANSPORTS[s.config.transport].capabilities.resume === "native");
@@ -261,11 +269,15 @@ export class SubscriptionPool {
     const { candidates, excluded } = this.rank({ ...request, excludeInstanceIds: [...(request.excludeInstanceIds ?? []), ...[...this._instances.keys()].filter(id => !allowed.has(id))] });
     const best = candidates[0];
     if (!best) return refuse("targets-unavailable", "Instances sharing this history are unavailable", excluded);
+    // Re-check after the refresh await, then stop the old session in the same synchronous step: no send can slip in between.
+    if (unresolved())
+      return refuse("unresolved-native-work", "The session has native work of unknown outcome; continuing elsewhere could repeat or fork it");
     binding.session?.kill();
     binding.lease?.release();
     const lease = this._lease(this._state(best.accountId), request.mode ?? "quartile-balanced", best.utilizationPercent, 0);
     try {
-      const session = this._session(lease, { model: request.model, ...(request.effort ? { effort: request.effort } : {}), ...config, externalSessionId: binding.externalSessionId });
+      const session = this._session(lease, { model: request.model, ...(request.effort ? { effort: request.effort } : {}), ...config },
+        { externalSessionId: binding.externalSessionId });
       this._emit({ type: "handoff", from: from.config.id, to: best.accountId, continuationKey: from.continuationKey, externalSessionId: binding.externalSessionId });
       return { session, lease };
     } catch (error) { lease.release(); throw error; }
@@ -312,9 +324,12 @@ export class SubscriptionPool {
   }
   private async _refreshStale(request: PoolRequest, only?: Set<string>): Promise<void> {
     const now = this._now();
+    const cooldown = this._options.probeCooldownMs ?? 60_000;
     const stale = [...this._instances.values()].filter(s => this._eligibleShape(s, request) && s.config.enabled !== false
       && (!only || only.has(s.config.id))
+      && (s.emptyProbeAt === undefined || now - s.emptyProbeAt >= cooldown)
       && (!s.limits || now - s.limits.observedAt > this._maxAge
+        || s.limits.windows.some(w => w.resetsAt !== undefined && w.resetsAt <= now)
         || (this._blocked(s, now) && (s.unavailableUntil === undefined || s.unavailableUntil <= now))));
     if (stale.length) await this.refreshLimits(stale.map(s => s.config.id));
   }
@@ -334,15 +349,29 @@ export class SubscriptionPool {
     this._emit({ type: "allocated", leaseId, instanceId: state.config.id, transport: state.config.transport, mode, utilizationPercent, rank });
     return lease;
   }
-  private _session(lease: Lease, config: PooledSessionConfig): HarnessSession {
+  /**
+   * Create a session bound to its lease: the lease ends when the session ends,
+   * is killed (even before start) or fails to start, and a session whose lease
+   * ended cannot start again (e.g. an automatic --resume restart) outside the pool.
+   */
+  private _session(lease: Lease, config: PooledSessionConfig, forced: Record<string, unknown> = {}): HarnessSession {
     const state = this._state(lease.instanceId);
-    const merged = { ...config, ...state.config.session, env: { ...(config.env as Record<string, string | undefined> | undefined), ...state.env } };
+    const merged = { ...config, ...state.config.session, env: { ...(config.env as Record<string, string | undefined> | undefined), ...state.env }, ...forced };
     const session = createSession(state.config.transport, merged as never);
     session.onEvent(event => {
       if (event.kind === "rate_limit" && event.limits) this.observeLimits(state.config.id, event.limits);
       else if (event.kind === "result" && event.nativeOutcome === "completed") this.reportSuccess(state.config.id);
       else if (event.kind === "result" && event.terminal?.apiErrorStatus === 429) this.reportFailure(state.config.id, "rate-limited");
       else if (event.kind === "session_end") lease.release();
+    });
+    const start = session.start.bind(session), kill = session.kill.bind(session);
+    // Own properties shadow the prototype, so the session's internal restart path goes through them too.
+    Object.assign(session, {
+      start: async () => {
+        if (lease.released) throw Error("Pool lease released; open a new session through the pool");
+        try { await start(); } catch (error) { lease.release(); throw error; }
+      },
+      kill: () => { try { kill(); } finally { lease.release(); } },
     });
     return session;
   }

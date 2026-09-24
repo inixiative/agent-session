@@ -324,6 +324,10 @@ abstract class BaseCodexSession implements HarnessSession {
       ...this._env,
       DISABLE_AUTOUPDATER: "1",
     };
+    // Subscription transport: an inherited API key never selects metered billing.
+    delete env.OPENAI_API_KEY;
+    delete env.CODEX_API_KEY;
+    for (const key of Object.keys(env)) if (env[key] === undefined) delete env[key];
 
     if (this._spawn) {
       this._proc = this._spawn([this._bin, ...args], { cwd: this._cwd, env });
@@ -949,10 +953,16 @@ export class CodexAppServerSession extends BaseCodexSession {
     const a = this._inflight?.evidence;
     const ignored = (reason: string) => this._emit({ kind: "error", timestamp: Date.now(), text: `push_ignored: kind=${payload.kind} — ${reason}`, raw: { kind: payload.kind } });
     if (!a || a.dispatch !== "attempted" || a.nativeOutcome !== "unknown" || !a.identity.turnId || !this._externalSessionId) return ignored("no owned in-flight turn");
+    let timer: ReturnType<typeof setTimeout> | undefined, timedOut = false;
     try {
-      await this._rpcRequest("turn/steer", { threadId: this._externalSessionId, expectedTurnId: a.identity.turnId, input: [{ type: "text", text: payload.text }] });
+      await Promise.race([this._rpcRequest("turn/steer", { threadId: this._externalSessionId, expectedTurnId: a.identity.turnId, input: [{ type: "text", text: payload.text }] }),
+        new Promise<never>((_, reject) => { timer = setTimeout(() => { timedOut = true; reject(Error("turn/steer unanswered")); }, 10_000); })]);
       this._emit({ ...a.identity, admissionId: a.admissionId, kind: "native_status", timestamp: Date.now(), raw: { type: "push-steered", kind: payload.kind } });
-    } catch (error) { ignored(`turn/steer refused: ${(error as Error).message.slice(0, 200)}`); }
+    } catch (error) {
+      // A refusal is the runtime's answer; no answer leaves delivery unknown, never "ignored".
+      if (timedOut || !this._alive) this._emit({ ...a.identity, admissionId: a.admissionId, kind: "native_status", timestamp: Date.now(), raw: { type: "push-unknown", kind: payload.kind } });
+      else ignored(`turn/steer refused: ${(error as Error).message.slice(0, 200)}`);
+    } finally { clearTimeout(timer); }
   }
   private readonly _options: NonNullable<CodexSessionConfig["appServer"]>;
   private readonly _onThreadReady?: (binding: string) => void | Promise<void>;

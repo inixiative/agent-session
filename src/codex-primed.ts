@@ -18,14 +18,15 @@
 // reset is a fork of a persisted primed thread. Forks must restate the
 // instructions or they run on Codex's default base prompt and miss the cache.
 //
-// Text-only: tool features, plugins, MCP servers and notify hooks are disabled
-// at launch; threads run read-only with approvals "never". Any non-text item,
+// Text-only: tool features and plugins are disabled at launch; MCP servers,
+// notify hooks and tool/environment instructions are disabled per thread;
+// threads run read-only with approvals "never". Any non-text item,
 // MCP server startup or server request on a decision thread is a violation:
 // the turn is interrupted and the process recycled.
 // ---------------------------------------------------------------------------
 
 import { JsonRpcConnection, JsonRpcError } from "./json-rpc";
-import type { CodexSpawn, PipedSubprocess } from "./codex-session";
+import type { PipedSubprocess } from "./codex-session";
 import type { SessionTokens } from "./harness-session";
 import { codexLimitSnapshot, mergeLimits, type LimitSnapshot } from "./limits";
 import {
@@ -41,17 +42,23 @@ export const CODEX_DECISION_DISABLED_FEATURES: readonly string[] = [
   "in_app_browser", "in_app_local_automation", "personality", "mentions_v2",
 ];
 
-/** Instruction surfaces that describe tools or the environment; a decision gets none of them. */
-const DISABLED_INSTRUCTIONS = ["include_permissions_instructions", "include_environment_context", "include_apps_instructions",
-  "include_apps_usage_instructions", "include_collaboration_mode_instructions", "include_plugin_usage_instructions",
-  "include_skills_usage_instructions"];
+/**
+ * Per-thread configuration for decisions: no notify hook, no built-in MCP server,
+ * no project docs or skills, and none of the instruction surfaces that describe
+ * tools or the environment. Applied on thread/start and thread/fork (verified
+ * equivalent to launch-level `-c` overrides), so the launch argv carries only
+ * approval, web-search and feature flags that credential launchers accept.
+ */
+export const CODEX_DECISION_THREAD_CONFIG: Readonly<Record<string, unknown>> = Object.freeze({
+  notify: [], "mcp_servers.node_repl.enabled": false, project_doc_max_bytes: 0, "skills.enabled": false,
+  include_permissions_instructions: false, include_environment_context: false, include_apps_instructions: false,
+  include_apps_usage_instructions: false, include_collaboration_mode_instructions: false,
+  include_plugin_usage_instructions: false, include_skills_usage_instructions: false,
+});
 
 /** `codex app-server` argv (without the binary) for tool-free decision sessions. */
 export function codexDecisionLaunchArgs(): string[] {
-  return ["app-server", "--listen", "stdio://",
-    "-c", 'approval_policy="never"', "-c", 'web_search="disabled"', "-c", "notify=[]",
-    "-c", "mcp_servers.node_repl.enabled=false", "-c", "project_doc_max_bytes=0", "-c", "skills.enabled=false",
-    ...DISABLED_INSTRUCTIONS.flatMap(key => ["-c", `${key}=false`]),
+  return ["app-server", "--listen", "stdio://", "-c", 'approval_policy="never"', "-c", 'web_search="disabled"',
     ...CODEX_DECISION_DISABLED_FEATURES.flatMap(feature => ["--disable", feature])];
 }
 
@@ -72,7 +79,11 @@ export interface CodexPrimedConfig {
   baseInstructions?: string;
   /** Merged over process.env. OPENAI_API_KEY / CODEX_API_KEY are always removed. */
   env?: Record<string, string | undefined>;
-  spawn?: CodexSpawn;
+  /**
+   * Process launcher (tests, containers, credential-lock wrappers). May be async;
+   * a rejection fails the decision before dispatch.
+   */
+  spawn?: (cmd: string[], opts: { cwd: string; env: Record<string, string | undefined> }) => PipedSubprocess | Promise<PipedSubprocess>;
   /** Concurrent decision turns across all keys. Default 8. */
   maxConcurrent?: number;
   /** Primed sessions kept live; the least recently used idle key is evicted beyond this. Default 256. */
@@ -102,6 +113,8 @@ interface Primed {
 
 interface Branch {
   readonly key: string;
+  /** The process this branch's thread lives on; only its notifications and loss apply. */
+  readonly conn: JsonRpcConnection;
   turnId?: string;
   text?: string;
   finalText?: string;
@@ -239,6 +252,7 @@ export class CodexPrimedSessions implements PrimedSessions {
   private _env(): Record<string, string | undefined> {
     const env: Record<string, string | undefined> = { ...process.env, ...this._config.env, DISABLE_AUTOUPDATER: "1" };
     delete env.OPENAI_API_KEY; delete env.CODEX_API_KEY;
+    for (const key of Object.keys(env)) if (env[key] === undefined) delete env[key];
     return env;
   }
 
@@ -252,14 +266,22 @@ export class CodexPrimedSessions implements PrimedSessions {
       return Promise.reject(new DecisionError("Codex app-server failed repeatedly; paused for up to 60 s", "transport", "not-dispatched", true));
     const generation = ++this._generation, t0 = performance.now();
     this._starting = (async () => {
+      await null; // settle only after `_starting` is assigned, so failures never stay cached
       const argv = [this._config.bin, ...codexDecisionLaunchArgs()];
       const options = { cwd: this._config.cwd, env: this._env() };
-      const proc = this._config.spawn ? this._config.spawn(argv, options)
-        : Bun.spawn(argv, { ...options, stdin: "pipe", stdout: "pipe", stderr: "pipe" }) as unknown as PipedSubprocess;
+      let proc: PipedSubprocess;
+      try {
+        proc = this._config.spawn ? await this._config.spawn(argv, options)
+          : Bun.spawn(argv, { ...options, stdin: "pipe", stdout: "pipe", stderr: "pipe" }) as unknown as PipedSubprocess;
+      } catch (error) {
+        this._failures.push(Date.now());
+        this._starting = undefined;
+        throw new DecisionError(`Codex app-server launch refused: ${(error as Error).message}`, "transport", "not-dispatched", true, undefined, { cause: error });
+      }
       const conn = new JsonRpcConnection(proc, {
-        onNotification: (method, params) => { if (this._generation === generation) this._notification(conn, method, params); },
+        onNotification: (method, params) => this._notification(conn, method, params),
         onRequest: (_id, _method, params) => { this._serverRequest(conn, params); return false; },
-        onClose: () => this._lost(generation),
+        onClose: () => this._lost(conn, generation),
       });
       try {
         await conn.request("initialize", { clientInfo: { name: this._config.clientName, version: "0.2.0" }, capabilities: {} }, 15_000);
@@ -309,20 +331,28 @@ export class CodexPrimedSessions implements PrimedSessions {
     }
   }
 
-  private _lost(generation: number): void {
-    if (generation !== this._generation) return;
-    this._conn = undefined;
+  /** A process ended (or its stdout closed): its threads and primed sessions are gone, whatever generation is current. */
+  private _lost(conn: JsonRpcConnection, generation: number): void {
+    if (this._conn === conn) this._conn = undefined;
     for (const session of [...this._sessions.values()]) {
       if (session.generation !== generation) continue;
       this._sessions.delete(session.key);
       this._emit({ type: "evicted", key: session.key, reason: "process-lost" });
     }
-    for (const branch of this._branches.values()) { branch.error ??= "Native process lost"; branch.lost = true; branch.wake(); }
+    this._wakeBranches(conn, "Native process lost");
   }
 
-  /** Kill the process; true once its exit is observed (bounded wait). */
+  private _wakeBranches(conn: JsonRpcConnection, error: string): void {
+    for (const branch of this._branches.values()) {
+      if (branch.conn !== conn || branch.terminal) continue;
+      branch.error ??= error; branch.lost = true; branch.wake();
+    }
+  }
+
+  /** Kill the process; true once its exit is observed (bounded wait). Every branch on it fails now, not at its deadline. */
   private _recycle(conn: JsonRpcConnection, reason: string): Promise<boolean> {
     if (this._conn === conn) { this._conn = undefined; this._emit({ type: "process-recycled", generation: this._generation, reason }); }
+    this._wakeBranches(conn, `Native process recycled (${reason})`);
     conn.kill();
     return Promise.race([conn.exited.then(() => true, () => false), Bun.sleep(2_000).then(() => false)]);
   }
@@ -338,7 +368,7 @@ export class CodexPrimedSessions implements PrimedSessions {
   private _serverRequest(conn: JsonRpcConnection, params: Record<string, unknown> | undefined): void {
     const threadId = typeof params?.threadId === "string" ? params.threadId : undefined;
     const branch = threadId ? this._branches.get(threadId) : undefined;
-    if (branch && threadId) this._violation(conn, threadId, branch, "server request");
+    if (branch && threadId && branch.conn === conn) this._violation(conn, threadId, branch, "server request");
   }
 
   private _notification(conn: JsonRpcConnection, method: string, params: Record<string, unknown> | undefined): void {
@@ -349,7 +379,7 @@ export class CodexPrimedSessions implements PrimedSessions {
     }
     const threadId = typeof params?.threadId === "string" ? params.threadId : undefined;
     const branch = threadId ? this._branches.get(threadId) : undefined;
-    if (!branch || !threadId) return;
+    if (!branch || !threadId || branch.conn !== conn) return;
     const turn = object(params?.turn), item = object(params?.item);
     switch (method) {
       case "turn/started": if (typeof turn?.id === "string") branch.turnId ??= turn.id; break;
@@ -376,11 +406,11 @@ export class CodexPrimedSessions implements PrimedSessions {
     }
   }
 
-  private _branch(threadId: string, key: string): Branch {
+  private _branch(conn: JsonRpcConnection, threadId: string, key: string): Branch {
     let finish!: () => void, wake!: () => void;
     const done = new Promise<void>(resolve => { finish = resolve; });
     const attention = new Promise<void>(resolve => { wake = resolve; });
-    const branch: Branch = { key, partial: "", done, finish, attention, wake };
+    const branch: Branch = { key, conn, partial: "", done, finish, attention, wake };
     this._branches.set(threadId, branch);
     return branch;
   }
@@ -416,7 +446,7 @@ export class CodexPrimedSessions implements PrimedSessions {
 
   private _threadParams(instructions: string): Record<string, unknown> {
     return { model: this._config.model, cwd: this._config.cwd, approvalPolicy: "never", sandbox: "read-only",
-      baseInstructions: this._config.baseInstructions, developerInstructions: instructions };
+      baseInstructions: this._config.baseInstructions, developerInstructions: instructions, config: { ...CODEX_DECISION_THREAD_CONFIG } };
   }
 
   private async _prime(conn: JsonRpcConnection, spec: PrimeSpec, hash: string, deadline: number): Promise<Primed> {
@@ -432,16 +462,22 @@ export class CodexPrimedSessions implements PrimedSessions {
       Math.max(1, deadline - Date.now())));
     const baseId = object(started?.thread)?.id;
     if (typeof baseId !== "string" || !baseId) throw new DecisionError("Codex thread/start returned no thread", "prime-failed", "not-dispatched", true);
-    const branch = this._branch(baseId, spec.key);
+    const branch = this._branch(conn, baseId, spec.key);
     let ok = false;
     try {
-      const { timedOut } = await this._turn(conn, baseId, branch, `${spec.context}${PRIMER_SUFFIX}`, deadline, {});
-      ok = !timedOut && !branch.violation && branch.terminal?.status === "completed" && !!branch.turnId;
+      let outcome: { timedOut: boolean; settled: boolean };
+      try { outcome = await this._turn(conn, baseId, branch, `${spec.context}${PRIMER_SUFFIX}`, deadline, {}); }
+      catch (error) {
+        // A primer turn/start without the runtime's own answer may still run: recycle before reporting.
+        const settled = error instanceof JsonRpcError || await this._recycle(conn, "primer turn/start unsettled");
+        throw new DecisionError(`Priming ${spec.key} failed: ${(error as Error).message}`, "prime-failed", "not-dispatched", settled, undefined, { cause: error });
+      }
+      ok = !outcome.timedOut && !branch.violation && branch.terminal?.status === "completed" && !!branch.turnId;
       if (!ok) {
-        const reason = branch.violation ? "violation" : timedOut ? "timeout"
-          : branch.terminal?.status === "failed" ? failureReason(branch.terminal.error) : "prime-failed";
-        throw new DecisionError(`Priming ${spec.key} failed (${branch.violation ?? branch.terminal?.status ?? "no terminal"})`,
-          reason === "native-failed" ? "prime-failed" : reason, "not-dispatched", true);
+        const reason = branch.violation ? "violation" : outcome.timedOut ? "timeout"
+          : branch.terminal?.status === "failed" ? failureReason(branch.terminal.error) : branch.lost ? "transport" : "prime-failed";
+        throw new DecisionError(`Priming ${spec.key} failed (${branch.violation ?? branch.terminal?.status ?? branch.error ?? "no terminal"})`,
+          reason === "native-failed" ? "prime-failed" : reason, "not-dispatched", outcome.settled);
       }
     } finally {
       this._branches.delete(baseId);
@@ -513,7 +549,7 @@ export class CodexPrimedSessions implements PrimedSessions {
       if (!threadId) throw new DecisionError("Codex returned no decision thread", "transport", "not-dispatched", true);
       session.model ??= typeof response?.model === "string" ? response.model : undefined;
       const branchMs = Math.round(performance.now() - t1);
-      const branch = this._branch(threadId, spec.key);
+      const branch = this._branch(conn, threadId, spec.key);
       admissionId = crypto.randomUUID();
       try { await request.onAdmission?.({ admissionId, key: spec.key, runtime: "codex", threadId }); }
       catch (cause) { throw new DecisionError("Decision admission refused before dispatch", "admission", "not-dispatched", true, admissionId, { cause }); }
@@ -536,8 +572,8 @@ export class CodexPrimedSessions implements PrimedSessions {
       if (terminal?.status !== "completed" || content === undefined) {
         const reason = terminal?.status === "failed" ? failureReason(terminal.error) : branch.error && !terminal ? "transport" : "native-failed";
         if (reason === "rate-limited") this._observeLimits({ runtime: "codex", source: "stream", observedAt: Date.now(), windows: [], blocked: true, reachedType: "turn-failed" });
-        throw new DecisionError(`Codex decision ${terminal?.status ?? "ended without a terminal"}${terminal?.error?.message ? `: ${String(terminal.error.message).slice(0, 300)}` : ""}`,
-          reason, "attempted", true, admissionId);
+        throw new DecisionError(`Codex decision ${terminal?.status ?? `ended without a terminal (${branch.error ?? "unknown"})`}${terminal?.error?.message ? `: ${String(terminal.error.message).slice(0, 300)}` : ""}`,
+          reason, "attempted", !!terminal || outcome.settled, admissionId);
       }
       const tokens = codexTokens(branch.usage);
       this._emit({ type: "decision", key: spec.key, prime, ms: Date.now() - started, ...(tokens?.cacheRead !== undefined ? { cacheRead: tokens.cacheRead } : {}),

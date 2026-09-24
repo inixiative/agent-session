@@ -84,7 +84,10 @@ const spec = { key: "t1:aux:domain:api", instructions: "ROLE", context: "DOMAIN 
 
 describe("CodexPrimedSessions", () => {
   test("launch disables tool surfaces and strips API keys; the account must be a ChatGPT login", async () => {
-    expect(codexDecisionLaunchArgs()).toEqual(expect.arrayContaining(["app-server", "--listen", "stdio://", "--disable", "shell_tool", "-c", "mcp_servers.node_repl.enabled=false"]));
+    const argv = codexDecisionLaunchArgs();
+    expect(argv).toEqual(expect.arrayContaining(["app-server", "--listen", "stdio://", "--disable", "shell_tool"]));
+    // Only approval and web-search overrides at launch: credential launchers allowlist exactly these.
+    expect(argv.filter((_, i) => argv[i - 1] === "-c")).toEqual(['approval_policy="never"', 'web_search="disabled"']);
     const prior = process.env.OPENAI_API_KEY; process.env.OPENAI_API_KEY = "sk-PRIVATE";
     try {
       const d = appServer(); const { h } = host(d, { env: { CODEX_HOME: "/profiles/c" } });
@@ -106,13 +109,15 @@ describe("CodexPrimedSessions", () => {
     expect(second).toMatchObject({ content: "decided: q2", prime: "warm" });
     const starts = d.requests("thread/start");
     expect(starts).toHaveLength(1);
-    expect(starts[0]!.params).toMatchObject({ ephemeral: false, developerInstructions: "ROLE", baseInstructions: "BASE", sandbox: "read-only", approvalPolicy: "never" });
+    expect(starts[0]!.params).toMatchObject({ ephemeral: false, developerInstructions: "ROLE", baseInstructions: "BASE", sandbox: "read-only", approvalPolicy: "never",
+      config: { "mcp_servers.node_repl.enabled": false, notify: [], include_environment_context: false } });
     const primer = d.requests("turn/start")[0]!.params;
     expect(primer.threadId).toBe("thread-1");
     expect(primer.input[0].text).toStartWith("DOMAIN CACHE");
     const forks = d.requests("thread/fork");
     expect(forks).toHaveLength(2);
-    for (const fork of forks) expect(fork.params).toMatchObject({ threadId: "thread-1", lastTurnId: "turn-1", ephemeral: true, developerInstructions: "ROLE", baseInstructions: "BASE" });
+    for (const fork of forks) expect(fork.params).toMatchObject({ threadId: "thread-1", lastTurnId: "turn-1", ephemeral: true, developerInstructions: "ROLE", baseInstructions: "BASE",
+      config: { "mcp_servers.node_repl.enabled": false } });
     // Decisions never run on the primed thread itself.
     expect(d.requests("turn/start").slice(1).every(r => r.params.threadId.startsWith("fork-"))).toBe(true);
     expect(d.requests("thread/unsubscribe").map(r => r.params.threadId)).toEqual([first.threadId, second.threadId]);
@@ -221,5 +226,40 @@ describe("CodexPrimedSessions", () => {
     expect(events.some(e => e.type === "evicted" && e.reason === "process-lost")).toBe(true);
     expect((await h.decide(spec, { input: "q2" })).prime).toBe("cold");
     expect(d.processes).toHaveLength(2);
+  });
+});
+
+describe("CodexPrimedSessions launch failures", () => {
+  test("a refused or throwing launcher fails before dispatch and a later launch can succeed", async () => {
+    const good = appServer();
+    let attempts = 0;
+    const h = new CodexPrimedSessions({ model: "gpt-test", cwd: "/private/decisions", spawn: async (argv, options) => {
+      if (++attempts === 1) throw Error("lock held");
+      return good.spawn(argv, options);
+    } });
+    cleanup.push(() => h.close());
+    await expect(h.decide(spec, { input: "q" })).rejects.toMatchObject({ reason: "transport", dispatch: "not-dispatched" });
+    expect((await h.decide(spec, { input: "q2" })).content).toBe("decided: q2");
+  });
+});
+
+describe("CodexPrimedSessions review regressions", () => {
+  test("a recycle fails every in-flight branch on that process at once, even after a new process started", async () => {
+    const d = appServer({ behavior: input => input === "bad" ? "tool" : input === "slow" ? "hold" : "answer" });
+    const { h } = host(d, { maxConcurrent: 4, timeoutMs: 5_000 });
+    await h.decide({ ...spec, key: "b" }, { input: "warm b" });
+    await h.decide({ ...spec, key: "a" }, { input: "warm a" });
+    const started = Date.now();
+    const slow = h.decide({ ...spec, key: "b" }, { input: "slow" }).catch(e => e);
+    await tick(10);
+    const bad = h.decide({ ...spec, key: "a" }, { input: "bad" }).catch(e => e);
+    expect((await bad).reason).toBe("violation");
+    // A new process serves new work while the old one's branches are already failed, not left to their deadline.
+    const fresh = await h.decide({ ...spec, key: "c" }, { input: "fresh" });
+    expect(fresh.content).toBe("decided: fresh");
+    const error = await slow;
+    expect(error).toMatchObject({ reason: "transport", dispatch: "attempted", settled: true });
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(d.processes.length).toBe(2);
   });
 });

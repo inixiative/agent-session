@@ -37,7 +37,7 @@ export interface SubscriptionCandidate {
   models: Readonly<Record<string, readonly string[]>>;
   activeRuns: number;
   concurrencyLimit: number;
-  /** All provider enforcement windows, plus locally retained reservations. */
+  /** All provider enforcement windows, plus locally retained reservations. `resetsAt: Infinity` means none reported. */
   windows: readonly {
     usedPercent: number | null;
     reservedPercent: number;
@@ -120,9 +120,10 @@ export function assessCandidate(request: CandidateRequest, account: Subscription
   for (const window of account.windows) {
     if (window.usedPercent === null || !Number.isFinite(window.usedPercent) || window.usedPercent < 0 || window.usedPercent > 100
       || !Number.isFinite(window.reservedPercent) || window.reservedPercent < 0) return { excluded: "invalid" };
+    // resetsAt === Infinity: the provider reported no reset for this window, so no reset can have crossed the observation.
     if (!Number.isFinite(window.observedAt) || window.observedAt > request.now
       || request.now - window.observedAt > request.maximumObservationAgeMs
-      || !Number.isFinite(window.resetsAt) || window.resetsAt <= request.now) return { excluded: "stale-observation" };
+      || (window.resetsAt !== Number.POSITIVE_INFINITY && (!Number.isFinite(window.resetsAt) || window.resetsAt <= request.now))) return { excluded: "stale-observation" };
     fractions.push(window.usedPercent + window.reservedPercent);
   }
   if (fractions.some(p => p >= 100)) return { excluded: "exhausted" };

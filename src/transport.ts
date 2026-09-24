@@ -42,7 +42,7 @@ export interface TransportCapabilities {
   readonly limits: { readonly stream: boolean; readonly poll: boolean };
   /** A tool-free, text-only session can be enforced (decisions). */
   readonly textOnly: boolean;
-  /** How a primed decision session returns to its primed state each cycle (see primed.ts). */
+  /** Primed decision host on this transport and how it returns to its primed state each cycle (see primed.ts). */
   readonly primed: "fork" | "none";
   readonly billing: "subscription" | "api";
 }
@@ -85,9 +85,10 @@ export const TRANSPORTS: Readonly<Record<TransportKind, TransportDescriptor>> = 
   "codex-app-server": {
     kind: "codex-app-server", runtime: "codex", status: "implemented", verified: "live",
     capabilities: { resume: "native", fork: "none", rollback: "none", interrupt: "acknowledged", push: "steer",
-      approvals: "refuse", usage: true, limits: { stream: true, poll: true }, textOnly: true, primed: "fork", billing: "subscription" },
+      approvals: "refuse", usage: true, limits: { stream: true, poll: true }, textOnly: false, primed: "fork", billing: "subscription" },
     notes: [
       "`codex app-server --listen stdio://` with thread/start, thread/resume, turn/start.",
+      "CodexAppServerSession runs with the profile's tools; tool-free text sessions are CodexPrimedSessions (primed: fork).",
       "interruptNative() sends turn/interrupt; push() sends turn/steer against the owned turn.",
       "Primed decisions (CodexPrimedSessions) host every key as a thread of one process per account and fork the primed thread per cycle.",
       "thread/rollback is refused by codex-cli 0.155 for both ephemeral and paginated threads; session fork() is not wired.",

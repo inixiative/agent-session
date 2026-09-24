@@ -6,7 +6,7 @@ const cleanup: Array<() => Promise<void> | void> = [];
 afterEach(async () => { for (const fn of cleanup.splice(0)) await fn(); });
 
 /** Claude CLI double: each process is one conversation; forks get new session ids. */
-function claudeCli(opts: { behavior?: (input: string) => "answer" | "tool" | "hold" | "limited" } = {}) {
+function claudeCli(opts: { behavior?: (input: string) => "answer" | "tool" | "hold" | "limited"; usage?: () => number } = {}) {
   const spawns: string[][] = [];
   const processes: ReturnType<typeof fakeProcess>[] = [];
   let forks = 0;
@@ -16,6 +16,8 @@ function claudeCli(opts: { behavior?: (input: string) => "answer" | "tool" | "ho
     const sid = resumeAt >= 0 && argv.includes("--fork-session") ? `fork-${++forks}` : resumeAt >= 0 ? argv[resumeAt + 1]! : "base-sid";
     const fake = fakeProcess((m, io) => {
       if (m.type === "control_request") {
+        if (m.request.subtype === "get_usage") io.emit({ type: "control_response", response: { subtype: "success", request_id: m.request_id, response: {
+          rate_limits_available: true, rate_limits: { five_hour: { utilization: opts.usage?.() ?? 10, resets_at: "2099-01-01T00:00:00Z" } } } } });
         if (m.request.subtype === "interrupt") {
           io.emit({ type: "control_response", response: { subtype: "success", request_id: m.request_id, response: {} } });
           io.emit({ type: "result", subtype: "error_during_execution", is_error: true, uuid: `int-${sid}`, session_id: sid, result: "" });
@@ -109,12 +111,33 @@ describe("ClaudePrimedSessions", () => {
     expect(error).toMatchObject({ reason: "timeout", dispatch: "attempted", settled: true });
   });
 
-  test("a rejected rate limit fails the decision and blocks the next one before dispatch", async () => {
-    const cli = claudeCli({ behavior: input => input === "limited" ? "limited" : "answer" }); const { h } = host(cli, { spare: false });
+  test("a rejected rate limit fails the decision and blocks the next one until a poll shows capacity", async () => {
+    let used = 100;
+    const cli = claudeCli({ behavior: input => input === "limited" ? "limited" : "answer", usage: () => used }); const { h } = host(cli, { spare: false });
     await h.decide(spec, { input: "q1" });
     await expect(h.decide(spec, { input: "limited" })).rejects.toMatchObject({ reason: "rate-limited", dispatch: "attempted" });
     expect(h.limits()?.blocked).toBe(true);
     await expect(h.decide(spec, { input: "q2" })).rejects.toMatchObject({ reason: "rate-limited", dispatch: "not-dispatched" });
+    expect(cli.spawns.some(argv => argv.includes("--no-session-persistence") && !argv.includes("--resume"))).toBe(true); // the poll
+  });
+
+  test("a rejection without utilization still carries its reset and never blocks forever", async () => {
+    const { claudeRateLimitSnapshot } = await import("../src");
+    expect(claudeRateLimitSnapshot({ status: "rejected", rateLimitType: "five_hour", resetsAt: 1 })).toMatchObject({ blocked: true,
+      windows: [{ id: "five_hour", usedPercent: 100, resetsAt: 1000 }] });
+  });
+
+  test("work waiting on a key is refused after close and live branches are stopped", async () => {
+    const cli = claudeCli({ behavior: input => input === "slow" ? "hold" : "answer" }); const { h } = host(cli, { spare: false, timeoutMs: 5_000 });
+    await h.decide(spec, { input: "q1" });
+    const slow = h.decide(spec, { input: "slow" }).catch(e => e);
+    const queued = h.decide(spec, { input: "after-close" }).catch(e => e);
+    await tick(20);
+    await h.close();
+    expect((await queued).reason).toBe("closed");
+    expect((await slow)).toBeInstanceOf(Error);
+    expect(cli.processes.flatMap(p => p.lines).some(l => l.type === "user" && l.message.content[0].text === "after-close")).toBe(false);
+    expect(cli.processes.every(p => p.killed || p.closed)).toBe(true);
   });
 
   test("close kills spares and refuses further decisions", async () => {

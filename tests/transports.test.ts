@@ -42,7 +42,7 @@ describe("transport matrix", () => {
     expect(new ClaudeCodeSession({ spawn }).transport).toBe(TRANSPORTS["claude-cli"]);
     expect(new CodexMcpSession({ spawn }).transport).toBe(TRANSPORTS["codex-mcp"]);
     expect(new CodexAppServerSession({ spawn }).transport).toBe(TRANSPORTS["codex-app-server"]);
-    expect(new ClaudeAgentSdkSession({ query: () => ({ interrupt: async () => {}, async *[Symbol.asyncIterator]() {} }) }).transport).toBe(TRANSPORTS["claude-agent-sdk"]);
+    expect(new ClaudeAgentSdkSession({ query: () => ({ interrupt: async () => {}, close() {}, async *[Symbol.asyncIterator]() {} }) }).transport).toBe(TRANSPORTS["claude-agent-sdk"]);
     expect(Object.values(TRANSPORTS).filter(t => t.status === "stub").map(t => t.kind).sort()).toEqual(["acp", "api"]);
     for (const [kind, d] of Object.entries(TRANSPORTS)) expect(d.kind).toBe(kind as never);
   });
@@ -233,12 +233,13 @@ describe("Agent SDK transport", () => {
 
   function sdkDouble() {
     const calls: Array<{ options: Record<string, unknown> }> = [];
-    let interrupts = 0;
+    let interrupts = 0, closes = 0;
     const query = ({ prompt, options }: { prompt: AsyncIterable<unknown>; options: Record<string, unknown> }) => {
       calls.push({ options });
       let interrupted: (() => void) | undefined;
       return {
         interrupt: async () => { interrupts++; interrupted?.(); },
+        close: () => { closes++; interrupted?.(); },
         async *[Symbol.asyncIterator]() {
           let n = 0;
           for await (const message of prompt) {
@@ -256,7 +257,7 @@ describe("Agent SDK transport", () => {
         },
       };
     };
-    return { query, calls, get interrupts() { return interrupts; } };
+    return { query, calls, get interrupts() { return interrupts; }, get closes() { return closes; } };
   }
 
   test("turns, SDK interrupt with acknowledgment, canUseTool and fork on the same transport", async () => {
@@ -277,6 +278,18 @@ describe("Agent SDK transport", () => {
     expect(f.transport?.kind).toBe("claude-agent-sdk");
     await f.start(); await f.send("two");
     expect(sdk.calls[1]!.options).toMatchObject({ resume: "sdk-session", forkSession: true });
+  });
+
+  test("kill closes the SDK query and reports exit only when its stream ends", async () => {
+    const sdk = sdkDouble();
+    const s = new ClaudeAgentSdkSession({ query: sdk.query });
+    await s.start();
+    const pending = s.send("hold").catch(e => e); await tick(5);
+    const exited = (s as unknown as { _proc: { exited: Promise<number> } })._proc.exited;
+    s.kill();
+    expect(sdk.closes).toBe(1);
+    expect(await exited).toBe(143);
+    expect(await pending).toBeInstanceOf(Error);
   });
 
   test("requires the caller's SDK query function", () => {

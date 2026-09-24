@@ -34,13 +34,15 @@ Callers branch on capabilities, not on kinds.
 | Approvals | mode | mode | refuse | callback | – | – |
 | Usage per turn | yes | yes | yes | yes | – | – |
 | Limits: stream / poll | yes / yes | no / no | yes / yes | yes / no | – | – |
-| Text-only | yes | no | yes | yes | – | – |
+| Text-only session | yes | no | no³ | yes | – | – |
 | Primed reset | fork | none | fork | none | – | – |
 | Billing | subscription | subscription | subscription | subscription | subscription | api |
 
 ¹ `--resume-session-at` exists natively but is not wired.
 ² codex-cli 0.155.1 refuses `thread/rollback` for ephemeral threads ("requires persisted
 thread history") and for persisted ones ("paginated threads do not support thread/rollback").
+³ `CodexAppServerSession` runs with the profile's tools; tool-free text sessions on this
+transport are `CodexPrimedSessions` (the "Primed reset" row).
 
 New optional `HarnessSession` members (existing implementers and consumers are unaffected):
 
@@ -51,6 +53,8 @@ New optional `HarnessSession` members (existing implementers and consumers are u
   `interrupt()`, a confirmed stop settles native ownership.
 - `readLimits()` — account limits without a model turn: Claude `get_usage`
   control request, Codex `account/rateLimits/read`.
+- `push()` on app-server steers the owned in-flight turn (`turn/steer`); a refusal
+  records `push_ignored`, no answer within 10 s records `push-unknown`.
 - `rate_limit` events with `limits` (from Claude `rate_limit_event` and Codex
   `account/rateLimits/updated`). They are account-level (`unattributedReason:
   "account-status"`) and never part of an admission's output.
@@ -68,7 +72,8 @@ a process-shaped bridge, so ClaudeCodeSession's classification, admission and
 ownership evidence apply unchanged; the CLI argv is mapped to SDK options
 (`sdkOptionsFromArgv`), with unmapped flags in `extraArgs`. It adds per-call
 approvals (`canUseTool`). The SDK Query API exposes no `get_usage`, so limit
-polling is refused on this transport (limits still stream).
+polling is refused on this transport (limits still stream). `kill()` calls
+`Query.close()`, and the session reports exit only when the SDK stream ends.
 
 ## Primed decision sessions
 
@@ -90,7 +95,7 @@ tag when one role runs under several instructions.
 | Prime | persisted `thread/start` + primer turn | persisted text-only session + primer turn |
 | Reset | `thread/fork` (ephemeral) through the primer turn, restating the instructions | `--resume <primed> --fork-session --no-session-persistence` |
 | Warm path | fork ≈ 60–90 ms, then the turn | pre-spawned spare fork: no process start |
-| Cleanup | fork unsubscribed; primed thread deleted on eviction/close; orphans in the private cwd swept at start | forks write no history |
+| Cleanup | fork unsubscribed; primed thread deleted on eviction/close; orphans in the private cwd swept at start | forks write no history; the primed transcript is deleted on eviction/close, and leftovers for the private cwd are swept on first use |
 | Text-only | features, plugins, MCP (node_repl), notify, tool instructions disabled at launch; read-only sandbox; approvals never | `--safe-mode --tools "" --strict-mcp-config …` |
 | Violations | non-text item, MCP startup or server request → interrupt, recycle process | tool activity → decision fails |
 
@@ -99,6 +104,10 @@ kinds (above), and ephemeral threads cannot be forked ("no rollout found"), so
 the primed thread is persisted and each cycle forks it. A fork that does not
 restate `baseInstructions`/`developerInstructions` runs on Codex's default
 prompt (10.8k instead of 6.6k input tokens) and misses the cache.
+
+A violation or an unacknowledged interrupt recycles the Codex process: every
+decision in flight on it fails at once (`transport`), and the next decision on
+each key re-primes on a fresh process.
 
 Decisions are serialized per key and bounded across keys (`maxConcurrent`).
 `onAdmission` runs before the native write; `DecisionError` states whether
@@ -135,9 +144,15 @@ organizationIds, models, concurrencyLimit }`.
   exclusion carries a reason (`PoolExhaustedError.excluded`). The draft's
   repository entry point `rankSubscriptionAccounts` and `repositoryIdentity` are
   kept intact with its tests.
-- **Limits**: `open()` refreshes stale instances with `probeCodexLimits` /
-  `probeClaudeLimits` (no model turn), and sessions opened by the pool feed their
-  `rate_limit` events back. Blocked instances are excluded until their window resets.
+- **Limits**: `open()` refreshes instances whose limits are missing, older than
+  the observation age, past a window reset, or blocked past their cooldown, with
+  `probeCodexLimits` / `probeClaudeLimits` (no model turn). A poll that fails or
+  returns nothing is not repeated for `probeCooldownMs`. Sessions opened by the pool
+  feed their `rate_limit` events back. A window without a reported reset time counts
+  as current.
+- **Leases** end when the session ends, is killed (even before start) or fails to
+  start; a session whose lease ended cannot restart outside the pool. The profile
+  variable is always pinned, so caller env cannot move a leased session to another login.
 - **Health**: `reportFailure` cools an instance down (doubling, max 10 min); a
   completed turn clears it.
 - **Continuity** (`continueOn`): a thread moves to another instance only when both

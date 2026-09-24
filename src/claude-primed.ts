@@ -18,6 +18,9 @@
 // history.
 // ---------------------------------------------------------------------------
 
+import { readdirSync, realpathSync, unlinkSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { ClaudeCodeSession, type ClaudeCodeSessionConfig, type PipedSubprocess } from "./claude-code-session";
 import { SessionTurnError, type SessionResult } from "./harness-session";
 import { mergeLimits, type LimitSnapshot } from "./limits";
@@ -48,6 +51,12 @@ export interface ClaudePrimedConfig {
   timeoutMs?: number;
   /** Pre-spawn the next fork after each decision. Default true. */
   spare?: boolean;
+  /**
+   * Delete primed transcripts this host persisted when a key is dropped, and
+   * transcripts a crashed host left for `cwd`, on first use. `cwd` must be
+   * dedicated to this host. Default true.
+   */
+  sweepTranscripts?: boolean;
   onEvent?: (event: PrimedEvent) => void;
 }
 
@@ -74,6 +83,10 @@ export class ClaudePrimedSessions implements PrimedSessions {
   private _limits?: LimitSnapshot;
   private _closed = false;
   private _idleTimer?: ReturnType<typeof setInterval>;
+  /** Branches and primers with a live process, so close() can stop them. */
+  private _live = new Set<Owned>();
+  private _swept = false;
+  private _lastPoll = 0;
 
   constructor(config: ClaudePrimedConfig) {
     if (!config.cwd?.startsWith("/")) throw Error("Primed Claude sessions require an absolute private working directory");
@@ -89,10 +102,10 @@ export class ClaudePrimedSessions implements PrimedSessions {
       sessions: this._sessions.size, active: this._slots.active, waiting: this._slots.waiting, ...(this._limits ? { limits: this._limits } : {}) };
   }
 
-  /** get_usage through a live spare, or a short-lived text-only session. No model turn. */
+  /** get_usage through a short-lived text-only session. No model turn. */
   async readLimits(opts?: { timeoutMs?: number }): Promise<LimitSnapshot | undefined> {
-    const spare = [...this._sessions.values()].find(s => s.spare?.session.alive && !s.busy)?.spare?.session;
-    if (spare) return spare.readLimits(opts);
+    if (this._closed) throw new DecisionError("Primed sessions closed", "closed", "not-dispatched", true);
+    this._lastPoll = Date.now();
     const probe = this._owned({ persistSession: false });
     try { await probe.session.start(); return await probe.session.readLimits(opts); }
     finally { await this._dispose(probe); }
@@ -121,12 +134,27 @@ export class ClaudePrimedSessions implements PrimedSessions {
     this._closed = true;
     clearInterval(this._idleTimer);
     this._slots.drain(new DecisionError("Primed sessions closed", "closed", "not-dispatched", true));
+    // In-flight branches and primers are stopped, not awaited to completion.
+    await Promise.all([...this._live].map(owned => this._dispose(owned)));
     await Promise.all([...this._sessions.values()].map(s => this._drop(s, "close")));
   }
 
   // -------------------------------------------------------------------------
 
   private _emit(event: PrimedEvent): void { try { this._config.onEvent?.(event); } catch { /* observers only */ } }
+
+  /** Refuse before dispatch while the account reports usage blocked; a poll (at most once a minute) can clear it. */
+  private async _checkLimits(): Promise<void> {
+    if (!this._limits?.blocked) return;
+    const now = Date.now();
+    const resets = this._limits.windows.filter(w => w.usedPercent >= 100 && w.resetsAt).map(w => w.resetsAt!);
+    if (resets.length && now >= Math.max(...resets)) { this._limits = { ...this._limits, blocked: false }; return; }
+    if (now - this._lastPoll >= 60_000) {
+      try { const polled = await this.readLimits({ timeoutMs: 10_000 }); if (polled) this._limits = mergeLimits(this._limits, polled); }
+      catch { /* keep the blocked view */ }
+    }
+    if (this._limits?.blocked) throw new DecisionError("Claude subscription usage limit reached; no fallback", "rate-limited", "not-dispatched", true);
+  }
 
   /** A session whose process exit is observable, so settlement can be proven. */
   private _owned(overrides: Partial<ClaudeCodeSessionConfig> & { instructions?: string }, from?: ClaudeCodeSession): Owned {
@@ -143,6 +171,7 @@ export class ClaudePrimedSessions implements PrimedSessions {
       textOnly: true, maxTurns: 1, timeout: this._config.timeoutMs,
       baseContext: [this._config.baseInstructions, instructions].filter(Boolean).join("\n\n") || undefined, ...rest, spawn,
     });
+    this._live.add(owned);
     owned.session.onEvent(event => {
       if (event.kind === "rate_limit" && event.limits) {
         this._limits = mergeLimits(this._limits, event.limits);
@@ -155,9 +184,34 @@ export class ClaudePrimedSessions implements PrimedSessions {
   /** Kill and wait (bounded) for exit; true when exit was observed. */
   private async _dispose(owned: Owned | undefined): Promise<boolean> {
     if (!owned) return true;
+    this._live.delete(owned);
     owned.session.kill();
     if (!owned.exited) return true;
     return Promise.race([owned.exited.then(() => true, () => false), Bun.sleep(2_000).then(() => false)]);
+  }
+
+  /** Where the CLI persists transcripts for this host's cwd. */
+  private _projectDirectory(): string | undefined {
+    try {
+      const configDir = this._config.env?.CLAUDE_CONFIG_DIR ?? process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude");
+      return join(configDir, "projects", realpathSync(this._config.cwd).replace(/[^a-zA-Z0-9]/g, "-"));
+    } catch { return undefined; }
+  }
+
+  private _deleteTranscript(sessionId: string | undefined): void {
+    if (this._config.sweepTranscripts === false || !sessionId || !/^[a-zA-Z0-9-]+$/.test(sessionId)) return;
+    const directory = this._projectDirectory();
+    if (directory) try { unlinkSync(join(directory, `${sessionId}.jsonl`)); } catch { /* already gone */ }
+  }
+
+  private _sweepTranscripts(): void {
+    if (this._swept || this._config.sweepTranscripts === false) return;
+    this._swept = true;
+    const directory = this._projectDirectory();
+    if (!directory) return;
+    let names: string[] = [];
+    try { names = readdirSync(directory); } catch { return; }
+    for (const name of names) if (/^[a-zA-Z0-9-]+\.jsonl$/.test(name)) try { unlinkSync(join(directory, name)); } catch { /* best effort */ }
   }
 
   private _branch(session: Primed): Owned {
@@ -178,13 +232,16 @@ export class ClaudePrimedSessions implements PrimedSessions {
       await base.session.start();
       result = await base.session.send(`${spec.context}${PRIMER_SUFFIX}`, { timeout: Math.max(1, deadline - Date.now()) });
     } catch (error) {
-      await this._dispose(base);
+      const settled = await this._dispose(base);
+      this._deleteTranscript(base.session.externalSessionId);
       throw new DecisionError(`Priming ${spec.key} failed: ${(error as Error).message}`, error instanceof SessionTurnError && error.attempt.localFailure === "timeout" ? "timeout" : "prime-failed",
-        "not-dispatched", true, undefined, { cause: error });
+        "not-dispatched", settled, undefined, { cause: error });
     }
-    await this._dispose(base);
-    if (result.nativeOutcome !== "completed" || !base.session.externalSessionId || result.events.some(e => e.kind === "tool_use"))
-      throw new DecisionError(`Priming ${spec.key} did not complete`, "prime-failed", "not-dispatched", true);
+    const settled = await this._dispose(base);
+    if (result.nativeOutcome !== "completed" || !base.session.externalSessionId || result.events.some(e => e.kind === "tool_use")) {
+      this._deleteTranscript(base.session.externalSessionId);
+      throw new DecisionError(`Priming ${spec.key} did not complete`, "prime-failed", "not-dispatched", settled);
+    }
     const primed: Primed = { key: spec.key, hash, instructions: spec.instructions, base: base.session, model: observedModel(result),
       lastUsed: Date.now(), busy: false };
     this._sessions.set(spec.key, primed);
@@ -197,6 +254,7 @@ export class ClaudePrimedSessions implements PrimedSessions {
     await session.cleanup;
     const spare = session.spare; session.spare = undefined;
     await this._dispose(spare);
+    this._deleteTranscript(session.base?.externalSessionId);
     this._emit({ type: "evicted", key: session.key, reason });
   }
 
@@ -207,12 +265,11 @@ export class ClaudePrimedSessions implements PrimedSessions {
 
   private async _decide(spec: PrimeSpec, request: DecisionRequest, started: number, deadline: number): Promise<DecisionResult> {
     const waitMs = Date.now() - started;
+    const closed = () => new DecisionError("Primed sessions closed", "closed", "not-dispatched", true);
+    if (this._closed) throw closed();
     if (Date.now() >= deadline) throw new DecisionError("Decision deadline passed before dispatch", "timeout", "not-dispatched", true);
-    if (this._limits?.blocked) {
-      const resets = this._limits.windows.filter(w => w.usedPercent >= 100 && w.resetsAt).map(w => w.resetsAt!);
-      if (!resets.length || Date.now() < Math.max(...resets))
-        throw new DecisionError("Claude subscription usage limit reached; no fallback", "rate-limited", "not-dispatched", true);
-    }
+    await this._checkLimits();
+    this._sweepTranscripts();
     const hash = primeHash(spec);
     let session = this._sessions.get(spec.key), prime: "warm" | "cold" = "warm", primeMs = 0;
     if (session && session.hash !== hash) { await this._drop(session, "reprime"); session = undefined; }
@@ -222,11 +279,13 @@ export class ClaudePrimedSessions implements PrimedSessions {
         if (!idle) break;
         await this._drop(idle, "capacity");
       }
+      if (this._closed) throw closed();
       const t = performance.now();
       session = await this._prime(spec, hash, deadline);
       primeMs = Math.round(performance.now() - t); prime = "cold";
     }
     await session.cleanup;
+    if (this._closed) throw closed();
     session.busy = true; session.lastUsed = Date.now();
     const t1 = performance.now();
     let branch = session.spare;
@@ -243,16 +302,27 @@ export class ClaudePrimedSessions implements PrimedSessions {
       const t2 = performance.now();
       let result: SessionResult;
       try {
+        let refusal: "timeout" | "closed" | "admission" | undefined;
         result = await branch.session.send(request.input, { timeout: Math.max(1, deadline - Date.now()), onAdmission: async attempt => {
           admissionId = attempt.admissionId;
-          if (Date.now() >= deadline) throw Error("Decision deadline passed before dispatch");
+          const expired = () => { refusal = this._closed ? "closed" : "timeout"; return Error("Decision deadline passed or host closed before dispatch"); };
+          if (Date.now() >= deadline || this._closed) throw expired();
+          refusal = "admission";
           await request.onAdmission?.({ admissionId: attempt.admissionId!, key: spec.key, runtime: "claude" });
-        } });
+          refusal = undefined;
+          if (Date.now() >= deadline || this._closed) throw expired();
+        } }).catch(error => {
+          const attempt = error instanceof SessionTurnError ? error.attempt : undefined;
+          if (attempt?.dispatch === "not-dispatched" && attempt.localFailure === "registration" && refusal)
+            throw new DecisionError(refusal === "admission" ? "Decision admission refused before dispatch" : "Decision deadline passed or host closed before dispatch",
+              refusal, "not-dispatched", true, admissionId, { cause: error });
+          throw error;
+        });
       } catch (error) {
+        if (error instanceof DecisionError) throw error;
         const attempt = error instanceof SessionTurnError ? error.attempt : undefined;
         if (!attempt || attempt.dispatch === "not-dispatched")
-          throw new DecisionError(attempt?.localFailure === "registration" ? "Decision admission refused before dispatch" : `Decision not dispatched: ${(error as Error).message}`,
-            attempt?.localFailure === "registration" ? "admission" : "transport", "not-dispatched", true, admissionId, { cause: error });
+          throw new DecisionError(`Decision not dispatched: ${(error as Error).message}`, "transport", "not-dispatched", true, admissionId, { cause: error });
         let settled = attempt.nativeOutcome !== "unknown";
         if (!settled && branch.session.interruptNative) settled = await branch.session.interruptNative({ timeoutMs: 2_000 }) === "acknowledged";
         const exited = await this._dispose(branch);

@@ -74,9 +74,11 @@ export function claudeRateLimitSnapshot(info: unknown, observedAt = Date.now()):
     for (const item of window(id, percent(entry?.utilization, 100), epochSeconds(entry?.resetsAt))) windows.set(id, item);
   }
   const type = typeof i.rateLimitType === "string" ? i.rateLimitType : undefined;
-  if (type && !windows.has(type)) for (const item of window(type, percent(i.utilization, 100), epochSeconds(i.resetsAt))) windows.set(type, item);
   const overage = i.overageStatus === "allowed" || i.overageStatus === "allowed_warning" || i.isUsingOverage === true;
   const blocked = i.status === "rejected" ? !overage : i.status === "allowed" || i.status === "allowed_warning" ? false : undefined;
+  // A rejection names its window; without a utilization figure it is at its limit, and its reset still applies.
+  const utilization = percent(i.utilization, 100) ?? (blocked && type ? 100 : undefined);
+  if (type && !windows.has(type)) for (const item of window(type, utilization, epochSeconds(i.resetsAt))) windows.set(type, item);
   if (!windows.size && blocked === undefined) return undefined;
   return { runtime: "claude", source: "stream", observedAt, windows: [...windows.values()],
     ...(blocked !== undefined ? { blocked } : {}), ...(blocked && type ? { reachedType: type } : {}) };

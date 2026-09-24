@@ -18,7 +18,9 @@ export interface LimitProbeOptions {
 export async function probeCodexLimits(options: LimitProbeOptions & { spawn?: CodexSpawn } = {}): Promise<LimitSnapshot | undefined> {
   const timeoutMs = options.timeoutMs ?? 15_000;
   const argv = [options.bin ?? "codex", "app-server", "--listen", "stdio://"];
-  const env = { ...process.env, ...options.env, DISABLE_AUTOUPDATER: "1" };
+  const env: Record<string, string | undefined> = { ...process.env, ...options.env, DISABLE_AUTOUPDATER: "1" };
+  delete env.OPENAI_API_KEY; delete env.CODEX_API_KEY;
+  for (const key of Object.keys(env)) if (env[key] === undefined) delete env[key];
   const cwd = options.cwd ?? process.cwd();
   const proc = options.spawn ? options.spawn(argv, { cwd, env })
     : Bun.spawn(argv, { cwd, env, stdin: "pipe", stdout: "pipe", stderr: "pipe" }) as unknown as PipedSubprocess;

@@ -66,6 +66,7 @@ export {
 export {
   CodexPrimedSessions,
   CODEX_DECISION_DISABLED_FEATURES,
+  CODEX_DECISION_THREAD_CONFIG,
   codexDecisionLaunchArgs,
   codexTokens,
   type CodexPrimedConfig,
