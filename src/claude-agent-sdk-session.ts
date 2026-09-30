@@ -32,7 +32,7 @@ export type ClaudeAgentSdkCanUseTool = (toolName: string, input: Record<string, 
 export interface ClaudeAgentSdkSessionConfig extends Omit<ClaudeCodeSessionConfig, "spawn"> {
   /** `query` from @anthropic-ai/claude-agent-sdk. */
   query: ClaudeAgentSdkQueryFunction;
-  /** Per-call tool approval. Consulted only when permissionMode is not "bypassPermissions". */
+  /** Per-call tool approval. Defaults permissionMode to "default"; combining it with "bypassPermissions" throws. */
   canUseTool?: ClaudeAgentSdkCanUseTool;
   /** Use the SDK's bundled CLI instead of resolving `bin` on PATH. Default false. */
   bundledCli?: boolean;
@@ -165,8 +165,10 @@ export class ClaudeAgentSdkSession extends ClaudeCodeSession {
 
   constructor(config: ClaudeAgentSdkSessionConfig) {
     if (typeof config?.query !== "function") throw Error("ClaudeAgentSdkSession requires `query` from @anthropic-ai/claude-agent-sdk");
+    if (config.canUseTool && config.permissionMode === "bypassPermissions")
+      throw Error("ClaudeAgentSdkSession: canUseTool is never consulted under permissionMode \"bypassPermissions\"; pass another mode or drop canUseTool");
     const { query: _query, canUseTool: _canUseTool, bundledCli: _bundled, sdkOptions: _options, ...session } = config;
-    super({ ...session, spawn: bridge(config) });
+    super({ ...session, ...(config.canUseTool ? { permissionMode: config.permissionMode ?? "default" } : {}), spawn: bridge(config) });
     this._sdk = config;
   }
 

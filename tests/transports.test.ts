@@ -280,6 +280,29 @@ describe("Agent SDK transport", () => {
     expect(sdk.calls[1]!.options).toMatchObject({ resume: "sdk-session", forkSession: true });
   });
 
+  test("canUseTool defaults permissionMode to default and rejects bypassPermissions", async () => {
+    const sdk = sdkDouble();
+    const canUseTool = async () => ({ behavior: "allow" });
+    const s = new ClaudeAgentSdkSession({ query: sdk.query, canUseTool });
+    cleanup.push(() => s.kill());
+    await s.start(); await s.send("one");
+    expect(sdk.calls[0]!.options).toMatchObject({ permissionMode: "default", canUseTool });
+    expect(sdk.calls[0]!.options.allowDangerouslySkipPermissions).toBeUndefined();
+    const f = s.fork(); cleanup.push(() => f.kill());
+    await f.start(); await f.send("two");
+    expect(sdk.calls[1]!.options).toMatchObject({ permissionMode: "default", canUseTool });
+    expect(() => new ClaudeAgentSdkSession({ query: sdk.query, canUseTool, permissionMode: "bypassPermissions" })).toThrow("bypassPermissions");
+  });
+
+  test("without canUseTool the default stays bypassPermissions", async () => {
+    const sdk = sdkDouble();
+    const s = new ClaudeAgentSdkSession({ query: sdk.query });
+    cleanup.push(() => s.kill());
+    await s.start(); await s.send("one");
+    expect(sdk.calls[0]!.options).toMatchObject({ permissionMode: "bypassPermissions", allowDangerouslySkipPermissions: true });
+    expect(sdk.calls[0]!.options.canUseTool).toBeUndefined();
+  });
+
   test("kill closes the SDK query and reports exit only when its stream ends", async () => {
     const sdk = sdkDouble();
     const s = new ClaudeAgentSdkSession({ query: sdk.query });
