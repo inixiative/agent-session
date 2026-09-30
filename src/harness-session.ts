@@ -10,8 +10,13 @@
 // HarnessSession is stateful: it owns a running process, tracks turns,
 // captures every event for Oracle, and supports fork/interrupt.
 //
-// Implementations: ClaudeCodeSession (now), CodexSession / CursorSession (future)
+// Implementations: ClaudeCodeSession, CodexMcpSession, CodexAppServerSession,
+// ClaudeAgentSdkSession. How a model is reached is the session's transport
+// (see transport.ts); every transport implements this one contract.
 // ---------------------------------------------------------------------------
+
+import type { LimitSnapshot } from "./limits";
+import type { TransportDescriptor } from "./transport";
 
 // ---------------------------------------------------------------------------
 // Event taxonomy — classified events from the agent stream
@@ -69,6 +74,7 @@ export type SessionEventKind =
   | "tool_result"
   | "thinking"
   | "usage"
+  | "rate_limit"
   | "result"
   | "error";
 
@@ -97,7 +103,8 @@ export interface SessionEvent extends SessionIdentity {
    * compaction boundary whose native uuid was already recorded.
    */
   readonly unattributedReason?: "no-admission" | "foreign-session" | "foreign-turn" | "duplicate-terminal" | "after-terminal"
-    | "unrecognized-event" | "session-configuration" | "duplicate-boundary" | "duplicate-tool" | "unmatched-tool" | "malformed-tool";
+    | "unrecognized-event" | "session-configuration" | "duplicate-boundary" | "duplicate-tool" | "unmatched-tool" | "malformed-tool"
+    | "account-status";
   /** Local transport observation, not a native terminal acknowledgment. */
   readonly transportOutcome?: SessionAttempt["transportOutcome"];
   readonly nativeOutcome?: NativeOutcome;
@@ -137,6 +144,8 @@ export interface SessionEvent extends SessionIdentity {
   readonly externalSessionId?: string;
   /** Turn totals on result; request snapshots on usage. Do not sum both. */
   readonly tokens?: SessionTokens;
+  /** Account-level usage limits (for rate_limit). Never attributed to an admission. */
+  readonly limits?: LimitSnapshot;
   /** Owned, deeply frozen native JSON data (for Oracle introspection). */
   readonly raw?: unknown;
 }
@@ -203,7 +212,21 @@ export interface SessionSendOptions {
 // HarnessSession interface
 // ---------------------------------------------------------------------------
 
+/** `acknowledged`: the runtime confirmed the stop and the turn reached a native terminal. */
+export type NativeInterruptOutcome = "acknowledged" | "no-turn" | "unacknowledged";
+
 export interface HarnessSession {
+  /** How this session reaches its model, with the capabilities that transport declares. */
+  readonly transport?: TransportDescriptor;
+  /**
+   * Ask the runtime to stop the in-flight turn and wait (bounded) for its
+   * acknowledgment. Present only where the transport declares
+   * `interrupt: "acknowledged"`. Unlike interrupt(), a confirmed stop settles
+   * native ownership through the turn's own terminal.
+   */
+  interruptNative?(opts?: { timeoutMs?: number }): Promise<NativeInterruptOutcome>;
+  /** Poll account usage limits without a model turn. Present where the transport declares `limits.poll`. */
+  readLimits?(opts?: { timeoutMs?: number }): Promise<LimitSnapshot | undefined>;
   /** One immutable admission snapshot, without copying unrelated session history. */
   inspectAttempt?(admissionId: string): SessionAttempt | undefined;
   readonly admissionProtocol?: "prewrite-v1";

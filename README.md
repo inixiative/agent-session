@@ -1,7 +1,10 @@
 # @inixiative/agent-session
 
 Drive coding-agent CLIs as **persistent, streaming, event-captured sessions** —
-one interface, any agent. Claude Code and Codex today; Gemini and Grok planned.
+one interface, any agent, over interchangeable **transports**. Claude Code
+(CLI or Agent SDK) and Codex (MCP or app-server) today; Gemini and Grok planned.
+Also: warm **primed decision sessions**, **subscription pools** with
+deterministic routing, **limit polling** and **session continuity**.
 
 Most ways to script a coding agent are one-shot (`claude -p "…"`) and lose the
 process. `agent-session` keeps a single long-lived agent process, streams turns
@@ -43,13 +46,78 @@ session.kill();
   containers.
 - **fork / resume / interrupt** and pre-send hooks (rewrite the outgoing
   message — e.g. inject just-in-time context per turn).
-- **Zero dependencies.** Just Bun + the agent CLI you're driving.
+- **Transports with declared capabilities.** How a model is reached is a
+  pluggable transport; switching it is a routing change, not a rewrite.
+- **Zero dependencies.** Just Bun + the agent CLI you're driving. The Agent SDK
+  transport takes the SDK's `query` from the caller.
 
 ## Interface
 
 `HarnessSession` is the provider-agnostic contract (`start` / `send` / `kill` /
-`fork` / `interrupt` + an event handler). `ClaudeCodeSession` implements it over
-`claude --print --input-format stream-json --output-format stream-json`.
+`fork` / `interrupt` + an event handler). Optional members where a transport
+supports them: `transport` (its descriptor), `interruptNative()` (acknowledged
+stop), `readLimits()` (account limits without a model turn). Account limits also
+arrive as `rate_limit` events.
+
+## Transports
+
+```ts
+import { createSession, TRANSPORTS } from "@inixiative/agent-session";
+
+const kind = "codex-app-server";            // or claude-cli, claude-agent-sdk, codex-mcp
+if (TRANSPORTS[kind].capabilities.interrupt === "acknowledged") { /* … */ }
+const session = createSession(kind, { cwd, model: "gpt-6-luna", env: { CODEX_HOME: profile } });
+```
+
+| | claude-cli | codex-mcp | codex-app-server | claude-agent-sdk | acp | api |
+|---|---|---|---|---|---|---|
+| Status | ✅ live | ✅ live | ✅ live | ✅ live | stub | stub |
+| Resume / fork | native / native | loaded-only / same-thread | native / – | native / native | – | – |
+| Interrupt | acknowledged | local-only | acknowledged | acknowledged | – | – |
+| Push | – | – | steer | – | – | – |
+| Approvals | mode | mode | refuse | callback | – | – |
+| Limits stream / poll | ✅ / ✅ | – / – | ✅ / ✅ | ✅ / – | – | – |
+| Primed reset | fork | – | fork | – | – | – |
+
+Full matrix, notes and what is stubbed: [docs/transports-pools-routing.md](docs/transports-pools-routing.md).
+
+## Primed decision sessions
+
+One live, warm session per middleware role, primed once with its role
+instructions and stable context, reset to that primed state every cycle:
+
+```ts
+import { CodexPrimedSessions } from "@inixiative/agent-session";
+
+const decisions = new CodexPrimedSessions({ model: "gpt-6-luna", effort: "low", cwd: privateDir });
+const result = await decisions.decide(
+  { key: `${threadId}:aux:domain:api`, instructions: rolePrompt, context: layerContent, hash: layerHash },
+  { input: "## Message\n…", onAdmission: register },
+);
+```
+
+Codex hosts every key as a thread of one `app-server` process per account and
+forks the primed thread per cycle; Claude forks a persisted primed session with
+a pre-spawned spare. Measured on a ChatGPT login: warm Codex decisions 2.45 s
+median vs 3.9 s for `codex exec` per decision, with 34% fewer input tokens; warm
+Claude (haiku) decisions 1.95 s with the whole primed prefix read from cache.
+
+## Pools, routing and continuity
+
+```ts
+import { SubscriptionPool } from "@inixiative/agent-session";
+
+const pool = new SubscriptionPool({ instances: [
+  { id: "work", transport: "claude-cli", profileDirectory: "/profiles/work", organizationIds: ["org"] },
+  { id: "spare", transport: "claude-cli", profileDirectory: "/profiles/spare", organizationIds: ["org"] },
+] });
+const { session, lease } = await pool.open({ runtime: "claude", model: "sonnet", organizationId: "org", preferredInstanceId: "work" });
+```
+
+Routing is deterministic (quartile-balanced, owner-first or pinned) over
+observed limits, leases and health; stale or unknown limits exclude an instance
+and every exclusion has a reason. `continueOn` moves a thread only between
+instances that share native history, and says why when it cannot.
 
 ## Usage telemetry
 
@@ -71,13 +139,16 @@ snapshots in the artifact but do not fabricate a completed-turn total.
 | Runtime | Status |
 |---|---|
 | Claude Code | ✅ shipped |
-| Codex CLI (`codex mcp-server`, JSON-RPC) | ✅ shipped (`CodexSession`; `CodexAppServerSession` experimental) |
+| Codex CLI (`codex mcp-server`, JSON-RPC) | ✅ shipped (`CodexSession`) |
+| Codex app-server | ✅ shipped (`CodexAppServerSession`, `CodexPrimedSessions`) |
+| Claude Agent SDK | ✅ shipped (`ClaudeAgentSdkSession`; caller supplies `query`) |
+| ACP agents / direct API | typed stubs |
 | Gemini CLI | planned |
 | Grok CLI | planned (when its headless/stream mode matures) |
 
 Opaque runtimes degrade gracefully — fewer event types, never a hard failure.
 
-Proposed [subscription pooling goals](tickets/README.md) cover distributing session workloads across subscriptions while keeping working context independent of the capacity supplying it.
+[Subscription pooling goals](tickets/README.md) (AS-001…005) are implemented as described in [docs/transports-pools-routing.md](docs/transports-pools-routing.md); each ticket lists what remains.
 
 ## Provenance
 

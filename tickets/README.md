@@ -1,6 +1,6 @@
 # Goals and tickets
 
-These tickets capture proposed product goals and outcomes. They do not prescribe implementation, APIs, scheduling algorithms, or a build sequence. Pooling is proposed work, not a claim about current package capabilities.
+These tickets capture product goals and outcomes. Version 0.2.0 implements them as described in [docs/transports-pools-routing.md](../docs/transports-pools-routing.md); each ticket records what remains.
 
 ## Subscription pooling
 
@@ -10,11 +10,11 @@ The goal is to spread session workloads over available subscriptions and preserv
 
 | Ticket | Goal | Status |
 | --- | --- | --- |
-| [AS-001](AS-001-subscription-pools.md) | Represent subscriptions as pooled execution capacity | Proposed |
-| [AS-002](AS-002-load-distribution.md) | Spread session workloads across available capacity | Proposed |
-| [AS-003](AS-003-session-continuity.md) | Continue the same work when its supplying subscription changes | Proposed |
-| [AS-004](AS-004-provider-capabilities.md) | Establish pooling and continuation support for each harness | Proposed |
-| [AS-005](AS-005-policy-and-attribution.md) | Make pooled execution controllable and attributable | Proposed |
+| [AS-001](AS-001-subscription-pools.md) | Represent subscriptions as pooled execution capacity | Implemented (0.2.0) |
+| [AS-002](AS-002-load-distribution.md) | Spread session workloads across available capacity | Implemented (0.2.0) |
+| [AS-003](AS-003-session-continuity.md) | Continue the same work when its supplying subscription changes | Implemented for shared native history (0.2.0) |
+| [AS-004](AS-004-provider-capabilities.md) | Establish pooling and continuation support for each harness | Implemented (0.2.0) |
+| [AS-005](AS-005-policy-and-attribution.md) | Make pooled execution controllable and attributable | Implemented (0.2.0) |
 
 ## Responsibilities
 
@@ -24,4 +24,4 @@ The goal is to spread session workloads over available subscriptions and preserv
 
 Pooling should remain usable by consumers other than Kastle. It is not a prerequisite for Archive's storage, search, and sync MVP.
 
-Provider-specific feasibility remains to be established. The architectural goal does not imply that every native harness already supports every account switch or that different providers are interchangeable.
+Provider-specific support is declared per transport (AS-004). It does not imply that every native harness supports every account switch or that different providers are interchangeable.
