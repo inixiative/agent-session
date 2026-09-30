@@ -15,8 +15,8 @@
 // (see transport.ts); every transport implements this one contract.
 // ---------------------------------------------------------------------------
 
-import type { LimitSnapshot } from "./limits";
-import type { TransportDescriptor } from "./transport";
+import type { LimitSnapshot } from './limits';
+import type { TransportDescriptor } from './transport';
 
 // ---------------------------------------------------------------------------
 // Event taxonomy — classified events from the agent stream
@@ -32,9 +32,9 @@ export interface SessionIdentity {
   readonly callId?: string;
   readonly messageId?: string;
   readonly rpcRequestId?: number;
-  readonly correlation?: "native-turn" | "ordered-stream" | "unknown";
+  readonly correlation?: 'native-turn' | 'ordered-stream' | 'unknown';
 }
-export type NativeOutcome = "unknown" | "completed" | "failed";
+export type NativeOutcome = 'unknown' | 'completed' | 'failed';
 export interface NativeTerminal {
   readonly type: string;
   readonly eventId?: string;
@@ -45,38 +45,54 @@ export interface NativeTerminal {
 }
 export interface SessionAttempt extends SessionIdentity {
   readonly nativeOutcome: NativeOutcome;
-  readonly localOutcome: "pending" | "resolved" | "rejected";
-  readonly dispatch: "not-dispatched" | "attempted";
-  readonly transportOutcome: "open" | "failed" | "closed";
+  readonly localOutcome: 'pending' | 'resolved' | 'rejected';
+  readonly dispatch: 'not-dispatched' | 'attempted';
+  readonly transportOutcome: 'open' | 'failed' | 'closed';
   readonly terminal?: NativeTerminal;
-  readonly rpcOutcome?: "pending" | "resolved" | "failed" | "unknown";
-  readonly localFailure?: "timeout" | "interrupt-request" | "transport" | "rpc" | "validation" | "blocked" | "killed" | "unrecognized-terminal" | "registration";
+  readonly rpcOutcome?: 'pending' | 'resolved' | 'failed' | 'unknown';
+  readonly localFailure?:
+    | 'timeout'
+    | 'interrupt-request'
+    | 'transport'
+    | 'rpc'
+    | 'validation'
+    | 'blocked'
+    | 'killed'
+    | 'unrecognized-terminal'
+    | 'registration';
   readonly content: string;
   readonly events: readonly SessionEvent[];
   readonly tokens?: SessionTokens;
 }
 /** A rejected local send can still have a later native terminal; read attempt again to reconcile. */
 export class SessionTurnError extends Error {
-  constructor(message: string, private readonly evidence: () => SessionAttempt, options?: ErrorOptions) {
-    super(message, options); this.name = "SessionTurnError";
+  constructor(
+    message: string,
+    private readonly evidence: () => SessionAttempt,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+    this.name = 'SessionTurnError';
   }
-  get attempt(): SessionAttempt { return this.evidence(); }
+  get attempt(): SessionAttempt {
+    return this.evidence();
+  }
 }
 
 export type SessionEventKind =
-  | "text_delta"
-  | "native_status"
-  | "session_start"
-  | "session_end"
-  | "session_compact"
-  | "text"
-  | "tool_use"
-  | "tool_result"
-  | "thinking"
-  | "usage"
-  | "rate_limit"
-  | "result"
-  | "error";
+  | 'text_delta'
+  | 'native_status'
+  | 'session_start'
+  | 'session_end'
+  | 'session_compact'
+  | 'text'
+  | 'tool_use'
+  | 'tool_result'
+  | 'thinking'
+  | 'usage'
+  | 'rate_limit'
+  | 'result'
+  | 'error';
 
 /** Input excludes cache reads/writes when those disjoint counters are supplied.
  * Thinking is a subset of output; TTL counters are subsets of cacheWrite.
@@ -102,11 +118,21 @@ export interface SessionEvent extends SessionIdentity {
    * repeated one is not evidence of compaction or restart. "duplicate-boundary": an explicit
    * compaction boundary whose native uuid was already recorded.
    */
-  readonly unattributedReason?: "no-admission" | "foreign-session" | "foreign-turn" | "duplicate-terminal" | "after-terminal"
-    | "unrecognized-event" | "session-configuration" | "duplicate-boundary" | "duplicate-tool" | "unmatched-tool" | "malformed-tool"
-    | "account-status";
+  readonly unattributedReason?:
+    | 'no-admission'
+    | 'foreign-session'
+    | 'foreign-turn'
+    | 'duplicate-terminal'
+    | 'after-terminal'
+    | 'unrecognized-event'
+    | 'session-configuration'
+    | 'duplicate-boundary'
+    | 'duplicate-tool'
+    | 'unmatched-tool'
+    | 'malformed-tool'
+    | 'account-status';
   /** Local transport observation, not a native terminal acknowledgment. */
-  readonly transportOutcome?: SessionAttempt["transportOutcome"];
+  readonly transportOutcome?: SessionAttempt['transportOutcome'];
   readonly nativeOutcome?: NativeOutcome;
   readonly terminal?: NativeTerminal;
   readonly kind: SessionEventKind;
@@ -152,9 +178,9 @@ export interface SessionEvent extends SessionIdentity {
 
 /** Result of a single send() — the turn's content plus all classified events. */
 export interface SessionResult extends SessionIdentity {
-  readonly localOutcome?: SessionAttempt["localOutcome"];
-  readonly transportOutcome?: SessionAttempt["transportOutcome"];
-  readonly rpcOutcome?: SessionAttempt["rpcOutcome"];
+  readonly localOutcome?: SessionAttempt['localOutcome'];
+  readonly transportOutcome?: SessionAttempt['transportOutcome'];
+  readonly rpcOutcome?: SessionAttempt['rpcOutcome'];
   readonly nativeOutcome?: NativeOutcome;
   readonly terminal?: NativeTerminal;
   readonly content: string;
@@ -173,7 +199,7 @@ export interface SessionArtifact {
   readonly diagnostics?: SessionDiagnostics;
   readonly attempts?: readonly SessionAttempt[];
   /** Legacy totalTokens contains observed counts only, not proof of complete accounting. */
-  readonly accounting?: "observed-only";
+  readonly accounting?: 'observed-only';
   /** The runtime's native session ID. See SessionEvent.externalSessionId. */
   readonly externalSessionId?: string;
   readonly events: readonly SessionEvent[];
@@ -198,9 +224,7 @@ export type SessionEventHandler = (event: SessionEvent) => void;
  * computes "what's new since the last injection," formats it as a prefix,
  * and the composed message goes to send().
  */
-export type BeforeSendHook = (
-  message: string,
-) => string | Promise<string>;
+export type BeforeSendHook = (message: string) => string | Promise<string>;
 
 export interface SessionSendOptions {
   timeout?: number;
@@ -213,7 +237,7 @@ export interface SessionSendOptions {
 // ---------------------------------------------------------------------------
 
 /** `acknowledged`: the runtime confirmed the stop and the turn reached a native terminal. */
-export type NativeInterruptOutcome = "acknowledged" | "no-turn" | "unacknowledged";
+export type NativeInterruptOutcome = 'acknowledged' | 'no-turn' | 'unacknowledged';
 
 export interface HarnessSession {
   /** How this session reaches its model, with the capabilities that transport declares. */
@@ -229,10 +253,10 @@ export interface HarnessSession {
   readLimits?(opts?: { timeoutMs?: number }): Promise<LimitSnapshot | undefined>;
   /** One immutable admission snapshot, without copying unrelated session history. */
   inspectAttempt?(admissionId: string): SessionAttempt | undefined;
-  readonly admissionProtocol?: "prewrite-v1";
+  readonly admissionProtocol?: 'prewrite-v1';
   readonly diagnostics?: SessionDiagnostics;
   readonly attempts?: readonly SessionAttempt[];
-  readonly accounting?: "observed-only";
+  readonly accounting?: 'observed-only';
   readonly alive: boolean;
   /**
    * The agent runtime's native session ID — external to Foundry.

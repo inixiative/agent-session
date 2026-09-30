@@ -1,8 +1,8 @@
-import type { SessionTokens } from "./harness-session";
+import type { SessionTokens } from './harness-session';
 
 /** Preserve the native payload as well as the counters consumers aggregate. */
 export function parseClaudeUsage(value: unknown): SessionTokens | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const usage = value as Record<string, unknown>;
   const tokens: SessionTokens = {
     input: count(usage.input_tokens) ?? 0,
@@ -25,6 +25,5 @@ export function parseClaudeUsage(value: unknown): SessionTokens | undefined {
 }
 
 function count(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0
-    ? value : undefined;
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined;
 }

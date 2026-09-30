@@ -1,106 +1,62 @@
 // @inixiative/agent-session — drive coding-agent runtimes as persistent,
 // streaming, event-captured sessions, over interchangeable transports.
 
-// The provider-agnostic interface + event taxonomy.
-export * from "./harness-session";
-
-// Transports: how a session reaches its model, with declared capabilities.
-export {
-  TRANSPORTS,
-  TransportUnavailableError,
-  type TransportCapabilities,
-  type TransportDescriptor,
-  type TransportKind,
-  type TransportRuntime,
-} from "./transport";
-export {
-  createSession,
-  describeTransport,
-  AcpSession,
-  ApiSession,
-  type AcpSessionConfig,
-  type ApiSessionConfig,
-  type TransportConfigs,
-} from "./transports";
-
-// Claude Code adapter (persistent stream-json session, subscription auth).
-export {
-  ClaudeCodeSession,
-  CLAUDE_TEXT_ONLY_ARGS,
-  type ClaudeCodeSessionConfig,
-} from "./claude-code-session";
-
 // Claude through the Agent SDK (caller supplies `query`; zero dependencies here).
 export {
-  ClaudeAgentSdkSession,
-  sdkOptionsFromArgv,
   type ClaudeAgentSdkCanUseTool,
   type ClaudeAgentSdkQuery,
   type ClaudeAgentSdkQueryFunction,
+  ClaudeAgentSdkSession,
   type ClaudeAgentSdkSessionConfig,
-} from "./claude-agent-sdk-session";
+  sdkOptionsFromArgv,
+} from './claude-agent-sdk-session';
+// Claude Code adapter (persistent stream-json session, subscription auth).
+export {
+  CLAUDE_TEXT_ONLY_ARGS,
+  ClaudeCodeSession,
+  type ClaudeCodeSessionConfig,
+} from './claude-code-session';
+export { type ClaudePrimedConfig, ClaudePrimedSessions } from './claude-primed';
+export { parseClaudeUsage } from './claude-usage';
+export {
+  CODEX_DECISION_DISABLED_FEATURES,
+  CODEX_DECISION_THREAD_CONFIG,
+  type CodexPrimedConfig,
+  CodexPrimedSessions,
+  codexDecisionLaunchArgs,
+  codexTokens,
+} from './codex-primed';
 
 // Codex CLI adapter (persistent JSON-RPC session). CodexSession defaults to the
 // mcp-server variant; CodexAppServerSession is the app-server one.
 export {
-  CodexSession,
-  CodexMcpSession,
   CodexAppServerSession,
+  CodexMcpSession,
+  CodexSession,
   type CodexSessionConfig,
   type CodexSpawn,
-} from "./codex-session";
-
-// Primed decision sessions: one live, warm session per middleware role.
+} from './codex-session';
+// The provider-agnostic interface + event taxonomy.
+export * from './harness-session';
 export {
-  DecisionError,
-  primeHash,
-  type DecisionAdmission,
-  type DecisionFailure,
-  type DecisionRequest,
-  type DecisionResult,
-  type PrimedEvent,
-  type PrimedSessions,
-  type PrimedSnapshot,
-  type PrimeSpec,
-} from "./primed";
-export {
-  CodexPrimedSessions,
-  CODEX_DECISION_DISABLED_FEATURES,
-  CODEX_DECISION_THREAD_CONFIG,
-  codexDecisionLaunchArgs,
-  codexTokens,
-  type CodexPrimedConfig,
-} from "./codex-primed";
-export { ClaudePrimedSessions, type ClaudePrimedConfig } from "./claude-primed";
-
+  JsonRpcClosedError,
+  JsonRpcConnection,
+  JsonRpcError,
+  JsonRpcTimeoutError,
+} from './json-rpc';
 // Subscription limits, polling, routing and pools.
 export {
   claudeRateLimitSnapshot,
   claudeUsageSnapshot,
   codexLimitSnapshot,
-  limitUtilization,
-  mergeLimits,
   type LimitRuntime,
   type LimitSnapshot,
   type LimitWindow,
-} from "./limits";
-export { probeClaudeLimits, probeCodexLimits, type LimitProbeOptions } from "./limits-probe";
+  limitUtilization,
+  mergeLimits,
+} from './limits';
+export { type LimitProbeOptions, probeClaudeLimits, probeCodexLimits } from './limits-probe';
 export {
-  assessCandidate,
-  rankCandidates,
-  rankSubscriptionAccounts,
-  repositoryIdentity,
-  type CandidateRequest,
-  type ExclusionReason,
-  type RankedCandidate,
-  type RepositoryRoute,
-  type RoutingMode,
-  type RoutingRequest,
-  type SubscriptionCandidate,
-} from "./routing";
-export {
-  SubscriptionPool,
-  PoolExhaustedError,
   ContinuityError,
   type ContinuityRefusal,
   type FailureKind,
@@ -108,11 +64,54 @@ export {
   type InstanceStatus,
   type Lease,
   type PoolEvent,
-  type PoolRequest,
+  PoolExhaustedError,
   type PooledSessionConfig,
   type PooledTransport,
+  type PoolRequest,
+  SubscriptionPool,
   type SubscriptionPoolOptions,
-} from "./pool";
-
-export { JsonRpcConnection, JsonRpcError, JsonRpcClosedError, JsonRpcTimeoutError } from "./json-rpc";
-export { parseClaudeUsage } from "./claude-usage";
+} from './pool';
+// Primed decision sessions: one live, warm session per middleware role.
+export {
+  type DecisionAdmission,
+  DecisionError,
+  type DecisionFailure,
+  type DecisionRequest,
+  type DecisionResult,
+  type PrimedEvent,
+  type PrimedSessions,
+  type PrimedSnapshot,
+  type PrimeSpec,
+  primeHash,
+} from './primed';
+export {
+  assessCandidate,
+  type CandidateRequest,
+  type ExclusionReason,
+  type RankedCandidate,
+  type RepositoryRoute,
+  type RoutingMode,
+  type RoutingRequest,
+  rankCandidates,
+  rankSubscriptionAccounts,
+  repositoryIdentity,
+  type SubscriptionCandidate,
+} from './routing';
+// Transports: how a session reaches its model, with declared capabilities.
+export {
+  TRANSPORTS,
+  type TransportCapabilities,
+  type TransportDescriptor,
+  type TransportKind,
+  type TransportRuntime,
+  TransportUnavailableError,
+} from './transport';
+export {
+  AcpSession,
+  type AcpSessionConfig,
+  ApiSession,
+  type ApiSessionConfig,
+  createSession,
+  describeTransport,
+  type TransportConfigs,
+} from './transports';
