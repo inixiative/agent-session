@@ -9,7 +9,7 @@ export function fakeProcess(onMessage: (message: any, io: FakeIo) => void = () =
   const encoder = new TextEncoder();
   const io: FakeIo = {
     emit(value) {
-      if (!closed) out.enqueue(encoder.encode(JSON.stringify(value) + '\n'));
+      if (!closed) out.enqueue(encoder.encode(`${JSON.stringify(value)}\n`));
     },
     exit(code = 0) {
       if (!closed) {

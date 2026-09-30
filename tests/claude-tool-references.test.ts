@@ -13,7 +13,7 @@ async function run(
   let out!: ReadableStreamDefaultController<Uint8Array>, exit!: (code: number) => void;
   let closed = false,
     writes = 0;
-  const emit = (v: unknown) => out.enqueue(new TextEncoder().encode(JSON.stringify(v) + '\n'));
+  const emit = (v: unknown) => out.enqueue(new TextEncoder().encode(`${JSON.stringify(v)}\n`));
   const proc = {
     stdout: new ReadableStream<Uint8Array>({
       start(c) {

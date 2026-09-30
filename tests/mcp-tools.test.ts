@@ -19,7 +19,7 @@ async function replay(frames: Record<string, unknown>[], late = false) {
   let request: number;
   let writes = 0;
   const emit = (value: unknown) =>
-    output.enqueue(new TextEncoder().encode(JSON.stringify(value) + '\n'));
+    output.enqueue(new TextEncoder().encode(`${JSON.stringify(value)}\n`));
   const event = (msg: Record<string, unknown>) =>
     emit({ method: 'codex/event', params: { id: 'turn', msg } });
   const session = new CodexMcpSession({
@@ -104,14 +104,11 @@ test('MCP call evidence preserves public arguments, server, result and immutable
   expect(r.attempt.nativeOutcome).toBe('completed');
 });
 for (const result of [{ Err: 'PUBLIC_TOOL_ERROR' }, { Ok: { content: [], isError: true } }])
-  test(
-    'MCP tool failure does not fabricate failed native terminal ' + JSON.stringify(result),
-    async () => {
-      const r = await replay([begin(), end(result)]);
-      expect(r.attempt.nativeOutcome).toBe('completed');
-      expect(r.attempt.events.find((e) => e.kind === 'tool_result')?.toolError).toBe(true);
-    },
-  );
+  test(`MCP tool failure does not fabricate failed native terminal ${JSON.stringify(result)}`, async () => {
+    const r = await replay([begin(), end(result)]);
+    expect(r.attempt.nativeOutcome).toBe('completed');
+    expect(r.attempt.events.find((e) => e.kind === 'tool_result')?.toolError).toBe(true);
+  });
 test('duplicate, foreign, mismatched and malformed MCP events cannot invent call joins', async () => {
   const r = await replay([
     end(),

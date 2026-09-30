@@ -58,7 +58,7 @@ for (const cmd of [
     p.exited,
   ]);
   const file = `${checks.length + 1}.log`;
-  writeFileSync(join(output, file), stdout + '\n' + stderr);
+  writeFileSync(join(output, file), `${stdout}\n${stderr}`);
   checks.push({ command: cmd, startedAt: start, exitCode, log: file });
 }
 const after = await fingerprint();

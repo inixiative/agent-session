@@ -297,8 +297,6 @@ export class ClaudeCodeSession implements HarnessSession {
   private _attempts: TurnState[] = [];
   private _seenTerminals = new Set<string>();
   private _inflight: QueuedTurn | null = null;
-  private _turnEvents: SessionEvent[] = [];
-  private _resultText = '';
   private _turnTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(config?: ClaudeCodeSessionConfig) {
@@ -592,11 +590,7 @@ export class ClaudeCodeSession implements HarnessSession {
    */
   async interruptNative(opts?: { timeoutMs?: number }): Promise<NativeInterruptOutcome> {
     const turn = this._inflight;
-    if (
-      !turn ||
-      turn.evidence.dispatch !== 'attempted' ||
-      turn.evidence.nativeOutcome !== 'unknown'
-    )
+    if (turn?.evidence.dispatch !== 'attempted' || turn.evidence.nativeOutcome !== 'unknown')
       return 'no-turn';
     const deadline = Date.now() + (opts?.timeoutMs ?? 5_000);
     try {
@@ -643,7 +637,7 @@ export class ClaudeCodeSession implements HarnessSession {
       });
       try {
         this._proc!.stdin.write(
-          JSON.stringify({ type: 'control_request', request_id: requestId, request }) + '\n',
+          `${JSON.stringify({ type: 'control_request', request_id: requestId, request })}\n`,
         );
         this._proc!.stdin.flush();
       } catch (error) {
@@ -754,20 +748,17 @@ export class ClaudeCodeSession implements HarnessSession {
 
   private _writeTurn(turn: QueuedTurn): void {
     turn.evidence.dispatch = 'attempted';
-    this._turnEvents = turn.evidence.events;
-    this._resultText = '';
 
     // Wire format validated empirically against claude 2.1.114:
     // {type:"user", message:{role,content:[{type:"text",text}]}}
     // Alternative shapes ({type:"user_message"}, {role,content}) are silently dropped.
-    const payload =
-      JSON.stringify({
-        type: 'user',
-        message: {
-          role: 'user',
-          content: [{ type: 'text', text: turn.message }],
-        },
-      }) + '\n';
+    const payload = `${JSON.stringify({
+      type: 'user',
+      message: {
+        role: 'user',
+        content: [{ type: 'text', text: turn.message }],
+      },
+    })}\n`;
     try {
       this._proc!.stdin.write(payload);
       this._proc!.stdin.flush();
@@ -945,10 +936,10 @@ export class ClaudeCodeSession implements HarnessSession {
       if (id && this._proc) {
         try {
           this._proc.stdin.write(
-            JSON.stringify({
+            `${JSON.stringify({
               type: 'control_response',
               response: { subtype: 'error', request_id: id, error: 'Unsupported by this client' },
-            }) + '\n',
+            })}\n`,
           );
           this._proc.stdin.flush();
         } catch {
@@ -1075,7 +1066,6 @@ export class ClaudeCodeSession implements HarnessSession {
         messageId: typeof message?.id === 'string' ? message.id : undefined,
         ...(terminal ? { nativeOutcome: a.nativeOutcome, terminal: a.terminal } : {}),
       });
-      this._resultText = a.content;
       // Native result usage is authoritative for the whole turn. Request
       // snapshots can repeat across content blocks and must not be added again.
       if (e.kind === 'result' && e.tokens) {

@@ -127,7 +127,7 @@ export class JsonRpcConnection {
 
   private _write(message: unknown): void {
     if (this._closeError) throw this._closeError;
-    this._proc.stdin.write(JSON.stringify(message) + '\n');
+    this._proc.stdin.write(`${JSON.stringify(message)}\n`);
     this._proc.stdin.flush();
   }
 

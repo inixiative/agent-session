@@ -126,7 +126,7 @@ async function replay(recording: any, chunkSize: number) {
   const emitThrough = (id?: number) => {
     while (offset < values.length) {
       const value = values[offset++];
-      const bytes = new TextEncoder().encode(JSON.stringify(value) + '\n');
+      const bytes = new TextEncoder().encode(`${JSON.stringify(value)}\n`);
       for (let i = 0; i < bytes.length; i += chunkSize)
         controller.enqueue(bytes.slice(i, i + chunkSize));
       if (id !== undefined && value.id === id && ('result' in value || 'error' in value)) break;

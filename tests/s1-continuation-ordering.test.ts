@@ -31,7 +31,7 @@ function fixture(s: Scenario) {
     timers.push(setTimeout(fn, ms));
   };
   const emit = (value: unknown) => {
-    if (!closed) output.enqueue(new TextEncoder().encode(JSON.stringify(value) + '\n'));
+    if (!closed) output.enqueue(new TextEncoder().encode(`${JSON.stringify(value)}\n`));
   };
   const event = (msg: Record<string, unknown>) =>
     emit({ jsonrpc: '2.0', method: 'codex/event', params: { id: msg.turn_id, msg } });

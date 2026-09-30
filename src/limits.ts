@@ -149,7 +149,7 @@ export function claudeUsageSnapshot(
   observedAt = Date.now(),
 ): LimitSnapshot | undefined {
   const r = object(response);
-  if (!r || r.rate_limits_available !== true) return undefined;
+  if (r?.rate_limits_available !== true) return undefined;
   const limits = object(r.rate_limits);
   const windows: LimitWindow[] = [];
   for (const [id, minutes] of [

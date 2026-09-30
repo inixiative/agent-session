@@ -47,7 +47,7 @@ function makeFakeProc(opts?: {
   });
 
   const emit = (json: Record<string, unknown>) => {
-    const line = JSON.stringify(json) + '\n';
+    const line = `${JSON.stringify(json)}\n`;
     stdoutCtrl.enqueue(new TextEncoder().encode(line));
   };
 

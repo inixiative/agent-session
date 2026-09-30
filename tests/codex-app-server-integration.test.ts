@@ -2,7 +2,9 @@ import { afterEach, expect, test } from 'bun:test';
 import { CodexAppServerSession, type CodexSessionConfig } from '../src';
 
 const cleanup: Array<() => void> = [];
-afterEach(() => cleanup.splice(0).forEach((fn) => fn()));
+afterEach(() => {
+  for (const fn of cleanup.splice(0)) fn();
+});
 const tick = () => Bun.sleep(0);
 export function appFixture(
   options: {
@@ -20,7 +22,7 @@ export function appFixture(
   let inventoryPage = 0;
   const requests: any[] = [];
   const emit = (v: unknown) => {
-    if (!closed) out.enqueue(new TextEncoder().encode(JSON.stringify(v) + '\n'));
+    if (!closed) out.enqueue(new TextEncoder().encode(`${JSON.stringify(v)}\n`));
   };
   const threadId = options.binding ?? 'native-thread';
   const response = {

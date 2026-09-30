@@ -40,7 +40,7 @@ function fixture(
     const data = new TextEncoder().encode(text);
     for (let i = 0; i < data.length; i += 7) controller.enqueue(data.slice(i, i + 7));
   };
-  const emit = (value: unknown) => bytes(JSON.stringify(value) + '\n');
+  const emit = (value: unknown) => bytes(`${JSON.stringify(value)}\n`);
   const exit = (code = 1) => {
     if (!closed) {
       closed = true;

@@ -152,7 +152,7 @@ function bridge(
       finish(code);
     };
     const emit = (message: unknown) => {
-      if (!finished) out.enqueue(encoder.encode(JSON.stringify(message) + '\n'));
+      if (!finished) out.enqueue(encoder.encode(`${JSON.stringify(message)}\n`));
     };
 
     const inbox: unknown[] = [];

@@ -751,7 +751,7 @@ abstract class BaseCodexSession implements HarnessSession {
       this._inflight.evidence.identity = { ...this._inflight.evidence.identity, rpcRequestId: id };
       this._inflight.evidence.rpcOutcome = 'pending';
     }
-    const payload = JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n';
+    const payload = `${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`;
     return new Promise<unknown>((resolve, reject) => {
       this._pending.set(id, { resolve, reject });
       try {
@@ -769,7 +769,7 @@ abstract class BaseCodexSession implements HarnessSession {
   }
 
   protected _rpcNotify(method: string, params?: unknown): void {
-    const payload = JSON.stringify({ jsonrpc: '2.0', method, params }) + '\n';
+    const payload = `${JSON.stringify({ jsonrpc: '2.0', method, params })}\n`;
     this._proc!.stdin.write(payload);
     this._proc!.stdin.flush();
   }
@@ -1144,8 +1144,7 @@ export class CodexAppServerSession extends BaseCodexSession {
   async interruptNative(opts?: { timeoutMs?: number }): Promise<NativeInterruptOutcome> {
     const a = this._inflight?.evidence;
     if (
-      !a ||
-      a.dispatch !== 'attempted' ||
+      a?.dispatch !== 'attempted' ||
       a.nativeOutcome !== 'unknown' ||
       !a.identity.turnId ||
       !this._externalSessionId
@@ -1187,8 +1186,7 @@ export class CodexAppServerSession extends BaseCodexSession {
         raw: { kind: payload.kind },
       });
     if (
-      !a ||
-      a.dispatch !== 'attempted' ||
+      a?.dispatch !== 'attempted' ||
       a.nativeOutcome !== 'unknown' ||
       !a.identity.turnId ||
       !this._externalSessionId
@@ -1289,12 +1287,11 @@ export class CodexAppServerSession extends BaseCodexSession {
   protected override _serverRequest(request: Record<string, unknown>): boolean {
     // JSON-RPC's explicit method-not-supported refusal also covers unknown future
     // requests. Never approve native work or echo private request parameters.
-    const payload =
-      JSON.stringify({
-        jsonrpc: '2.0',
-        id: request.id,
-        error: { code: -32601, message: 'Client interaction is unsupported by this adapter' },
-      }) + '\n';
+    const payload = `${JSON.stringify({
+      jsonrpc: '2.0',
+      id: request.id,
+      error: { code: -32601, message: 'Client interaction is unsupported by this adapter' },
+    })}\n`;
     const params = object(request.params),
       a = this._inflight?.evidence;
     const identity =
@@ -1364,8 +1361,7 @@ export class CodexAppServerSession extends BaseCodexSession {
       if (result.nextCursor == null) {
         const tools = object(found?.tools);
         if (
-          !found ||
-          found.runtimeStatus !== 'connected' ||
+          found?.runtimeStatus !== 'connected' ||
           !tools ||
           required.tools.some((name) => object(tools[name])?.name !== name)
         )

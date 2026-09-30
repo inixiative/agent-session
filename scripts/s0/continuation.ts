@@ -194,8 +194,7 @@ export class ContinuationCapture {
   private verify(turn: Turn): boolean {
     const a = this.session.attempts.find((a) => a.admissionId === turn.admissionId);
     if (
-      !a ||
-      a.nativeOutcome !== 'completed' ||
+      a?.nativeOutcome !== 'completed' ||
       a.localOutcome !== 'resolved' ||
       a.transportOutcome !== 'open' ||
       !this.session.alive ||

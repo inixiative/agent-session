@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test';
-import { CodexAppServerSession, type SessionEvent } from '../src';
+import { CodexAppServerSession } from '../src';
 
 // Synthetic installed-0.153.4 schema cases, never a recorded native success.
 const closes: Array<() => void> = [];
@@ -27,7 +27,7 @@ function fixture(
     commands: string[][] = [];
   const threadId = opts.returnedThread ?? opts.binding ?? 'thread-owned';
   const emit = (value: unknown) => {
-    if (!closed) out.enqueue(new TextEncoder().encode(JSON.stringify(value) + '\n'));
+    if (!closed) out.enqueue(new TextEncoder().encode(`${JSON.stringify(value)}\n`));
   };
   const replyThread = () => {
     const req = requests.find((r) => ['thread/start', 'thread/resume'].includes(r.method))!;
@@ -124,7 +124,7 @@ function fixture(
     threadId,
     emitBatch(values: unknown[]) {
       out.enqueue(
-        new TextEncoder().encode(values.map((value) => JSON.stringify(value) + '\n').join('')),
+        new TextEncoder().encode(values.map((value) => `${JSON.stringify(value)}\n`).join('')),
       );
     },
     rpc(id = 'turn-one', error?: string) {

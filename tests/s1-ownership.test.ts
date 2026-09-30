@@ -7,7 +7,7 @@ function setup(engine: 'claude' | 'mcp', resume = 'native-session') {
   const writes: any[] = [],
     spawns: string[][] = [];
   let writeFailure: Error | undefined;
-  const emit = (v: unknown) => out.enqueue(new TextEncoder().encode(JSON.stringify(v) + '\n'));
+  const emit = (v: unknown) => out.enqueue(new TextEncoder().encode(`${JSON.stringify(v)}\n`));
   const proc = {
     stdin: {
       write(data: string) {

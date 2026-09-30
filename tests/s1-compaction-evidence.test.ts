@@ -38,7 +38,7 @@ function fixture(resume = 'ref-3') {
     spawn: () => proc,
   });
   const emit = (raw: unknown) =>
-    output.enqueue(new TextEncoder().encode(JSON.stringify(raw) + '\n'));
+    output.enqueue(new TextEncoder().encode(`${JSON.stringify(raw)}\n`));
   const of = (kind: SessionEvent['kind']) => session.events.filter((e) => e.kind === kind);
   const inits = () =>
     session.events.filter(

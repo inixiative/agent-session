@@ -207,7 +207,7 @@ export class SubscriptionPool {
       if (!config.id || this._instances.has(config.id))
         throw Error(`Duplicate or empty instance id "${config.id}"`);
       const descriptor = TRANSPORTS[config.transport];
-      if (!descriptor || descriptor.status !== 'implemented' || descriptor.runtime === 'external')
+      if (descriptor?.status !== 'implemented' || descriptor.runtime === 'external')
         throw Error(`Instance ${config.id}: transport "${config.transport}" cannot be pooled`);
       const runtime = descriptor.runtime;
       const variable = PROFILE_VARIABLE[runtime];

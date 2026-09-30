@@ -91,7 +91,7 @@ test('session diagnostics use explicit labels/counts and preserve two-admission 
 test('split UTF8 / newline frames retain framing evidence without persisting original bytes', () => {
   const f = new FrameRecorder(new Sanitizer());
   const bytes = new TextEncoder().encode(
-    JSON.stringify({ type: 'result', result: 'secret café S0_PROBE_OK', is_error: false }) + '\n',
+    `${JSON.stringify({ type: 'result', result: 'secret café S0_PROBE_OK', is_error: false })}\n`,
   );
   for (const byte of bytes) f.chunk(new Uint8Array([byte]));
   f.end();

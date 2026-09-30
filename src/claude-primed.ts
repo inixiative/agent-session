@@ -485,7 +485,7 @@ export class ClaudePrimedSessions implements PrimedSessions {
     session.spare = undefined;
     let admissionId: string | undefined;
     try {
-      if (!branch || !branch.session.alive) {
+      if (!branch?.session.alive) {
         await this._dispose(branch);
         branch = this._branch(session);
         try {

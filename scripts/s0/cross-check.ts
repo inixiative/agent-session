@@ -50,7 +50,7 @@ const [stdout, stderr, exitCode] = await Promise.all([
   p.exited,
 ]);
 const after = await snapshot();
-writeFileSync(join(dir, 'check.log'), stdout + '\n' + stderr);
+writeFileSync(join(dir, 'check.log'), `${stdout}\n${stderr}`);
 const foundryReport = stdout.match(/Evidence: (.+\/report\.json)/)?.[1];
 const passed = exitCode === 0 && before.sha256 === after.sha256;
 writeFileSync(
