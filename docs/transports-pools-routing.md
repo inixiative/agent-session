@@ -8,7 +8,7 @@ Status: implemented in 0.2.0. Verified against codex-cli 0.155.1, claude 2.1.281
 - **agent-session** owns sessions, how they reach a model (transports), pools of
   subscription instances, routing across them, limit polling and continuity.
 - **Foundry** decides which work needs what: roles, priorities, prompts, what is primed.
-- **Kingdom/Kastle** owns authority and capacity accounting: which instances,
+- **Kingdom** owns authority and capacity accounting: which instances,
   organizations and preferences a caller may use. Routing never widens a grant.
 
 ## Transports
