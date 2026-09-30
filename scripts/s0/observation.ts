@@ -7,9 +7,15 @@ export class CaptureState {
   private outboundObserverFailed = false;
   readonly observerErrors: string[] = [];
 
-  admitSend() { this.sendAdmitted = true; }
+  admitSend() {
+    this.sendAdmitted = true;
+  }
   observe(fn: () => void) {
-    try { fn(); } catch { this.observerErrors.push("observation-failed"); }
+    try {
+      fn();
+    } catch {
+      this.observerErrors.push('observation-failed');
+    }
   }
   write(data: string, observe: (data: string) => boolean, forward: (data: string) => void) {
     this.attemptedWrites++;
@@ -19,21 +25,30 @@ export class CaptureState {
       if (!provenNonTurn) this.possibleTurnWrite = true;
     } catch {
       this.outboundObserverFailed = true;
-      this.observerErrors.push("outbound-observation-failed");
+      this.observerErrors.push('outbound-observation-failed');
     }
     // Preserve exactly one original transport write and its original exception.
     forward(data);
   }
   noTurn() {
-    return !this.sendAdmitted && !this.possibleTurnWrite && !this.outboundObserverFailed
-      && this.attemptedWrites === this.observedWrites;
+    return (
+      !this.sendAdmitted &&
+      !this.possibleTurnWrite &&
+      !this.outboundObserverFailed &&
+      this.attemptedWrites === this.observedWrites
+    );
   }
   cleanupAllowed(nativeTerminalObserved: boolean, processExited: boolean) {
     return nativeTerminalObserved || processExited || this.noTurn();
   }
   snapshot() {
-    return { sendAdmitted: this.sendAdmitted, attemptedWrites: this.attemptedWrites,
-      observedWrites: this.observedWrites, possibleTurnWrite: this.possibleTurnWrite,
-      outboundObserverFailed: this.outboundObserverFailed, noTurn: this.noTurn() };
+    return {
+      sendAdmitted: this.sendAdmitted,
+      attemptedWrites: this.attemptedWrites,
+      observedWrites: this.observedWrites,
+      possibleTurnWrite: this.possibleTurnWrite,
+      outboundObserverFailed: this.outboundObserverFailed,
+      noTurn: this.noTurn(),
+    };
   }
 }

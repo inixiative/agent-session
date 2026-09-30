@@ -13,9 +13,9 @@
 // tool, command or approval activity is a violation that fails the decision.
 // ---------------------------------------------------------------------------
 
-import { createHash } from "node:crypto";
-import type { SessionTokens } from "./harness-session";
-import type { LimitSnapshot } from "./limits";
+import { createHash } from 'node:crypto';
+import type { SessionTokens } from './harness-session';
+import type { LimitSnapshot } from './limits';
 
 export interface PrimeSpec {
   /** Session identity. One live primed session per key. */
@@ -31,7 +31,7 @@ export interface PrimeSpec {
 export interface DecisionAdmission {
   readonly admissionId: string;
   readonly key: string;
-  readonly runtime: "codex" | "claude";
+  readonly runtime: 'codex' | 'claude';
   /** Native identity of the branch the decision will run on, when known before the write. */
   readonly threadId?: string;
 }
@@ -58,16 +58,31 @@ export interface DecisionResult {
   readonly threadId?: string;
   readonly turnId?: string;
   /** `warm`: forked from the key's primed state; `cold`: ran inline (no primed session for this context yet). */
-  readonly prime: "warm" | "cold";
+  readonly prime: 'warm' | 'cold';
   /** A second branch was started for this slow decision; the result is the first to finish. */
   readonly hedged?: boolean;
   /** The runtime fell back from websockets to HTTPS during this decision's turn. */
   readonly transportFallback?: boolean;
-  readonly timing: { readonly waitMs: number; readonly primeMs: number; readonly branchMs: number; readonly turnMs: number };
+  readonly timing: {
+    readonly waitMs: number;
+    readonly primeMs: number;
+    readonly branchMs: number;
+    readonly turnMs: number;
+  };
 }
 
 export type DecisionFailure =
-  | "closed" | "busy" | "admission" | "rate-limited" | "auth" | "timeout" | "aborted" | "violation" | "transport" | "native-failed" | "prime-failed";
+  | 'closed'
+  | 'busy'
+  | 'admission'
+  | 'rate-limited'
+  | 'auth'
+  | 'timeout'
+  | 'aborted'
+  | 'violation'
+  | 'transport'
+  | 'native-failed'
+  | 'prime-failed';
 
 /**
  * `dispatch: "not-dispatched"`: no model input was written for this decision.
@@ -77,31 +92,42 @@ export class DecisionError extends Error {
   constructor(
     message: string,
     readonly reason: DecisionFailure,
-    readonly dispatch: "not-dispatched" | "attempted",
+    readonly dispatch: 'not-dispatched' | 'attempted',
     readonly settled: boolean,
     readonly admissionId?: string,
     options?: ErrorOptions,
   ) {
     super(message, options);
-    this.name = "DecisionError";
+    this.name = 'DecisionError';
   }
   /** A second branch was started for this decision before it failed; both were stopped. */
   hedged?: boolean;
 }
 
 export type PrimedEvent =
-  | { readonly type: "process-started"; readonly generation: number; readonly ms: number }
-  | { readonly type: "process-recycled"; readonly generation: number; readonly reason: string }
-  | { readonly type: "primed"; readonly key: string; readonly hash: string; readonly ms: number }
-  | { readonly type: "evicted"; readonly key: string; readonly reason: "idle" | "capacity" | "reprime" | "requested" | "process-lost" | "close" }
-  | { readonly type: "decision"; readonly key: string; readonly prime: "warm" | "cold"; readonly ms: number; readonly cacheRead?: number; readonly input?: number }
-  | { readonly type: "limits"; readonly limits: LimitSnapshot }
-  | { readonly type: "violation"; readonly key: string; readonly detail: string }
-  | { readonly type: "hedged"; readonly key: string; readonly afterMs: number }
-  | { readonly type: "transport-fallback"; readonly key: string };
+  | { readonly type: 'process-started'; readonly generation: number; readonly ms: number }
+  | { readonly type: 'process-recycled'; readonly generation: number; readonly reason: string }
+  | { readonly type: 'primed'; readonly key: string; readonly hash: string; readonly ms: number }
+  | {
+      readonly type: 'evicted';
+      readonly key: string;
+      readonly reason: 'idle' | 'capacity' | 'reprime' | 'requested' | 'process-lost' | 'close';
+    }
+  | {
+      readonly type: 'decision';
+      readonly key: string;
+      readonly prime: 'warm' | 'cold';
+      readonly ms: number;
+      readonly cacheRead?: number;
+      readonly input?: number;
+    }
+  | { readonly type: 'limits'; readonly limits: LimitSnapshot }
+  | { readonly type: 'violation'; readonly key: string; readonly detail: string }
+  | { readonly type: 'hedged'; readonly key: string; readonly afterMs: number }
+  | { readonly type: 'transport-fallback'; readonly key: string };
 
 export interface PrimedSnapshot {
-  readonly runtime: "codex" | "claude";
+  readonly runtime: 'codex' | 'claude';
   readonly closed: boolean;
   readonly generation: number;
   readonly processAlive: boolean;
@@ -112,7 +138,7 @@ export interface PrimedSnapshot {
 }
 
 export interface PrimedSessions {
-  readonly runtime: "codex" | "claude";
+  readonly runtime: 'codex' | 'claude';
   decide(spec: PrimeSpec, request: DecisionRequest): Promise<DecisionResult>;
   /** Drop a key's primed session; the next decision re-primes it. */
   evict(key: string): Promise<void>;
@@ -122,42 +148,92 @@ export interface PrimedSessions {
 }
 
 export function primeHash(spec: PrimeSpec): string {
-  return spec.hash ?? createHash("sha256").update(spec.instructions).update("\0").update(spec.context ?? "").digest("hex");
+  return (
+    spec.hash ??
+    createHash('sha256')
+      .update(spec.instructions)
+      .update('\0')
+      .update(spec.context ?? '')
+      .digest('hex')
+  );
 }
 
 /** FIFO counting semaphore with deadline-bounded waits. */
 export class Slots {
   private _active = 0;
-  private _waiters: Array<{ grant(): void; fail(error: Error): void; timer: ReturnType<typeof setTimeout> }> = [];
+  private _waiters: Array<{
+    grant(): void;
+    fail(error: Error): void;
+    timer: ReturnType<typeof setTimeout>;
+  }> = [];
   constructor(private readonly _limit: number) {
-    if (!Number.isSafeInteger(_limit) || _limit < 1) throw Error("Concurrency limit must be a positive integer");
+    if (!Number.isSafeInteger(_limit) || _limit < 1)
+      throw Error('Concurrency limit must be a positive integer');
   }
-  get active() { return this._active; }
-  get waiting() { return this._waiters.length; }
+  get active() {
+    return this._active;
+  }
+  get waiting() {
+    return this._waiters.length;
+  }
   acquire(deadline: number, signal?: AbortSignal): Promise<() => void> {
-    if (signal?.aborted) return Promise.reject(new DecisionError("Decision aborted before dispatch", "aborted", "not-dispatched", true));
+    if (signal?.aborted)
+      return Promise.reject(
+        new DecisionError('Decision aborted before dispatch', 'aborted', 'not-dispatched', true),
+      );
     const release = () => {
       let released = false;
       return () => {
-        if (released) return; released = true;
+        if (released) return;
+        released = true;
         const next = this._waiters.shift();
-        if (next) { clearTimeout(next.timer); next.grant(); } else this._active--;
+        if (next) {
+          clearTimeout(next.timer);
+          next.grant();
+        } else this._active--;
       };
     };
-    if (this._active < this._limit) { this._active++; return Promise.resolve(release()); }
+    if (this._active < this._limit) {
+      this._active++;
+      return Promise.resolve(release());
+    }
     return new Promise((resolve, reject) => {
       const leave = (error: DecisionError) => {
         const index = this._waiters.indexOf(waiter);
-        signal?.removeEventListener("abort", onAbort);
-        if (index >= 0) { this._waiters.splice(index, 1); clearTimeout(waiter.timer); reject(error); }
+        signal?.removeEventListener('abort', onAbort);
+        if (index >= 0) {
+          this._waiters.splice(index, 1);
+          clearTimeout(waiter.timer);
+          reject(error);
+        }
       };
-      const onAbort = () => leave(new DecisionError("Decision aborted before dispatch", "aborted", "not-dispatched", true));
+      const onAbort = () =>
+        leave(
+          new DecisionError('Decision aborted before dispatch', 'aborted', 'not-dispatched', true),
+        );
       const waiter = {
-        grant: () => { signal?.removeEventListener("abort", onAbort); resolve(release()); },
-        fail: (error: Error) => { signal?.removeEventListener("abort", onAbort); reject(error); },
-        timer: setTimeout(() => leave(new DecisionError("Decision expired waiting for a session slot", "busy", "not-dispatched", true)), Math.max(0, deadline - Date.now())),
+        grant: () => {
+          signal?.removeEventListener('abort', onAbort);
+          resolve(release());
+        },
+        fail: (error: Error) => {
+          signal?.removeEventListener('abort', onAbort);
+          reject(error);
+        },
+        timer: setTimeout(
+          () =>
+            leave(
+              new DecisionError(
+                'Decision expired waiting for a session slot',
+                'busy',
+                'not-dispatched',
+                true,
+              ),
+            ),
+          Math.max(0, deadline - Date.now()),
+        ),
       };
-      signal?.addEventListener("abort", onAbort, { once: true });
+      signal?.addEventListener('abort', onAbort, { once: true });
       this._waiters.push(waiter);
     });
   }
@@ -167,15 +243,22 @@ export class Slots {
     this._active++;
     let released = false;
     return () => {
-      if (released) return; released = true;
+      if (released) return;
+      released = true;
       const next = this._waiters.shift();
-      if (next) { clearTimeout(next.timer); next.grant(); } else this._active--;
+      if (next) {
+        clearTimeout(next.timer);
+        next.grant();
+      } else this._active--;
     };
   }
 
   /** Reject every waiter (close). Held slots are released by their owners. */
   drain(error: Error): void {
-    for (const waiter of this._waiters.splice(0)) { clearTimeout(waiter.timer); waiter.fail(error); }
+    for (const waiter of this._waiters.splice(0)) {
+      clearTimeout(waiter.timer);
+      waiter.fail(error);
+    }
   }
 }
 
@@ -185,10 +268,17 @@ export class KeyedQueue {
   run<T>(key: string, task: () => Promise<T>): Promise<T> {
     const prior = this._tails.get(key) ?? Promise.resolve();
     const result = prior.then(task, task);
-    const tail = result.then(() => undefined, () => undefined);
+    const tail = result.then(
+      () => undefined,
+      () => undefined,
+    );
     this._tails.set(key, tail);
-    void tail.then(() => { if (this._tails.get(key) === tail) this._tails.delete(key); });
+    void tail.then(() => {
+      if (this._tails.get(key) === tail) this._tails.delete(key);
+    });
     return result;
   }
-  get size() { return this._tails.size; }
+  get size() {
+    return this._tails.size;
+  }
 }
