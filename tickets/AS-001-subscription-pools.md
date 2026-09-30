@@ -23,4 +23,4 @@ Allow agent-session to use a configured pool of authenticated subscriptions as s
 - Pool membership grants nothing: callers supply the instances, organizations and preferences they may use; routing filters by them and never widens them.
 - See [docs/transports-pools-routing.md](../docs/transports-pools-routing.md).
 
-**Remaining:** instances are configured by the caller; enrollment of new logins and Kastle-supplied instance lists are out of scope here.
+**Remaining:** instances are configured by the caller; enrollment of new logins and Kingdom-supplied instance lists are out of scope here.

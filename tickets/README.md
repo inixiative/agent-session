@@ -19,9 +19,9 @@ The goal is to spread session workloads over available subscriptions and preserv
 ## Responsibilities
 
 - **agent-session:** manage sessions, allocate execution from configured pools, and continue work within caller-supplied policies.
-- **Kastle:** supply the available capacity and policies, including priorities and work/personal boundaries.
+- **Kingdom:** supply the available capacity and policies, including priorities and work/personal boundaries.
 - **Archive:** preserve and retrieve session history, including attribution of the capacity used.
 
-Pooling should remain usable by consumers other than Kastle. It is not a prerequisite for Archive's storage, search, and sync MVP.
+Pooling should remain usable by consumers other than Kingdom. It is not a prerequisite for Archive's storage, search, and sync MVP.
 
 Provider-specific support is declared per transport (AS-004). It does not imply that every native harness supports every account switch or that different providers are interchangeable.

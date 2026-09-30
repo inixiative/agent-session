@@ -9,7 +9,7 @@
 // identity says the native history is shared.
 //
 // The session is the work; an instance supplies capacity. Pool membership
-// grants nothing by itself: callers (Kastle, Foundry) supply the instances and
+// grants nothing by itself: callers (Kingdom, Foundry) supply the instances and
 // the organization/preference policy they are allowed to use.
 // ---------------------------------------------------------------------------
 
