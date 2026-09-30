@@ -1,5 +1,4 @@
 {
-  "extends": [
-    "@inixiative/config/biome/base.json"
-  ]
+  "extends": ["@inixiative/config/biome/base.json"],
+  "files": { "includes": ["!fixtures"] }
 }
