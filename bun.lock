@@ -6,7 +6,7 @@
       "name": "@inixiative/agent-session",
       "devDependencies": {
         "@biomejs/biome": "2.5.2",
-        "@inixiative/config": "^0.5.44",
+        "@inixiative/config": "^0.5.45",
         "@types/bun": "1.4.2",
         "lefthook": "2.1.9",
         "typescript": "6.0.3",
@@ -32,7 +32,7 @@
 
     "@biomejs/cli-win32-x64": ["@biomejs/cli-win32-x64@2.5.2", "", { "os": "win32", "cpu": "x64" }, "sha512-4InchVpdVmdkkkgjQqKpgvyu+VPnoF/7RPSw5YATgEVpt2j72wcCAeV5TwaE9ZGJUZWZn7v2CwSAj6CrMJEx8A=="],
 
-    "@inixiative/config": ["@inixiative/config@0.5.44", "", { "peerDependencies": { "@biomejs/biome": ">=2.5.0", "tsup": ">=8.5.0", "typescript": ">=6.0.0" }, "optionalPeers": ["@biomejs/biome", "tsup", "typescript"], "bin": { "inixiative-config": "dist/cli.js" } }, "sha512-xObRB1SV7aFR6syrN3WQWgqjJsgjIi/4rTdt3kpYzfzKRzNL7dSE4fgfkcqnPw/v4EAHHkv058w0OkMa34Rjog=="],
+    "@inixiative/config": ["@inixiative/config@0.5.45", "", { "peerDependencies": { "@biomejs/biome": ">=2.5.0", "tsup": ">=8.5.0", "typescript": ">=6.0.0" }, "optionalPeers": ["@biomejs/biome", "tsup", "typescript"], "bin": { "inixiative-config": "dist/cli.js" } }, "sha512-F8w47n/37O9SOMgNKLNa/a5Fqo10QTvT5DHwCMqMHJSdByPif7oS7ibsz4LtgvTt0QQJOehWdA9usAhEzp7s2A=="],
 
     "@types/bun": ["@types/bun@1.4.2", "", { "dependencies": { "bun-types": "1.4.2" } }, "sha512-GimotNn7+ZV0uVArItBbriZsR1oNf0+WTzPkdcFrzShI7k2norL0uzEaJT8T33dWr7O/c9ZDuAFQrctKCi72oQ=="],
 
