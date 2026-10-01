@@ -27,6 +27,8 @@ interface DoubleOptions {
   orphans?: string[];
   behavior?: (input: string, occurrence: number) => Behavior;
   forkError?: boolean;
+  /** Instruction files the thread reports loading (a shared CODEX_HOME's AGENTS.md). */
+  instructionSources?: string[];
 }
 
 /** codex app-server double: persisted threads, forks, turns and account reads. */
@@ -85,6 +87,7 @@ function appServer(opts: DoubleOptions = {}) {
           return reply({
             thread: { id, status: { type: 'idle' }, turns: [] },
             model: 'gpt-observed',
+            instructionSources: opts.instructionSources ?? [],
           });
         }
         case 'thread/fork': {
@@ -100,6 +103,7 @@ function appServer(opts: DoubleOptions = {}) {
           return reply({
             thread: { id, status: { type: 'idle' }, turns: [] },
             model: 'gpt-observed',
+            instructionSources: opts.instructionSources ?? [],
           });
         }
         case 'turn/start': {
@@ -248,6 +252,22 @@ describe('CodexPrimedSessions', () => {
     });
   });
 
+  test('a thread that loaded instructions is refused before any turn: priming and deciding', async () => {
+    const d = appServer({ instructionSources: ['/home/user/.codex/AGENTS.md'] });
+    const { h } = host(d);
+    // Priming is best-effort: the persisted thread is deleted and nothing is installed.
+    await h.prime(spec);
+    const [persisted] = d.requests('thread/start').filter((r) => r.params.ephemeral === false);
+    await tick();
+    expect(d.requests('thread/delete').map((r) => r.params.threadId)).toContain(`thread-1`);
+    expect(persisted).toBeDefined();
+    const decided = await h.decide(spec, { input: 'q' }).catch((error: unknown) => error);
+    expect(decided).toBeInstanceOf(DecisionError);
+    expect(decided).toMatchObject({ reason: 'violation', dispatch: 'not-dispatched' });
+    expect((decided as Error).message).toContain('/home/user/.codex/AGENTS.md');
+    expect(d.requests('turn/start')).toHaveLength(0);
+  });
+
   test('a miss decides inline at once and primes off-path; later cycles fork the primed thread', async () => {
     const d = appServer();
     const { h, events } = host(d);
@@ -266,7 +286,6 @@ describe('CodexPrimedSessions', () => {
       sandbox: 'read-only',
       approvalPolicy: 'never',
       config: {
-        'mcp_servers.node_repl.enabled': false,
         notify: [],
         include_environment_context: false,
       },
@@ -298,7 +317,7 @@ describe('CodexPrimedSessions', () => {
         ephemeral: true,
         developerInstructions: 'ROLE',
         baseInstructions: 'BASE',
-        config: { 'mcp_servers.node_repl.enabled': false },
+        config: { notify: [], project_doc_max_bytes: 0 },
       });
     expect(new Set(forks.map((f) => f.params.threadId))).toEqual(new Set([primer.threadId]));
     // Warm decisions send only the cycle input and never run on the primed thread itself.

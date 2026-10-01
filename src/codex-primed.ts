@@ -75,15 +75,19 @@ export const CODEX_DECISION_DISABLED_FEATURES: readonly string[] = [
 ];
 
 /**
- * Per-thread configuration for decisions: no notify hook, no built-in MCP server,
- * no project docs or skills, and none of the instruction surfaces that describe
- * tools or the environment. Applied on thread/start and thread/fork (verified
- * equivalent to launch-level `-c` overrides), so the launch argv carries only
- * approval, web-search and feature flags that credential launchers accept.
+ * Per-thread configuration for decisions: no notify hook, no project docs or skills,
+ * and none of the instruction surfaces that describe tools or the environment.
+ * Applied on thread/start and thread/fork (verified equivalent to launch-level `-c`
+ * overrides), so the launch argv carries only approval, web-search and feature flags
+ * that credential launchers accept.
+ *
+ * The user's own CODEX_HOME (its AGENTS.md, memories, MCP servers) is not a thread
+ * setting: run decisions on a private CODEX_HOME holding only the login. A thread
+ * that reports an instruction source is refused, and an MCP server that starts is a
+ * violation.
  */
 export const CODEX_DECISION_THREAD_CONFIG: Readonly<Record<string, unknown>> = Object.freeze({
   notify: [],
-  'mcp_servers.node_repl.enabled': false,
   project_doc_max_bytes: 0,
   'skills.enabled': false,
   include_permissions_instructions: false,
@@ -212,6 +216,19 @@ interface Branch {
   attention: Promise<void>;
   wake(): void;
 }
+
+/** Instruction files Codex loaded into a thread (the user's AGENTS.md, project docs); a decision allows none. */
+const instructionSources = (response: Record<string, unknown> | undefined): string | undefined => {
+  const sources = response?.instructionSources;
+  return Array.isArray(sources) && sources.length ? sources.map(String).join(', ') : undefined;
+};
+const instructionLeak = (sources: string) =>
+  new DecisionError(
+    `Codex loaded instructions into a decision thread (${sources}); run decisions on a private CODEX_HOME`,
+    'violation',
+    'not-dispatched',
+    true,
+  );
 
 const object = (value: unknown): Record<string, unknown> | undefined =>
   value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -1045,6 +1062,11 @@ export class CodexPrimedSessions implements PrimedSessions {
         'not-dispatched',
         true,
       );
+    const leaked = instructionSources(started);
+    if (leaked) {
+      void conn.request('thread/delete', { threadId: baseId }, 10_000).catch(() => undefined);
+      throw instructionLeak(leaked);
+    }
     const branch = this._branch(conn, baseId, spec.key);
     let ok = false;
     try {
@@ -1287,6 +1309,8 @@ export class CodexPrimedSessions implements PrimedSessions {
       );
       const id = object(response?.thread)?.id;
       if (typeof id !== 'string' || !id) throw Error('Codex returned no decision thread');
+      const leaked = instructionSources(response);
+      if (leaked) throw instructionLeak(leaked);
       model ??= typeof response?.model === 'string' ? response.model : undefined;
       return { threadId: id, branch: this._branch(conn, id, spec.key) };
     };
@@ -1294,6 +1318,7 @@ export class CodexPrimedSessions implements PrimedSessions {
       if (Date.now() >= deadline || signal?.aborted) throw expired();
       const t1 = performance.now();
       const opened = await openBranch().catch((error) => {
+        if (error instanceof DecisionError) throw error;
         // The runtime refusing the fork means the primed thread is gone: retire it and prime again off-path.
         // A timeout proves nothing about the primed thread.
         if (session && error instanceof JsonRpcError) this._retire(session, 'reprime');
