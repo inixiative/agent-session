@@ -111,8 +111,8 @@ tag when one role runs under several instructions.
 | Reset | `thread/fork` (ephemeral) through the primer turn, restating the instructions | `--resume <primed> --fork-session --no-session-persistence` |
 | Warm path | fork ≈ 60–90 ms, then the turn | pre-spawned spare fork: no process start |
 | Cleanup | fork unsubscribed; primed thread deleted on eviction/close; orphans in the private cwd swept at start | forks write no history; the primed transcript is deleted on eviction/close, and leftovers for the private cwd are swept on first use |
-| Text-only | features, plugins, MCP (node_repl), notify, tool instructions disabled at launch; read-only sandbox; approvals never | `--safe-mode --tools "" --strict-mcp-config …` |
-| Violations | non-text item, MCP startup or server request → interrupt, recycle process | tool activity → decision fails |
+| Text-only | features, plugins, notify, project docs, tool instructions disabled; read-only sandbox; approvals never; run on a private `CODEX_HOME` holding only the login (the user's AGENTS.md, memories and MCP servers live in theirs) | `--safe-mode --tools "" --strict-mcp-config …` |
+| Violations | a thread reporting `instructionSources` → refused before any turn; non-text item, MCP startup or server request → interrupt, recycle process | tool activity → decision fails |
 
 Why fork and not rollback: codex-cli 0.155.1 refuses rollback on both thread
 kinds (above), and ephemeral threads cannot be forked ("no rollout found"), so

@@ -96,6 +96,11 @@ const result = await decisions.decide(
 );
 ```
 
+Run Codex decisions on a private `CODEX_HOME` that holds only the login (link
+`auth.json` from the account's home; a copy forks its refresh token): Codex has no
+setting that drops the user's own `AGENTS.md`, and a decision thread that reports
+any instruction source is refused.
+
 Codex hosts every key as a thread of one `app-server` process per account and
 forks the primed thread per cycle; Claude forks a persisted primed session with
 a pre-spawned spare. Measured on a ChatGPT login: warm Codex decisions 2.45 s
