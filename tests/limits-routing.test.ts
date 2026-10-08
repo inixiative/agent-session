@@ -518,3 +518,73 @@ describe('flexible ordering', () => {
     expect(order({ ordering: 'priority-strict' }, accounts)).toEqual(['c', 'd', 'a', 'b']);
   });
 });
+
+describe('billing', () => {
+  const base = {
+    runtime: 'codex' as const,
+    model: 'worker',
+    effort: 'medium',
+    now: 1000,
+    maximumObservationAgeMs: 500,
+  };
+  const paid = (id: string, percent: number): SubscriptionCandidate => ({
+    ...account(id, percent),
+    authentication: 'api-key',
+  });
+
+  test('subscription only by default: api-key capacity is excluded as billing', () => {
+    const { candidates, excluded } = rankCandidates(base, [paid('paid', 0), account('sub', 80)]);
+    expect(candidates.map((c) => c.accountId)).toEqual(['sub']);
+    expect(excluded).toEqual({ paid: 'billing' });
+  });
+
+  test('a caller may widen billing, and widening never implies the other mode', () => {
+    expect(
+      rankCandidates({ ...base, allowedBilling: ['api-key'] }, [paid('paid', 0), account('sub', 0)])
+        .excluded,
+    ).toEqual({ sub: 'billing' });
+    expect(
+      rankCandidates({ ...base, allowedBilling: ['subscription', 'api-key'] }, [
+        paid('paid', 10),
+        account('sub', 90),
+      ]).candidates.map((c) => c.accountId),
+    ).toEqual(['paid', 'sub']);
+    expect(
+      rankCandidates({ ...base, allowedBilling: [] }, [paid('paid', 0), account('sub', 0)])
+        .candidates,
+    ).toEqual([]);
+  });
+
+  test('widening billing does not relax any other gate', () => {
+    const { candidates, excluded } = rankCandidates(
+      { ...base, organizationId: 'org', allowedBilling: ['api-key'] },
+      [
+        { ...paid('blocked', 10), blocked: true },
+        paid('exhausted', 100),
+        { ...paid('occupied', 10), activeRuns: 1 },
+        { ...paid('foreign', 10), organizationIds: ['other'] },
+        { ...paid('wrong-model', 10), models: { other: ['medium'] } },
+        { ...paid('unread', 0), windows: [] },
+        paid('ok', 10),
+      ],
+    );
+    expect(candidates.map((c) => c.accountId)).toEqual(['ok']);
+    expect(excluded).toEqual({
+      blocked: 'blocked',
+      exhausted: 'exhausted',
+      occupied: 'occupied',
+      foreign: 'organization',
+      'wrong-model': 'model',
+      unread: 'no-observation',
+    });
+  });
+
+  test('api-key capacity ranks on priority and utilization like any other', () => {
+    expect(
+      rankCandidates({ ...base, allowedBilling: ['api-key'], ordering: 'priority-strict' }, [
+        { ...paid('tier2', 0), priority: 1 },
+        { ...paid('tier1', 50), priority: 0 },
+      ]).candidates.map((c) => c.accountId),
+    ).toEqual(['tier1', 'tier2']);
+  });
+});

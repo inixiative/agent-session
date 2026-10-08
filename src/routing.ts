@@ -20,6 +20,7 @@
 // ---------------------------------------------------------------------------
 
 import type { OrderBy, SortDir } from '@inixiative/json-rules';
+import { orderRecords } from '@inixiative/json-rules';
 
 export type { OrderBy, SortDir };
 
@@ -127,6 +128,16 @@ export interface SubscriptionCandidate {
  */
 export type UnknownUtilizationPolicy = 'exclude' | 'rank-last';
 
+/**
+ * How an instance is paid for. Routing serves only `subscription` unless the
+ * caller widens it: spending real money is the caller's decision, never a
+ * routing default. Kingdom widens to `api-key`, where a run's spend is bounded
+ * by its allocation policies.
+ */
+export type BillingMode = 'subscription' | 'api-key';
+
+const DEFAULT_BILLING: readonly BillingMode[] = ['subscription'];
+
 export interface RoutingRequest {
   repository: string;
   organizationId?: string;
@@ -138,6 +149,7 @@ export interface RoutingRequest {
   ordering?: OrderingSpec;
   pinned?: boolean;
   unknownUtilization?: UnknownUtilizationPolicy;
+  allowedBilling?: readonly BillingMode[];
 }
 
 /** Repository resolution already done by the caller (or not needed). */
@@ -153,6 +165,8 @@ export interface CandidateRequest {
   /** Only the preferred instance may serve; others are excluded as `not-pinned`. */
   pinned?: boolean;
   unknownUtilization?: UnknownUtilizationPolicy;
+  /** Billing modes this request may use. Default: subscription only. */
+  allowedBilling?: readonly BillingMode[];
 }
 
 export interface RankedCandidate {
@@ -167,7 +181,7 @@ export interface RankedCandidate {
 
 export type ExclusionReason =
   | 'disabled'
-  | 'not-subscription'
+  | 'billing'
   | 'organization'
   | 'runtime'
   | 'model'
@@ -229,7 +243,8 @@ export function assessCandidate(
   )
     return { excluded: 'invalid' };
   if (!account.enabled) return { excluded: 'disabled' };
-  if (account.authentication !== 'subscription') return { excluded: 'not-subscription' };
+  if (!(request.allowedBilling ?? DEFAULT_BILLING).includes(account.authentication))
+    return { excluded: 'billing' };
   if (
     request.organizationId !== undefined &&
     !account.organizationIds.includes(request.organizationId)
@@ -275,20 +290,16 @@ export function assessCandidate(
   return { utilizationPercent: Math.max(...fractions) };
 }
 
-const FIELD_VALUE: Record<RoutingField, (candidate: RankedCandidate) => number | null> = {
-  priority: (c) => c.priority,
-  utilization: (c) => c.utilizationPercent,
-  quartile: (c) => c.quartile,
-  headroom: (c) => c.headroom,
-  preferred: (c) => Number(c.preferred),
-};
-
-/** Nulls last in either direction: an unknown reading never outranks a known one. */
-const compare = (a: number | null, b: number | null, dir: SortDir): number => {
-  if (a === null) return b === null ? 0 : 1;
-  if (b === null) return -1;
-  return dir === 'desc' ? b - a : a - b;
-};
+/** Term fields as own properties, so json-rules orders them by name. */
+const sortKey = (candidate: RankedCandidate, index: number) => ({
+  index,
+  priority: candidate.priority,
+  utilization: candidate.utilizationPercent,
+  quartile: candidate.quartile,
+  headroom: candidate.headroom,
+  preferred: Number(candidate.preferred),
+  id: candidate.accountId,
+});
 
 /** Rank eligible candidates deterministically (ties broken by id). */
 export function rankCandidates(
@@ -329,14 +340,8 @@ export function rankCandidates(
       },
     ];
   });
-  ranked.sort((a, b) => {
-    for (const { field, dir } of ordering) {
-      const order = compare(FIELD_VALUE[field](a), FIELD_VALUE[field](b), dir);
-      if (order !== 0) return order;
-    }
-    return a.accountId.localeCompare(b.accountId);
-  });
-  return { candidates: ranked, excluded, ordering };
+  const ordered = orderRecords(ranked.map(sortKey), [...ordering, { field: 'id', dir: 'asc' }]);
+  return { candidates: ordered.map((key) => ranked[key.index]!), excluded, ordering };
 }
 
 /** The draft's repository-scoped entry point: resolve ownership, then rank. */
@@ -373,6 +378,7 @@ export function rankSubscriptionAccounts(
       ...(request.unknownUtilization !== undefined
         ? { unknownUtilization: request.unknownUtilization }
         : {}),
+      ...(request.allowedBilling !== undefined ? { allowedBilling: request.allowedBilling } : {}),
     },
     accounts,
   );

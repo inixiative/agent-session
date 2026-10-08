@@ -1,6 +1,6 @@
 {
   "name": "@inixiative/agent-session",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Drive coding-agent CLIs as persistent, streaming, event-captured sessions over interchangeable transports, with primed decision sessions, subscription pools, routing, limit polling and continuity.",
   "type": "module",
   "main": "src/index.ts",
@@ -35,7 +35,7 @@
   ],
   "license": "MIT",
   "dependencies": {
-    "@inixiative/json-rules": "^3.4.1"
+    "@inixiative/json-rules": "^3.5.0"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.2",
