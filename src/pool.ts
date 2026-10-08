@@ -20,8 +20,9 @@ import { type LimitSnapshot, mergeLimits } from './limits';
 import { probeClaudeLimits, probeCodexLimits } from './limits-probe';
 import {
   type ExclusionReason,
+  type OrderingSpec,
   type RankedCandidate,
-  type RoutingMode,
+  type ResolvedOrdering,
   rankCandidates,
   type SubscriptionCandidate,
 } from './routing';
@@ -48,6 +49,8 @@ export interface InstanceConfig {
   readonly models?: Readonly<Record<string, readonly string[]>>;
   /** Concurrent leases. Default 1. */
   readonly concurrencyLimit?: number;
+  /** Lower serves first under a priority ordering. Default 0. */
+  readonly priority?: number;
   readonly enabled?: boolean;
   readonly authentication?: 'subscription' | 'api-key';
   /** Session config merged into every session opened on this instance (bin, spawn, SDK query…). */
@@ -60,7 +63,9 @@ export interface PoolRequest {
   readonly effort?: string;
   readonly organizationId?: string;
   readonly preferredInstanceId?: string;
-  readonly mode?: RoutingMode;
+  readonly ordering?: OrderingSpec;
+  /** Only the preferred instance may serve. Requires preferredInstanceId. */
+  readonly pinned?: boolean;
   /** Restrict to these transports (e.g. only resumable ones). */
   readonly transports?: readonly TransportKind[];
   readonly excludeInstanceIds?: readonly string[];
@@ -90,8 +95,8 @@ export type PoolEvent =
       readonly leaseId: string;
       readonly instanceId: string;
       readonly transport: PooledTransport;
-      readonly mode: RoutingMode;
-      readonly utilizationPercent: number;
+      readonly ordering: ResolvedOrdering;
+      readonly utilizationPercent: number | null;
       readonly rank: number;
     }
   | { readonly type: 'released'; readonly leaseId: string; readonly instanceId: string }
@@ -288,6 +293,7 @@ export class SubscriptionPool {
   rank(request: PoolRequest): {
     candidates: RankedCandidate[];
     excluded: Record<string, ExclusionReason>;
+    ordering: ResolvedOrdering;
   } {
     const now = this._now();
     const effort = request.effort ?? 'default';
@@ -304,6 +310,7 @@ export class SubscriptionPool {
         models: state.config.models ?? { [request.model]: [effort] },
         activeRuns: state.leases.size,
         concurrencyLimit: state.config.concurrencyLimit ?? 1,
+        priority: state.config.priority ?? 0,
         windows: (limits?.windows ?? []).map((w) => ({
           usedPercent: w.usedPercent,
           reservedPercent: reserved,
@@ -323,7 +330,8 @@ export class SubscriptionPool {
         effort,
         now,
         maximumObservationAgeMs: this._maxAge,
-        mode: request.mode,
+        ordering: request.ordering,
+        ...(request.pinned !== undefined ? { pinned: request.pinned } : {}),
         organizationId: request.organizationId,
         preferredId: request.preferredInstanceId,
       },
@@ -333,7 +341,7 @@ export class SubscriptionPool {
 
   /** Lease the best instance now, or throw PoolExhaustedError with every exclusion reason. */
   acquire(request: PoolRequest): Lease {
-    const { candidates, excluded } = this.rank(request);
+    const { candidates, excluded, ordering } = this.rank(request);
     const best = candidates[0];
     if (!best) {
       this._emit({ type: 'exhausted', runtime: request.runtime, model: request.model, excluded });
@@ -346,12 +354,7 @@ export class SubscriptionPool {
         excluded,
       );
     }
-    return this._lease(
-      this._state(best.accountId),
-      request.mode ?? 'quartile-balanced',
-      best.utilizationPercent,
-      0,
-    );
+    return this._lease(this._state(best.accountId), ordering, best.utilizationPercent, 0);
   }
 
   /** Refresh stale limits, lease an instance and open a session on it. The lease ends with the session. */
@@ -429,7 +432,7 @@ export class SubscriptionPool {
       );
     const allowed = new Set(shared.map((s) => s.config.id));
     await this._refreshStale(request, allowed);
-    const { candidates, excluded } = this.rank({
+    const { candidates, excluded, ordering } = this.rank({
       ...request,
       excludeInstanceIds: [
         ...(request.excludeInstanceIds ?? []),
@@ -451,12 +454,7 @@ export class SubscriptionPool {
       );
     binding.session?.kill();
     binding.lease?.release();
-    const lease = this._lease(
-      this._state(best.accountId),
-      request.mode ?? 'quartile-balanced',
-      best.utilizationPercent,
-      0,
-    );
+    const lease = this._lease(this._state(best.accountId), ordering, best.utilizationPercent, 0);
     try {
       const session = this._session(
         lease,
@@ -566,8 +564,8 @@ export class SubscriptionPool {
   }
   private _lease(
     state: InstanceState,
-    mode: RoutingMode,
-    utilizationPercent: number,
+    ordering: ResolvedOrdering,
+    utilizationPercent: number | null,
     rank: number,
   ): Lease {
     const leaseId = crypto.randomUUID();
@@ -593,7 +591,7 @@ export class SubscriptionPool {
       leaseId,
       instanceId: state.config.id,
       transport: state.config.transport,
-      mode,
+      ordering,
       utilizationPercent,
       rank,
     });

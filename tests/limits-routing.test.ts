@@ -1,13 +1,21 @@
 import { describe, expect, test } from 'bun:test';
 import {
+  type CandidateRequest,
   claudeRateLimitSnapshot,
   claudeUsageSnapshot,
   codexLimitSnapshot,
+  DEFAULT_STRATEGY,
   limitUtilization,
   mergeLimits,
+  type OrderBy,
+  ROUTING_STRATEGIES,
+  type RoutingField,
+  type RoutingStrategy,
   rankCandidates,
   rankSubscriptionAccounts,
   repositoryIdentity,
+  resolveOrdering,
+  type SortDir,
   type SubscriptionCandidate,
 } from '../src';
 
@@ -247,7 +255,7 @@ describe('repository subscription routing (ported draft)', () => {
       ]);
     expect(rank([account('owner', 100), account('spare', 75)])).toEqual(['spare']);
     expect(
-      rankSubscriptionAccounts({ ...request, mode: 'owner-first' }, routes, [
+      rankSubscriptionAccounts({ ...request, ordering: 'owner-first' }, routes, [
         account('owner', 99),
         account('spare', 0),
       ]).candidates[0]!.accountId,
@@ -302,18 +310,18 @@ describe('candidate ranking', () => {
   };
   test('pinned serves only the preferred instance and requires one', () => {
     expect(
-      rankCandidates({ ...base, mode: 'pinned', preferredId: 'owner' }, [
+      rankCandidates({ ...base, pinned: true, preferredId: 'owner' }, [
         account('owner', 90),
         account('spare', 0),
       ]).candidates.map((c) => c.accountId),
     ).toEqual(['owner']);
     expect(
-      rankCandidates({ ...base, mode: 'pinned', preferredId: 'owner' }, [
+      rankCandidates({ ...base, pinned: true, preferredId: 'owner' }, [
         account('owner', 100),
         account('spare', 0),
       ]).candidates,
     ).toEqual([]);
-    expect(() => rankCandidates({ ...base, mode: 'pinned' }, [])).toThrow('preferred');
+    expect(() => rankCandidates({ ...base, pinned: true }, [])).toThrow('preferred');
   });
   test('every exclusion has a stated reason, and blocked or cooling-down instances are excluded', () => {
     const { excluded, candidates } = rankCandidates(base, [
@@ -345,5 +353,168 @@ describe('candidate ranking', () => {
     expect(
       rankCandidates(base, [...accounts].reverse()).candidates.map((c) => c.accountId),
     ).toEqual(first);
+  });
+});
+
+describe('flexible ordering', () => {
+  const base = {
+    runtime: 'codex' as const,
+    model: 'worker',
+    effort: 'medium',
+    now: 1000,
+    maximumObservationAgeMs: 500,
+  };
+  const tier = (id: string, priority: number, percent: number): SubscriptionCandidate => ({
+    ...account(id, percent),
+    priority,
+  });
+  const order = (request: Partial<CandidateRequest>, accounts: SubscriptionCandidate[]) =>
+    rankCandidates({ ...base, ...request }, accounts).candidates.map((c) => c.accountId);
+
+  test('resolved terms are a json-rules OrderBy and every term gains a direction', () => {
+    const resolved: OrderBy = resolveOrdering('quartile-balanced');
+    expect(resolved).toEqual([
+      { field: 'quartile', dir: 'asc' },
+      { field: 'preferred', dir: 'desc' },
+      { field: 'utilization', dir: 'asc' },
+    ]);
+    expect(resolveOrdering()).toEqual(resolveOrdering(DEFAULT_STRATEGY));
+    expect(resolveOrdering([{ field: 'headroom' }])).toEqual([{ field: 'headroom', dir: 'desc' }]);
+    expect(resolveOrdering([{ field: 'priority', dir: 'desc' }])).toEqual([
+      { field: 'priority', dir: 'desc' },
+    ]);
+  });
+
+  test('every preset resolves and is reported back with the ranking', () => {
+    for (const name of Object.keys(ROUTING_STRATEGIES) as RoutingStrategy[])
+      expect(resolveOrdering(name).length).toBeGreaterThan(0);
+    expect(rankCandidates(base, [account('a', 10)]).ordering).toEqual(
+      resolveOrdering(DEFAULT_STRATEGY),
+    );
+  });
+
+  test('priority-balanced: load decides across quartiles, priority decides within one', () => {
+    expect(
+      order({ ordering: 'priority-balanced' }, [tier('tier1', 0, 60), tier('tier2', 1, 10)]),
+    ).toEqual(['tier2', 'tier1']);
+    expect(
+      order({ ordering: 'priority-balanced' }, [tier('tier1', 0, 20), tier('tier2', 1, 10)]),
+    ).toEqual(['tier1', 'tier2']);
+  });
+
+  test('priority-strict: the top tier serves until excluded, then spills over', () => {
+    expect(
+      order({ ordering: 'priority-strict' }, [tier('tier1', 0, 99), tier('tier2', 1, 0)]),
+    ).toEqual(['tier1', 'tier2']);
+    const { candidates, excluded } = rankCandidates({ ...base, ordering: 'priority-strict' }, [
+      tier('tier1', 0, 100),
+      tier('tier2', 1, 0),
+    ]);
+    expect(candidates.map((c) => c.accountId)).toEqual(['tier2']);
+    expect(excluded).toEqual({ tier1: 'exhausted' });
+  });
+
+  test('absent priority is 0, so prioritized and unprioritized instances order together', () => {
+    expect(
+      order({ ordering: 'priority-strict' }, [tier('explicit', 1, 0), account('absent', 50)]),
+    ).toEqual(['absent', 'explicit']);
+    expect(rankCandidates(base, [account('a', 10)]).candidates[0]!.priority).toBe(0);
+  });
+
+  test('an explicit term list routes without a named strategy', () => {
+    const busy = { ...tier('busy', 0, 10), concurrencyLimit: 4, activeRuns: 3 };
+    const free = { ...tier('free', 1, 90), concurrencyLimit: 4, activeRuns: 0 };
+    expect(order({ ordering: [{ field: 'headroom' }] }, [busy, free])).toEqual(['free', 'busy']);
+    expect(order({ ordering: [{ field: 'utilization' }] }, [busy, free])).toEqual(['busy', 'free']);
+    expect(order({ ordering: [{ field: 'utilization', dir: 'desc' }] }, [busy, free])).toEqual([
+      'free',
+      'busy',
+    ]);
+    expect(rankCandidates(base, [busy]).candidates[0]!.headroom).toBe(1);
+  });
+
+  test('rank-last keeps an unreadable instance eligible but never ahead of a known one', () => {
+    const unread = { ...account('unread', 0), windows: [] };
+    expect(order({}, [unread, account('known', 90)])).toEqual(['known']);
+    const { candidates, excluded } = rankCandidates({ ...base, unknownUtilization: 'rank-last' }, [
+      unread,
+      account('known', 90),
+    ]);
+    expect(candidates.map((c) => c.accountId)).toEqual(['known', 'unread']);
+    expect(excluded).toEqual({});
+    expect(candidates[1]).toMatchObject({ utilizationPercent: null, quartile: null });
+    const stale = {
+      ...account('stale', 0),
+      windows: [{ usedPercent: 1, reservedPercent: 0, observedAt: 1, resetsAt: 2000 }],
+    };
+    expect(
+      rankCandidates({ ...base, unknownUtilization: 'rank-last' }, [stale]).candidates[0],
+    ).toMatchObject({ utilizationPercent: null });
+    expect(
+      rankCandidates(
+        {
+          ...base,
+          unknownUtilization: 'rank-last',
+          ordering: [{ field: 'utilization', dir: 'desc' }],
+        },
+        [unread, account('known', 90)],
+      ).candidates.map((c) => c.accountId),
+    ).toEqual(['known', 'unread']);
+  });
+
+  test('rank-last still excludes blocked, exhausted, occupied and unauthorized instances', () => {
+    const { candidates, excluded } = rankCandidates(
+      { ...base, organizationId: 'org', unknownUtilization: 'rank-last' },
+      [
+        { ...account('blocked', 10), blocked: true },
+        account('exhausted', 100),
+        { ...account('occupied', 10), activeRuns: 1 },
+        { ...account('foreign', 10), organizationIds: ['other'] },
+        { ...account('unread', 0), windows: [] },
+      ],
+    );
+    expect(candidates.map((c) => c.accountId)).toEqual(['unread']);
+    expect(excluded).toEqual({
+      blocked: 'blocked',
+      exhausted: 'exhausted',
+      occupied: 'occupied',
+      foreign: 'organization',
+    });
+  });
+
+  test('pinned is eligibility, not ordering, and composes with any term list', () => {
+    const { candidates, excluded } = rankCandidates(
+      { ...base, pinned: true, preferredId: 'owner', ordering: 'least-used' },
+      [account('owner', 90), account('spare', 0)],
+    );
+    expect(candidates.map((c) => c.accountId)).toEqual(['owner']);
+    expect(excluded).toEqual({ spare: 'not-pinned' });
+  });
+
+  test('ordering is validated, and an unusable spec throws rather than silently reordering', () => {
+    expect(() => resolveOrdering('nonsense' as RoutingStrategy)).toThrow(
+      'Unknown routing strategy',
+    );
+    expect(() => resolveOrdering([])).toThrow('at least one term');
+    expect(() => resolveOrdering([{ field: 'cost' as RoutingField }])).toThrow(
+      'Unknown ordering field',
+    );
+    expect(() => resolveOrdering([{ field: 'priority', dir: 'up' as SortDir }])).toThrow(
+      'Unknown sort direction',
+    );
+    expect(() => rankCandidates({ ...base, ordering: [] }, [])).toThrow('at least one term');
+    expect(rankCandidates(base, [{ ...account('bad', 10), priority: NaN }]).excluded).toEqual({
+      bad: 'invalid',
+    });
+  });
+
+  test('every preset ranks deterministically regardless of input order', () => {
+    const accounts = [tier('b', 1, 30), tier('a', 1, 30), tier('c', 0, 30), tier('d', 0, 80)];
+    for (const name of Object.keys(ROUTING_STRATEGIES) as RoutingStrategy[]) {
+      const first = order({ ordering: name }, accounts);
+      expect(order({ ordering: name }, [...accounts].reverse())).toEqual(first);
+      expect(new Set(first).size).toBe(first.length);
+    }
+    expect(order({ ordering: 'priority-strict' }, accounts)).toEqual(['c', 'd', 'a', 'b']);
   });
 });

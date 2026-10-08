@@ -87,15 +87,25 @@ export {
 export {
   assessCandidate,
   type CandidateRequest,
+  DEFAULT_STRATEGY,
   type ExclusionReason,
+  type OrderBy,
+  type OrderingSpec,
+  type OrderingTerm,
   type RankedCandidate,
   type RepositoryRoute,
-  type RoutingMode,
+  type ResolvedOrdering,
+  ROUTING_STRATEGIES,
+  type RoutingField,
   type RoutingRequest,
+  type RoutingStrategy,
   rankCandidates,
   rankSubscriptionAccounts,
   repositoryIdentity,
+  resolveOrdering,
+  type SortDir,
   type SubscriptionCandidate,
+  type UnknownUtilizationPolicy,
 } from './routing';
 // Transports: how a session reaches its model, with declared capabilities.
 export {

@@ -119,8 +119,12 @@ describe('SubscriptionPool', () => {
       'owner',
     ]);
     expect(
-      p.rank({ runtime: 'codex', model: 'm', preferredInstanceId: 'owner', mode: 'owner-first' })
-        .candidates[0]!.accountId,
+      p.rank({
+        runtime: 'codex',
+        model: 'm',
+        preferredInstanceId: 'owner',
+        ordering: 'owner-first',
+      }).candidates[0]!.accountId,
     ).toBe('owner');
     p.observeLimits('owner', limits('codex', 12));
     expect(
@@ -259,7 +263,7 @@ describe('SubscriptionPool', () => {
       runtime: 'claude',
       model: 'm',
       preferredInstanceId: 'a',
-      mode: 'pinned',
+      pinned: true,
     });
     await opened.session.start();
     const done = await opened.session.send('work');
@@ -413,11 +417,11 @@ describe('SubscriptionPool review regressions', () => {
       return fakeProcess().proc;
     };
     const a = await p.open(
-      { runtime: 'claude', model: 'm', mode: 'pinned', preferredInstanceId: 'a' },
+      { runtime: 'claude', model: 'm', pinned: true, preferredInstanceId: 'a' },
       { spawn, env: { CLAUDE_CONFIG_DIR: '/elsewhere' } },
     );
     const b = await p.open(
-      { runtime: 'claude', model: 'm', mode: 'pinned', preferredInstanceId: 'b' },
+      { runtime: 'claude', model: 'm', pinned: true, preferredInstanceId: 'b' },
       { spawn, env: { CLAUDE_CONFIG_DIR: '/elsewhere' } },
     );
     await a.session.start();

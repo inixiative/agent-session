@@ -159,21 +159,68 @@ keys its cache per conversation); Claude reads the whole primed prefix every tim
 
 `SubscriptionPool` treats each login as an **instance** of a transport:
 `{ id, transport, profileDirectory (CODEX_HOME / CLAUDE_CONFIG_DIR), continuationKey,
-organizationIds, models, concurrencyLimit }`.
+organizationIds, models, concurrencyLimit, priority }`.
 
 - **Routing** (`rankCandidates`, ported from Foundry's draft account-routing policy
-  a60c664): deterministic, from observed limits, active leases and local health.
-  Strategies: `quartile-balanced` (default), `owner-first`, `pinned`. Unknown,
-  stale, future or reset-crossing observations exclude an instance; every
-  exclusion carries a reason (`PoolExhaustedError.excluded`). The draft's
-  repository entry point `rankSubscriptionAccounts` and `repositoryIdentity` are
-  kept intact with its tests.
+  a60c664): deterministic, from observed limits, priority, active leases and local
+  health. Every exclusion carries a reason (`PoolExhaustedError.excluded`). The
+  draft's repository entry point `rankSubscriptionAccounts` and `repositoryIdentity`
+  are kept intact with its tests.
+
+### Ordering
+
+Ordering is an ordered list of terms over the fields projected onto each eligible
+candidate, in `@inixiative/json-rules`' `OrderBy` vocabulary (`{ field, dir }[]`) —
+the same type Kingdom stores on a capacity pool, so one spec travels between them.
+`id` is always the final term, so ranking is total and reproducible. A term may omit
+`dir` and take the direction that puts the better candidate first.
+
+| Field | Meaning | Natural direction |
+|---|---|---|
+| `priority` | instance `priority`, absent is 0 | `asc` (lower serves first) |
+| `utilization` | highest window's used + reserved percent | `asc` |
+| `quartile` | `utilization` floored into 25-point buckets | `asc` |
+| `headroom` | `concurrencyLimit - activeRuns` | `desc` |
+| `preferred` | is this the request's preferred instance | `desc` |
+
+Named strategies are presets over that list; `request.ordering` takes a name or an
+explicit term list, and the resolved terms come back on the ranking and on the
+`allocated` event.
+
+| Strategy | Terms |
+|---|---|
+| `quartile-balanced` (default) | `quartile`, `preferred`, `utilization` |
+| `owner-first` | `preferred`, `utilization` |
+| `priority-balanced` | `quartile`, `priority`, `preferred`, `utilization` |
+| `priority-strict` | `priority`, `utilization` |
+| `least-used` | `utilization` |
+
+`priority-balanced` and `priority-strict` differ in what priority outranks: under
+`balanced` load decides between tiers a quartile apart and priority decides within
+one, so a tier-2 login at 10% beats tier-1 at 60% but loses to tier-1 at 20%. Under
+`strict` the top tier serves until it is excluded, then work spills to the next.
+
+**Eligibility is separate from ordering.** `pinned` (with `preferredInstanceId`)
+makes every other instance ineligible as `not-pinned` — it is a filter, not a sort,
+and composes with any term list. Unknown, stale, future or reset-crossing limit
+observations mean routing has no capacity reading for an instance;
+`unknownUtilization` decides what that means:
+
+- `exclude` (default) suits provider-enforced subscription windows, where an unread
+  login may already be exhausted and sending work there fails the turn.
+- `rank-last` suits capacity whose spend is bounded elsewhere — Kingdom gates on
+  allocation policies — where a never-observed instance must stay usable. Its
+  `utilizationPercent` and `quartile` are null, and a null never outranks a known
+  reading in either direction. `blocked`, `exhausted`, `occupied` and the authority
+  filters still exclude.
 - **Limits**: `open()` refreshes instances whose limits are missing, older than
   the observation age, past a window reset, or blocked past their cooldown, with
   `probeCodexLimits` / `probeClaudeLimits` (no model turn). A poll that fails or
   returns nothing is not repeated for `probeCooldownMs`. Sessions opened by the pool
   feed their `rate_limit` events back. A window without a reported reset time counts
-  as current.
+  as current. A caller that observes capacity the native probes cannot read supplies
+  `options.probe` and returns its own `LimitSnapshot`: the pool decides, the caller
+  provides the reading.
 - **Leases** end when the session ends, is killed (even before start) or fails to
   start; a session whose lease ended cannot restart outside the pool. The profile
   variable is always pinned, so caller env cannot move a leased session to another login.
@@ -197,6 +244,8 @@ organizationIds, models, concurrencyLimit }`.
   per-cycle input. Keep the scheduler's priority and fairness; its concurrency is
   now turns on one warm process, not processes.
 - Account routing: use `SubscriptionPool` / `rankCandidates` rather than landing
-  the draft `routing/subscription-routing.ts` in Foundry.
+  the draft `routing/subscription-routing.ts` in Foundry. Decision profiles become
+  pool instances; `maxConcurrent` becomes per-instance `concurrencyLimit` plus the
+  caller's own global cap.
 - Existing `ClaudeCodeSession`/`CodexSession` behavior is unchanged unless the new
   options are used; `interrupt()` still only releases the local waiter.
