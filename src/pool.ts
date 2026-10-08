@@ -19,12 +19,14 @@ import type { HarnessSession } from './harness-session';
 import { type LimitSnapshot, mergeLimits } from './limits';
 import { probeClaudeLimits, probeCodexLimits } from './limits-probe';
 import {
+  type BillingMode,
   type ExclusionReason,
   type OrderingSpec,
   type RankedCandidate,
   type ResolvedOrdering,
   rankCandidates,
   type SubscriptionCandidate,
+  type UnknownUtilizationPolicy,
 } from './routing';
 import { TRANSPORTS, type TransportKind } from './transport';
 import { createSession } from './transports';
@@ -66,6 +68,9 @@ export interface PoolRequest {
   readonly ordering?: OrderingSpec;
   /** Only the preferred instance may serve. Requires preferredInstanceId. */
   readonly pinned?: boolean;
+  /** Billing modes this request may use. Default: subscription only. */
+  readonly allowedBilling?: readonly BillingMode[];
+  readonly unknownUtilization?: UnknownUtilizationPolicy;
   /** Restrict to these transports (e.g. only resumable ones). */
   readonly transports?: readonly TransportKind[];
   readonly excludeInstanceIds?: readonly string[];
@@ -228,6 +233,8 @@ export class SubscriptionPool {
       const limit = config.concurrencyLimit ?? 1;
       if (!Number.isSafeInteger(limit) || limit < 1)
         throw Error(`Instance ${config.id}: concurrencyLimit must be a positive integer`);
+      if (config.priority !== undefined && !Number.isSafeInteger(config.priority))
+        throw Error(`Instance ${config.id}: priority must be a safe integer`);
       this._instances.set(config.id, {
         config,
         runtime,
@@ -332,6 +339,10 @@ export class SubscriptionPool {
         maximumObservationAgeMs: this._maxAge,
         ordering: request.ordering,
         ...(request.pinned !== undefined ? { pinned: request.pinned } : {}),
+        ...(request.allowedBilling !== undefined ? { allowedBilling: request.allowedBilling } : {}),
+        ...(request.unknownUtilization !== undefined
+          ? { unknownUtilization: request.unknownUtilization }
+          : {}),
         organizationId: request.organizationId,
         preferredId: request.preferredInstanceId,
       },

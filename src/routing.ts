@@ -74,9 +74,8 @@ const ROUTING_FIELDS = Object.keys(NATURAL_DIRECTION) as RoutingField[];
 /** Resolve a strategy name or explicit term list into terms, each with a direction. */
 export const resolveOrdering = (spec: OrderingSpec = DEFAULT_STRATEGY): ResolvedOrdering => {
   if (typeof spec === 'string') {
-    const preset = ROUTING_STRATEGIES[spec];
-    if (!preset) throw Error(`Unknown routing strategy "${spec}"`);
-    return resolveOrdering(preset);
+    if (!Object.hasOwn(ROUTING_STRATEGIES, spec)) throw Error(`Unknown routing strategy "${spec}"`);
+    return resolveOrdering(ROUTING_STRATEGIES[spec]);
   }
   if (!spec.length) throw Error('Ordering requires at least one term');
   return spec.map((term) => {
@@ -228,7 +227,7 @@ export function repositoryIdentity(remote: string): string {
   return `${url.hostname.toLowerCase()}/${normalized}`;
 }
 
-/** Why one candidate is ineligible, or undefined with its utilization when eligible. */
+/** Why one candidate is ineligible, or its utilization when eligible. */
 export function assessCandidate(
   request: CandidateRequest,
   account: SubscriptionCandidate,
@@ -257,13 +256,13 @@ export function assessCandidate(
     return { excluded: 'unavailable' };
   if (account.activeRuns >= account.concurrencyLimit) return { excluded: 'occupied' };
   if (account.blocked) return { excluded: 'blocked' };
-  const unreadable = request.unknownUtilization === 'rank-last' ? null : undefined;
-  if (account.windows.length === 0) {
-    if (unreadable === undefined) return { excluded: 'no-observation' };
-    return { utilizationPercent: null };
-  }
-  const fractions: number[] = [];
+  const rankLast = request.unknownUtilization === 'rank-last';
+  if (account.windows.length === 0)
+    return rankLast ? { utilizationPercent: null } : { excluded: 'no-observation' };
+  const readable: number[] = [];
+  let unreadable = false;
   for (const window of account.windows) {
+    // Corrupt is not unknown: a structurally impossible reading is never routable under any policy.
     if (
       window.usedPercent === null ||
       !Number.isFinite(window.usedPercent) ||
@@ -272,7 +271,7 @@ export function assessCandidate(
       !Number.isFinite(window.reservedPercent) ||
       window.reservedPercent < 0
     )
-      return unreadable === undefined ? { excluded: 'invalid' } : { utilizationPercent: null };
+      return { excluded: 'invalid' };
     // resetsAt === Infinity: the provider reported no reset for this window, so no reset can have crossed the observation.
     if (
       !Number.isFinite(window.observedAt) ||
@@ -280,14 +279,17 @@ export function assessCandidate(
       request.now - window.observedAt > request.maximumObservationAgeMs ||
       (window.resetsAt !== Number.POSITIVE_INFINITY &&
         (!Number.isFinite(window.resetsAt) || window.resetsAt <= request.now))
-    )
-      return unreadable === undefined
-        ? { excluded: 'stale-observation' }
-        : { utilizationPercent: null };
-    fractions.push(window.usedPercent + window.reservedPercent);
+    ) {
+      if (!rankLast) return { excluded: 'stale-observation' };
+      unreadable = true;
+      continue;
+    }
+    readable.push(window.usedPercent + window.reservedPercent);
   }
-  if (fractions.some((p) => p >= 100)) return { excluded: 'exhausted' };
-  return { utilizationPercent: Math.max(...fractions) };
+  // A window that is readable and full exhausts the instance even when another is not.
+  if (readable.some((p) => p >= 100)) return { excluded: 'exhausted' };
+  if (unreadable || !readable.length) return { utilizationPercent: null };
+  return { utilizationPercent: Math.max(...readable) };
 }
 
 /** Term fields as own properties, so json-rules orders them by name. */
@@ -318,6 +320,8 @@ export function rankCandidates(
     throw Error('Invalid observation policy');
   if (request.pinned && !request.preferredId)
     throw Error('Pinned routing requires a preferred instance');
+  if (request.allowedBilling?.length === 0)
+    throw Error('Ordering requires at least one billing mode');
   if (new Set(accounts.map((a) => a.id)).size !== accounts.length)
     throw Error('Duplicate account identity');
   const ordering = resolveOrdering(request.ordering);

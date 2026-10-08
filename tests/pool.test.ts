@@ -432,3 +432,58 @@ describe('SubscriptionPool review regressions', () => {
     b.session.kill();
   });
 });
+
+test('a pool can widen billing and rank unreadable instances last', () => {
+  const paid = {
+    id: 'paid',
+    transport: 'claude-cli' as const,
+    authentication: 'api-key' as const,
+    models: { m: ['default'] },
+  };
+  const subscription = new SubscriptionPool({ instances: [paid], now: () => 1000 });
+  expect(subscription.rank({ runtime: 'claude', model: 'm' }).excluded).toEqual({
+    paid: 'billing',
+  });
+  const widened = new SubscriptionPool({ instances: [paid], now: () => 1000 });
+  widened.observeLimits('paid', {
+    runtime: 'claude',
+    source: 'poll',
+    observedAt: 1000,
+    windows: [{ id: 'five_hour', usedPercent: 20, resetsAt: 9000 }],
+  });
+  expect(
+    widened
+      .rank({ runtime: 'claude', model: 'm', allowedBilling: ['api-key'] })
+      .candidates.map((c) => c.accountId),
+  ).toEqual(['paid']);
+  const unobserved = new SubscriptionPool({ instances: [paid], now: () => 1000 });
+  expect(
+    unobserved.rank({ runtime: 'claude', model: 'm', allowedBilling: ['api-key'] }).excluded,
+  ).toEqual({ paid: 'no-observation' });
+  expect(
+    unobserved
+      .rank({
+        runtime: 'claude',
+        model: 'm',
+        allowedBilling: ['api-key'],
+        unknownUtilization: 'rank-last',
+      })
+      .candidates.map((c) => c.accountId),
+  ).toEqual(['paid']);
+});
+
+test('an unusable priority fails at construction rather than silently never routing', () => {
+  for (const priority of [Number.NaN, Number.POSITIVE_INFINITY, 1.5])
+    expect(
+      () =>
+        new SubscriptionPool({
+          instances: [{ id: 'z', transport: 'claude-cli', priority }],
+        }),
+    ).toThrow('priority must be a safe integer');
+  expect(
+    () =>
+      new SubscriptionPool({
+        instances: [{ id: 'z', transport: 'claude-cli', priority: -3 }],
+      }),
+  ).not.toThrow();
+});

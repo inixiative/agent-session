@@ -549,10 +549,9 @@ describe('billing', () => {
         account('sub', 90),
       ]).candidates.map((c) => c.accountId),
     ).toEqual(['paid', 'sub']);
-    expect(
-      rankCandidates({ ...base, allowedBilling: [] }, [paid('paid', 0), account('sub', 0)])
-        .candidates,
-    ).toEqual([]);
+    expect(() =>
+      rankCandidates({ ...base, allowedBilling: [] }, [paid('paid', 0), account('sub', 0)]),
+    ).toThrow('at least one billing mode');
   });
 
   test('widening billing does not relax any other gate', () => {
@@ -586,5 +585,104 @@ describe('billing', () => {
         { ...paid('tier1', 50), priority: 0 },
       ]).candidates.map((c) => c.accountId),
     ).toEqual(['tier1', 'tier2']);
+  });
+});
+
+describe('rank-last never admits capacity it cannot prove', () => {
+  const base = {
+    runtime: 'codex' as const,
+    model: 'worker',
+    effort: 'medium',
+    now: 1000,
+    maximumObservationAgeMs: 500,
+    unknownUtilization: 'rank-last' as const,
+  };
+  const windowed = (
+    id: string,
+    windows: SubscriptionCandidate['windows'],
+  ): SubscriptionCandidate => ({ ...account(id, 0), windows });
+  const fresh = { reservedPercent: 0, observedAt: 900, resetsAt: 2000 };
+
+  test('a full readable window exhausts the instance even when another is unreadable', () => {
+    for (const windows of [
+      [
+        { usedPercent: 100, ...fresh },
+        { usedPercent: 40, reservedPercent: 0, observedAt: 900, resetsAt: 999 },
+      ],
+      [
+        { usedPercent: 40, reservedPercent: 0, observedAt: 900, resetsAt: 999 },
+        { usedPercent: 100, ...fresh },
+      ],
+      [
+        { usedPercent: 100, ...fresh },
+        { usedPercent: 40, reservedPercent: 0, observedAt: 1, resetsAt: 2000 },
+      ],
+    ]) {
+      const { candidates, excluded } = rankCandidates(base, [windowed('owner', windows)]);
+      expect(candidates).toEqual([]);
+      expect(excluded).toEqual({ owner: 'exhausted' });
+    }
+  });
+
+  test('a full readable window is not selected first under owner-first either', () => {
+    const { candidates } = rankCandidates(
+      { ...base, ordering: 'owner-first', preferredId: 'owner' },
+      [
+        windowed('owner', [
+          { usedPercent: 100, ...fresh },
+          { usedPercent: 40, reservedPercent: 0, observedAt: 900, resetsAt: 999 },
+        ]),
+        account('spare', 5),
+      ],
+    );
+    expect(candidates.map((c) => c.accountId)).toEqual(['spare']);
+  });
+
+  test('a structurally impossible reading is invalid under every policy, never unknown', () => {
+    for (const patch of [
+      { usedPercent: 101 },
+      { usedPercent: 1000 },
+      { usedPercent: NaN },
+      { usedPercent: -1 },
+      { usedPercent: null },
+      { reservedPercent: -5 },
+    ]) {
+      const windows = [{ usedPercent: 10, ...fresh, ...patch }];
+      expect(rankCandidates(base, [windowed('bad', windows)])).toMatchObject({
+        candidates: [],
+        excluded: { bad: 'invalid' },
+      });
+      expect(
+        rankCandidates({ ...base, unknownUtilization: 'exclude' }, [windowed('bad', windows)])
+          .excluded,
+      ).toEqual({ bad: 'invalid' });
+    }
+  });
+
+  test('an over-quota reading never outranks a known one under owner-first', () => {
+    expect(
+      rankCandidates({ ...base, ordering: 'owner-first', preferredId: 'over' }, [
+        windowed('over', [{ usedPercent: 150, ...fresh }]),
+        account('spare', 80),
+      ]).candidates.map((c) => c.accountId),
+    ).toEqual(['spare']);
+  });
+
+  test('only genuinely missing or stale readings become unknown', () => {
+    expect(
+      rankCandidates(base, [windowed('stale', [{ usedPercent: 40, ...fresh, observedAt: 1 }])])
+        .candidates[0],
+    ).toMatchObject({ utilizationPercent: null });
+    expect(rankCandidates(base, [windowed('none', [])]).candidates[0]).toMatchObject({
+      utilizationPercent: null,
+    });
+    expect(
+      rankCandidates(base, [windowed('known', [{ usedPercent: 40, ...fresh }])]).candidates[0],
+    ).toMatchObject({ utilizationPercent: 40 });
+  });
+
+  test('a strategy name inherited from Object.prototype is a usage error, not a TypeError', () => {
+    for (const name of ['constructor', 'hasOwnProperty', 'toString', 'valueOf', '__proto__'])
+      expect(() => resolveOrdering(name as RoutingStrategy)).toThrow('Unknown routing strategy');
   });
 });

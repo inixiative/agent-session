@@ -200,9 +200,12 @@ explicit term list, and the resolved terms come back on the ranking and on the
 one, so a tier-2 login at 10% beats tier-1 at 60% but loses to tier-1 at 20%. Under
 `strict` the top tier serves until it is excluded, then work spills to the next.
 
-Ordering is evaluated by json-rules' `orderRecords`, so agent-session, Kingdom's
-stored pool policy and any SQL or Prisma compilation of the same spec order
-identically; NULLs sort last on every rail.
+Ordering is evaluated by json-rules' `orderRecords`, so the same spec means the
+same thing wherever it is stored or compiled, and NULLs sort last on every rail.
+The final `id` term compares UTF-16 code units, which matches Postgres `C` /
+`ucs_basic` but not a locale collation such as `en_US.UTF-8`: with mixed-case or
+non-ASCII instance ids the JS and SQL rails can break an exact tie differently.
+Lowercase ids, including uuids, are unaffected.
 
 **Eligibility is separate from ordering.** `pinned` (with `preferredInstanceId`)
 makes every other instance ineligible as `not-pinned` — it is a filter, not a sort,
@@ -223,8 +226,22 @@ capacity reading for an instance; `unknownUtilization` decides what that means:
 - `rank-last` suits capacity whose spend is bounded elsewhere — Kingdom gates on
   allocation policies — where a never-observed instance must stay usable. Its
   `utilizationPercent` and `quartile` are null, and a null never outranks a known
-  reading in either direction. `blocked`, `exhausted`, `occupied` and the authority
+  reading on the same term. `blocked`, `exhausted`, `occupied` and the authority
   filters still exclude.
+
+`rank-last` widens what counts as *unknown*, never what counts as *available*:
+
+- A window that is readable and at or over 100% exhausts the instance even when
+  another window is unreadable.
+- A structurally impossible reading — negative, over 100, `NaN`, null — is
+  `invalid` under both policies. Corrupt is not unknown.
+- An instance is unknown only when a reading is genuinely missing or stale, and a
+  single unreadable window makes the whole instance unknown rather than reporting
+  the readable windows' maximum as if it were the true figure.
+
+Under `owner-first` a preferred instance with an unknown reading is still tried
+first, because `preferred` outranks `utilization` in that preset. Put
+`utilization` or `quartile` first if an unknown reading should lose.
 - **Limits**: `open()` refreshes instances whose limits are missing, older than
   the observation age, past a window reset, or blocked past their cooldown, with
   `probeCodexLimits` / `probeClaudeLimits` (no model turn). A poll that fails or
