@@ -200,11 +200,23 @@ explicit term list, and the resolved terms come back on the ranking and on the
 one, so a tier-2 login at 10% beats tier-1 at 60% but loses to tier-1 at 20%. Under
 `strict` the top tier serves until it is excluded, then work spills to the next.
 
+Ordering is evaluated by json-rules' `orderRecords`, so agent-session, Kingdom's
+stored pool policy and any SQL or Prisma compilation of the same spec order
+identically; NULLs sort last on every rail.
+
 **Eligibility is separate from ordering.** `pinned` (with `preferredInstanceId`)
 makes every other instance ineligible as `not-pinned` — it is a filter, not a sort,
-and composes with any term list. Unknown, stale, future or reset-crossing limit
-observations mean routing has no capacity reading for an instance;
-`unknownUtilization` decides what that means:
+and composes with any term list.
+
+`allowedBilling` decides which billing modes may serve, and defaults to
+`['subscription']`: spending real money is the caller's decision, never a routing
+default, and a widened request never implies the other mode. Anything outside it is
+excluded as `billing`. Kingdom passes `['api-key']`, where a run's spend is bounded
+by its allocation policies rather than by a provider's subscription window.
+Widening billing relaxes no other gate.
+
+Unknown, stale, future or reset-crossing limit observations mean routing has no
+capacity reading for an instance; `unknownUtilization` decides what that means:
 
 - `exclude` (default) suits provider-enforced subscription windows, where an unread
   login may already be exhausted and sending work there fails the turn.

@@ -86,6 +86,7 @@ export {
 } from './primed';
 export {
   assessCandidate,
+  type BillingMode,
   type CandidateRequest,
   DEFAULT_STRATEGY,
   type ExclusionReason,
