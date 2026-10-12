@@ -300,6 +300,44 @@ describe('ClaudePrimedSessions', () => {
     expect(cli.processes.every((p) => p.killed || p.closed)).toBe(true);
   });
 
+  test('overlapping decisions on one key run beside each other on one prime', async () => {
+    const cli = claudeCli({ behavior: (input) => (input === 'slow' ? 'hold' : 'answer') });
+    const { h, events } = host(cli, { maxConcurrent: 4 });
+    const order: string[] = [];
+    const slow = h
+      .decide(spec, { input: 'slow', timeoutMs: 400 })
+      .catch((e) => e)
+      .finally(() => order.push('slow'));
+    await tick(20);
+    // The second phase is not queued behind the first: it forks the same primed session.
+    const quick = await h.decide(spec, { input: 'quick' });
+    order.push('quick');
+    expect(quick).toMatchObject({ content: 'decided: quick', prime: 'warm' });
+    expect((await slow).reason).toBe('timeout');
+    expect(order).toEqual(['quick', 'slow']);
+    expect(events.filter((e) => e.type === 'primed')).toHaveLength(1);
+    const persisted = cli.spawns.filter((argv) => !argv.includes('--no-session-persistence'));
+    expect(persisted).toHaveLength(1);
+    await tick(20);
+    // One idle spare per key once both have finished.
+    const live = cli.processes.filter((p) => !p.killed && !p.closed);
+    expect(live).toHaveLength(1);
+    expect(h.snapshot()).toMatchObject({ sessions: 1, active: 0 });
+  });
+
+  test('a re-prime while a decision runs keeps the old transcript until it finishes', async () => {
+    const cli = claudeCli({ behavior: (input) => (input === 'slow' ? 'hold' : 'answer') });
+    const { h, events } = host(cli, { maxConcurrent: 4, spare: false });
+    await h.decide(spec, { input: 'q1' });
+    const slow = h.decide(spec, { input: 'slow', timeoutMs: 300 }).catch((e) => e);
+    await tick(20);
+    await h.decide({ ...spec, context: 'NEW' }, { input: 'q2' });
+    expect(events.some((e) => e.type === 'evicted')).toBe(false);
+    expect((await slow).reason).toBe('timeout');
+    await tick(20);
+    expect(events.filter((e) => e.type === 'evicted' && e.reason === 'reprime')).toHaveLength(1);
+  });
+
   test('close kills spares and refuses further decisions', async () => {
     const cli = claudeCli();
     const { h } = host(cli);

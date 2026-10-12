@@ -13,6 +13,12 @@
 //           decision pays no process start. Forks send the primed prefix
 //           byte-for-byte, so it is read from the prompt cache.
 //
+// A key's decisions run concurrently, like Codex forks: priming is
+// single-flight per key, the first decision takes the spare, and an
+// overlapping one starts its own fork (process start, no re-prime). One key
+// therefore serves every phase of a role without one phase queueing behind
+// another, and still holds a single idle spare.
+//
 // Verified live with claude 2.1.281: forks read the full primed prefix from
 // cache (cache_read equal to the primer's cache write) and write nothing to
 // history.
@@ -87,7 +93,10 @@ interface Primed {
   cleanup?: Promise<void>;
   model?: string;
   lastUsed: number;
-  busy: boolean;
+  /** Decisions currently forked from this session. */
+  inUse: number;
+  /** Replaced or evicted while in use: its transcript is deleted when the last decision finishes. */
+  stale?: 'idle' | 'capacity' | 'reprime' | 'requested' | 'close';
 }
 
 export class ClaudePrimedSessions implements PrimedSessions {
@@ -168,14 +177,14 @@ export class ClaudePrimedSessions implements PrimedSessions {
       Math.min(this._config.idleMs, 60_000),
     );
     (this._idleTimer as { unref?: () => void }).unref?.();
-    return this._queue.run(spec.key, async () => {
+    return (async () => {
       const release = await this._slots.acquire(deadline, request.signal);
       try {
         return await this._decide(spec, request, started, deadline);
       } finally {
         release();
       }
-    });
+    })();
   }
 
   async evict(key: string): Promise<void> {
@@ -358,7 +367,7 @@ export class ClaudePrimedSessions implements PrimedSessions {
         hash,
         instructions: spec.instructions,
         lastUsed: Date.now(),
-        busy: false,
+        inUse: 0,
       };
       this._sessions.set(spec.key, primed);
       this._emit({ type: 'primed', key: spec.key, hash, ms: 0 });
@@ -406,7 +415,7 @@ export class ClaudePrimedSessions implements PrimedSessions {
       base: base.session,
       model: observedModel(result),
       lastUsed: Date.now(),
-      busy: false,
+      inUse: 0,
     };
     this._sessions.set(spec.key, primed);
     this._emit({ type: 'primed', key: spec.key, hash, ms: Math.round(performance.now() - t0) });
@@ -422,6 +431,12 @@ export class ClaudePrimedSessions implements PrimedSessions {
     const spare = session.spare;
     session.spare = undefined;
     await this._dispose(spare);
+    // Decisions still forking from it keep its transcript until the last one finishes.
+    if (session.inUse > 0) session.stale ??= reason;
+    else this._retire(session, reason);
+  }
+
+  private _retire(session: Primed, reason: NonNullable<Primed['stale']>): void {
     this._deleteTranscript(session.base?.externalSessionId);
     this._emit({ type: 'evicted', key: session.key, reason });
   }
@@ -429,7 +444,7 @@ export class ClaudePrimedSessions implements PrimedSessions {
   private async _evictIdle(): Promise<void> {
     const cutoff = Date.now() - this._config.idleMs;
     for (const session of [...this._sessions.values()])
-      if (!session.busy && session.lastUsed < cutoff) await this._drop(session, 'idle');
+      if (!session.inUse && session.lastUsed < cutoff) await this._drop(session, 'idle');
   }
 
   private async _decide(
@@ -455,36 +470,43 @@ export class ClaudePrimedSessions implements PrimedSessions {
     await this._checkLimits();
     this._sweepTranscripts();
     const hash = primeHash(spec);
-    let session = this._sessions.get(spec.key),
-      prime: 'warm' | 'cold' = 'warm',
+    let prime: 'warm' | 'cold' = 'warm',
       primeMs = 0;
-    if (session && session.hash !== hash) {
-      await this._drop(session, 'reprime');
-      session = undefined;
-    }
-    if (!session) {
-      while (this._sessions.size >= this._config.maxSessions) {
-        const idle = [...this._sessions.values()]
-          .filter((s) => !s.busy)
-          .sort((a, b) => a.lastUsed - b.lastUsed)[0];
-        if (!idle) break;
-        await this._drop(idle, 'capacity');
-      }
+    // Only finding or priming the key's session is serialized: priming is single-flight per key,
+    // and the decision itself runs beside any other decision on the key.
+    const session = await this._queue.run(spec.key, async () => {
       if (this._closed || signal?.aborted) throw closed();
-      const t = performance.now();
-      session = await this._prime(spec, hash, deadline);
-      primeMs = Math.round(performance.now() - t);
-      prime = 'cold';
-    }
-    await session.cleanup;
-    if (this._closed || signal?.aborted) throw closed();
-    session.busy = true;
-    session.lastUsed = Date.now();
-    const t1 = performance.now();
-    let branch = session.spare;
-    session.spare = undefined;
+      let found = this._sessions.get(spec.key);
+      if (found && found.hash !== hash) {
+        await this._drop(found, 'reprime');
+        found = undefined;
+      }
+      if (!found) {
+        while (this._sessions.size >= this._config.maxSessions) {
+          const idle = [...this._sessions.values()]
+            .filter((s) => !s.inUse)
+            .sort((a, b) => a.lastUsed - b.lastUsed)[0];
+          if (!idle) break;
+          await this._drop(idle, 'capacity');
+        }
+        if (this._closed || signal?.aborted) throw closed();
+        const t = performance.now();
+        found = await this._prime(spec, hash, deadline);
+        primeMs = Math.round(performance.now() - t);
+        prime = 'cold';
+      }
+      found.inUse++;
+      return found;
+    });
+    let branch: Owned | undefined;
     let admissionId: string | undefined;
+    const t1 = performance.now();
     try {
+      await session.cleanup;
+      if (this._closed || signal?.aborted) throw closed();
+      session.lastUsed = Date.now();
+      branch = session.spare;
+      session.spare = undefined;
       if (!branch?.session.alive) {
         await this._dispose(branch);
         branch = this._branch(session);
@@ -627,18 +649,29 @@ export class ClaudePrimedSessions implements PrimedSessions {
         timing: { waitMs, primeMs, branchMs, turnMs },
       };
     } finally {
-      session.busy = false;
+      session.inUse--;
       session.lastUsed = Date.now();
       // The decision settled on its native terminal; process exit and the next spare are off the caller's path.
       const done = branch;
       session.cleanup = (async () => {
         await this._dispose(done);
-        if (this._config.spare && !this._closed && this._sessions.get(spec.key) === session) {
+        // One spare per key: an overlapping decision that already refilled it wins.
+        if (
+          this._config.spare &&
+          !this._closed &&
+          !session.spare &&
+          this._sessions.get(spec.key) === session
+        ) {
           const spare = this._branch(session);
           session.spare = spare;
           await spare.session.start().catch(() => {
             if (session.spare === spare) session.spare = undefined;
           });
+        }
+        if (session.stale && !session.inUse) {
+          const reason = session.stale;
+          session.stale = undefined;
+          this._retire(session, reason);
         }
       })();
     }
