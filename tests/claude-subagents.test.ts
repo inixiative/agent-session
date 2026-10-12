@@ -19,6 +19,8 @@ type Behavior = {
   tool?: (input: string) => boolean;
   /** An extra Agent call for a name nobody listed. */
   stray?: boolean;
+  /** A pre-started subagent that uses a tool before its moment. */
+  standbyTool?: boolean;
 };
 
 /** A Claude CLI double for the dispatcher: Agent calls through the PreToolUse hook, foreground subagents. */
@@ -29,6 +31,8 @@ function dispatcherCli(behavior: Behavior = {}) {
   const userMessages: { text: string; uuid: string }[] = [];
   const controls: Record<string, unknown>[] = [];
   const subagentInputs: string[] = [];
+  const standbyPrompts: string[] = [];
+  const momentInputs: string[] = [];
   let fanOuts = 0;
   const spawn = (argv: string[]) => {
     spawns.push(argv);
@@ -37,6 +41,8 @@ function dispatcherCli(behavior: Behavior = {}) {
     let seq = 0;
     const hookWaiters = new Map<string, (response: any) => void>();
     const running = new Map<string, { toolUseId: string }>();
+    /** Pre-started subagents holding a moment call. */
+    const waiting = new Map<string, { toolUseId: string }>();
     let turnOpen = false;
     const fake = fakeProcess((m, io) => {
       if (m.type === 'control_response') {
@@ -53,6 +59,17 @@ function dispatcherCli(behavior: Behavior = {}) {
         if (m.request.subtype === 'rewind_conversation') return ok({ rewound: true });
         if (m.request.subtype === 'interrupt') {
           ok();
+          for (const [taskId, task] of waiting) {
+            waiting.delete(taskId);
+            io.emit({
+              type: 'system',
+              subtype: 'task_notification',
+              task_id: taskId,
+              tool_use_id: task.toolUseId,
+              status: 'killed',
+              session_id: sid,
+            });
+          }
           if (turnOpen) {
             turnOpen = false;
             io.emit({
@@ -162,6 +179,88 @@ function dispatcherCli(behavior: Behavior = {}) {
             prompt,
             session_id: sid,
           });
+          const standby = /Call the mcp__foundry__moment tool now with token "([^"]+)"/.exec(
+            prompt,
+          );
+          if (standby) {
+            standbyPrompts.push(prompt);
+            io.emit({
+              type: 'assistant',
+              parent_tool_use_id: toolUseId,
+              session_id: sid,
+              message: {
+                role: 'assistant',
+                content: [
+                  behavior.standbyTool
+                    ? { type: 'tool_use', id: 'b', name: 'Bash', input: {} }
+                    : {
+                        type: 'tool_use',
+                        id: `mc${seq}`,
+                        name: 'mcp__foundry__moment',
+                        input: { token: standby[1] },
+                      },
+                ],
+              },
+            });
+            waiting.set(taskId, { toolUseId });
+            const rpc = `mcp-${++seq}`;
+            void new Promise<any>((resolve) => {
+              hookWaiters.set(rpc, resolve);
+              io.emit({
+                type: 'control_request',
+                request_id: rpc,
+                request: {
+                  subtype: 'mcp_message',
+                  server_name: 'foundry',
+                  message: {
+                    jsonrpc: '2.0',
+                    id: seq,
+                    method: 'tools/call',
+                    params: { name: 'moment', arguments: { token: standby[1] } },
+                  },
+                },
+              });
+            }).then((response) => {
+              if (!waiting.has(taskId)) return;
+              waiting.delete(taskId);
+              const moment = response.mcp_response.result.content[0].text as string;
+              momentInputs.push(moment);
+              io.emit({
+                type: 'assistant',
+                parent_tool_use_id: toolUseId,
+                session_id: sid,
+                message: {
+                  role: 'assistant',
+                  model: 'claude-test',
+                  content: [{ type: 'text', text: `decided: ${moment}` }],
+                  usage: {
+                    input_tokens: 2,
+                    output_tokens: 3,
+                    cache_read_input_tokens: 5000,
+                    cache_creation_input_tokens: 0,
+                  },
+                },
+              });
+              io.emit({
+                type: 'system',
+                subtype: 'task_notification',
+                task_id: taskId,
+                tool_use_id: toolUseId,
+                status: 'completed',
+                session_id: sid,
+              });
+              io.emit({
+                type: 'user',
+                session_id: sid,
+                message: {
+                  role: 'user',
+                  content: [{ type: 'tool_result', tool_use_id: toolUseId, content: 'hand-back' }],
+                },
+              });
+              done();
+            });
+            continue;
+          }
           if (behavior.hold?.(prompt)) {
             running.set(taskId, { toolUseId });
             continue;
@@ -210,7 +309,17 @@ function dispatcherCli(behavior: Behavior = {}) {
     processes.push(fake);
     return fake.proc;
   };
-  return { spawn, spawns, agents, processes, userMessages, controls, subagentInputs };
+  return {
+    spawn,
+    spawns,
+    agents,
+    processes,
+    userMessages,
+    controls,
+    subagentInputs,
+    standbyPrompts,
+    momentInputs,
+  };
 }
 
 function host(
@@ -262,7 +371,8 @@ describe('ClaudeSubagentSessions', () => {
     ]);
     // Each role is an agent whose system prompt is the base, its instructions and its stable context.
     expect(
-      Object.values(cli.agents[0]!)
+      Object.values(cli.agents[0]! as Record<string, any>)
+        .filter((a) => a.tools.length === 0)
         .map((a: any) => a.prompt)
         .sort(),
     ).toEqual([
@@ -270,7 +380,10 @@ describe('ClaudeSubagentSessions', () => {
       'BASE\n\nROLE docs\n\nCACHE docs',
       'BASE\n\nROLE tests\n\nCACHE tests',
     ]);
-    for (const def of Object.values(cli.agents[0]!) as any[]) expect(def.tools).toEqual([]);
+    const defs = Object.values(cli.agents[0]!) as any[];
+    // Each role also has a pre-started variant whose only tool is the moment.
+    expect(defs.filter((d) => d.tools.length === 0)).toHaveLength(3);
+    expect(defs.filter((d) => d.tools[0] === 'mcp__foundry__moment')).toHaveLength(3);
     const argv = cli.spawns[0]!;
     expect(argv).toEqual(expect.arrayContaining(['--tools', 'Agent', '--no-session-persistence']));
     // The dispatcher's wrap-up is cut short and its turn rewound to before the fan-out.
@@ -415,6 +528,97 @@ describe('ClaudeSubagentSessions', () => {
       dispatch: 'not-dispatched',
     });
     expect(events.filter((e) => e.type === 'process-started')).toHaveLength(0);
+  });
+
+  test('pre-started members answer at once: the decision only answers their held moment call', async () => {
+    const cli = dispatcherCli();
+    const { h } = host(cli);
+    const roles = ['api', 'docs', 'tests'].map(role);
+    h.prestart(
+      'T1',
+      roles.map((spec) => ({ spec, standby: 'THREAD v1\n' })),
+    );
+    await tick(60);
+    expect(cli.userMessages).toHaveLength(1); // the standby fan-out, off any decision's path
+    expect(cli.standbyPrompts.every((p) => p.startsWith('THREAD v1\n'))).toBe(true);
+    // Every role is a standby variant whose only tool is the moment.
+    const defs = cli.agents[0]! as Record<string, any>;
+    expect(Object.values(defs).filter((d) => d.tools[0] === 'mcp__foundry__moment')).toHaveLength(
+      3,
+    );
+    const results = await Promise.all(
+      roles.map((spec, i) =>
+        h.decide(spec, { input: `moment ${i}`, group: 'T1', standby: 'THREAD v1\n' }),
+      ),
+    );
+    expect(results.map((r) => r.content)).toEqual([
+      'decided: moment 0',
+      'decided: moment 1',
+      'decided: moment 2',
+    ]);
+    expect(cli.momentInputs.sort()).toEqual(['moment 0', 'moment 1', 'moment 2']);
+    expect(cli.subagentInputs.filter((p) => p.startsWith('moment'))).toEqual([]); // no fan-out for them
+    // Used spares end the standby turn, which is rewound; they are pre-started again.
+    await tick(80);
+    expect(cli.controls.some((c) => c.subtype === 'rewind_conversation')).toBe(true);
+    expect(cli.standbyPrompts).toHaveLength(6);
+  });
+
+  test('a decision whose standby context differs fans out with the standby in front of its input', async () => {
+    const cli = dispatcherCli();
+    const { h } = host(cli);
+    h.prestart('T1', [{ spec: role('api'), standby: 'THREAD v1\n' }]);
+    await tick(60);
+    const r = await h.decide(role('api'), { input: 'moment', group: 'T1', standby: 'THREAD v2\n' });
+    expect(r.content).toBe('decided: THREAD v2\nmoment');
+    expect(cli.momentInputs).toEqual([]);
+  });
+
+  test('new standby context replaces the spares; the old standby turn ends', async () => {
+    const cli = dispatcherCli();
+    const { h } = host(cli);
+    h.prestart('T1', [{ spec: role('api'), standby: 'THREAD v1\n' }]);
+    await tick(60);
+    h.prestart('T1', [{ spec: role('api'), standby: 'THREAD v2\n' }]);
+    await tick(120);
+    expect(cli.controls.some((c) => c.subtype === 'interrupt')).toBe(true);
+    const r = await h.decide(role('api'), { input: 'moment', group: 'T1', standby: 'THREAD v2\n' });
+    expect(r.content).toBe('decided: moment');
+    expect(cli.momentInputs).toEqual(['moment']);
+  });
+
+  test('a reserved spare whose decision expires before its moment stays pre-started', async () => {
+    const cli = dispatcherCli();
+    const { h } = host(cli);
+    h.prestart('T1', [{ spec: role('api'), standby: 'S\n' }]);
+    // Reserved immediately, while the spare is still starting; it expires unsent.
+    const late = await h
+      .decide(role('api'), { input: 'late', group: 'T1', standby: 'S\n', timeoutMs: 1 })
+      .catch((e) => e);
+    expect(late).toMatchObject({ reason: 'timeout', dispatch: 'not-dispatched' });
+    await tick(60);
+    const r = await h.decide(role('api'), { input: 'next', group: 'T1', standby: 'S\n' });
+    expect(r.content).toBe('decided: next');
+    expect(cli.momentInputs).toEqual(['next']);
+  });
+
+  test('a pre-started member that acts before its moment is never used', async () => {
+    const cli = dispatcherCli({ standbyTool: true });
+    const { h } = host(cli);
+    h.prestart('T1', [{ spec: role('api'), standby: 'S\n' }]);
+    await tick(60);
+    const r = await h.decide(role('api'), { input: 'moment', group: 'T1', standby: 'S\n' });
+    expect(r.content).toBe('decided: S\nmoment'); // served by a fan-out instead
+  });
+
+  test('releasing a group stops its pre-started members and side sessions', async () => {
+    const cli = dispatcherCli();
+    const { h } = host(cli);
+    h.prestart('T1', [{ spec: role('api'), standby: 'S\n' }]);
+    await tick(60);
+    await h.releaseGroup('T1');
+    expect(cli.processes.every((p) => p.killed || p.closed)).toBe(true);
+    expect(h.snapshot().sessions).toBe(0);
   });
 
   test('close refuses waiting decisions and stops the side sessions', async () => {

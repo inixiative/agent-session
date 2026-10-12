@@ -48,6 +48,11 @@ export interface DecisionRequest {
   readonly signal?: AbortSignal;
   /** Decisions of one group share a side session (ClaudeSubagentSessions): a Foundry thread. */
   readonly group?: string;
+  /**
+   * The group's current context, which precedes `input` (ClaudeSubagentSessions): a member
+   * pre-started with exactly this context receives only `input`; otherwise both are sent.
+   */
+  readonly standby?: string;
 }
 
 export interface DecisionResult {
@@ -144,6 +149,10 @@ export interface PrimedSessions {
   decide(spec: PrimeSpec, request: DecisionRequest): Promise<DecisionResult>;
   /** Drop a key's primed session; the next decision re-primes it. */
   evict(key: string): Promise<void>;
+  /** Keep these roles of a group pre-started, holding this standby context (ClaudeSubagentSessions). */
+  prestart?(group: string, entries: ReadonlyArray<{ spec: PrimeSpec; standby: string }>): void;
+  /** A group is done (its thread closed): stop what it holds (ClaudeSubagentSessions). */
+  releaseGroup?(group: string): Promise<void>;
   limits(): LimitSnapshot | undefined;
   snapshot(): PrimedSnapshot;
   close(): Promise<void>;
