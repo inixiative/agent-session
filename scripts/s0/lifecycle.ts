@@ -42,7 +42,14 @@ export function sanitizeArgv(cmd: readonly string[], sanitizer: Sanitizer) {
     const flag = eq < 0 ? token : token.slice(0, eq);
     const known =
       flag in values ||
-      ['--resume', '--append-system-prompt', '--max-turns', '-c', '--config'].includes(flag);
+      [
+        '--resume',
+        '--append-system-prompt',
+        '--append-system-prompt-file',
+        '--max-turns',
+        '-c',
+        '--config',
+      ].includes(flag);
     if (!known) {
       args.push(redacted);
       continue;

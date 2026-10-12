@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { ClaudeCodeSession, type PipedSubprocess } from '../src/claude-code-session';
 import type { SessionEvent } from '../src/harness-session';
 
@@ -322,6 +323,51 @@ describe('ClaudeCodeSession', () => {
     session.interrupt();
 
     await expect(p).rejects.toThrow(/interrupted/);
+  });
+
+  test('the base context rides in a private file, not argv, and is removed with the process', async () => {
+    const fake = makeFakeProc();
+    let argv: string[] = [];
+    const base = `BASE ${'x'.repeat(200 * 1024)}`;
+    const session = new ClaudeCodeSession({
+      bin: 'claude',
+      cwd: '/tmp',
+      model: 'haiku',
+      baseContext: base,
+      spawn: (cmd) => {
+        argv = cmd;
+        return fake.proc;
+      },
+    });
+    await session.start();
+    expect(argv).not.toContain('--append-system-prompt');
+    expect(argv.every((arg) => arg.length < 128 * 1024)).toBe(true);
+    const file = argv[argv.indexOf('--append-system-prompt-file') + 1]!;
+    expect(readFileSync(file, 'utf8')).toBe(base);
+    expect(statSync(file).mode & 0o777).toBe(0o600);
+    session.kill();
+    expect(existsSync(file)).toBe(false);
+  });
+
+  test('a process that exits on its own removes its base context file', async () => {
+    const fake = makeFakeProc();
+    let argv: string[] = [];
+    const session = new ClaudeCodeSession({
+      bin: 'claude',
+      cwd: '/tmp',
+      model: 'haiku',
+      baseContext: 'BASE',
+      spawn: (cmd) => {
+        argv = cmd;
+        return fake.proc;
+      },
+    });
+    await session.start();
+    const file = argv[argv.indexOf('--append-system-prompt-file') + 1]!;
+    expect(existsSync(file)).toBe(true);
+    fake.exit(1);
+    await Bun.sleep(10);
+    expect(existsSync(file)).toBe(false);
   });
 
   test('kill() tears down the session and rejects pending turns', async () => {

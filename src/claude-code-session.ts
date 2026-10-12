@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   claudeRateLimitSnapshot,
   claudeUsageSnapshot,
@@ -92,7 +95,8 @@ export interface ClaudeCodeSessionConfig {
   /**
    * Base context to pre-load at session startup.
    *
-   * Injected via --append-system-prompt on process spawn. Persists for the
+   * Injected via --append-system-prompt-file on process spawn (a private 0600 file, removed when the
+   * process ends), so a base past Linux's 128 KiB per-argument limit still starts. Persists for the
    * entire session lifetime. Include all stable context here (system,
    * conventions, memory, architecture) so per-message delta is minimal.
    */
@@ -258,6 +262,8 @@ export class ClaudeCodeSession implements HarnessSession {
   private _permissionMode: string;
   private _defaultTimeout: number;
   private _baseContext?: string;
+  /** The private directory holding the base context file while a process runs. */
+  private _baseContextDir?: string;
   private _forking = false;
   private _awaitingForkIdentity = false;
   private _spawn?: ClaudeCodeSessionConfig['spawn'];
@@ -448,16 +454,21 @@ export class ClaudeCodeSession implements HarnessSession {
     delete env.ANTHROPIC_AUTH_TOKEN;
     for (const key of Object.keys(env)) if (env[key] === undefined) delete env[key];
 
-    if (this._spawn) {
-      this._proc = this._spawn([this._bin, ...args], { cwd: this._cwd, env });
-    } else {
-      this._proc = Bun.spawn([this._bin, ...args], {
-        cwd: this._cwd,
-        stdin: 'pipe',
-        stdout: 'pipe',
-        stderr: 'pipe',
-        env,
-      }) as unknown as PipedSubprocess;
+    try {
+      if (this._spawn) {
+        this._proc = this._spawn([this._bin, ...args], { cwd: this._cwd, env });
+      } else {
+        this._proc = Bun.spawn([this._bin, ...args], {
+          cwd: this._cwd,
+          stdin: 'pipe',
+          stdout: 'pipe',
+          stderr: 'pipe',
+          env,
+        }) as unknown as PipedSubprocess;
+      }
+    } catch (error) {
+      this._removeBaseContext();
+      throw error;
     }
 
     this._alive = true;
@@ -470,7 +481,10 @@ export class ClaudeCodeSession implements HarnessSession {
     this._readStderr();
 
     // Monitor process exit for cleanup
+    // The process read its base context file at startup; it goes when the process does.
+    const baseDir = this._baseContextDir;
     proc.exited.then(async (code) => {
+      this._removeBaseContext(baseDir);
       if (this._proc !== proc || !this._alive) return;
       this._alive = false;
       await stdoutDone; // Drain buffered terminal evidence before interpreting process exit.
@@ -734,6 +748,7 @@ export class ClaudeCodeSession implements HarnessSession {
       /* already dead */
     }
     this._proc = null;
+    this._removeBaseContext();
 
     this._emit({ kind: 'session_end', timestamp: Date.now() });
   }
@@ -1328,10 +1343,26 @@ export class ClaudeCodeSession implements HarnessSession {
 
     // Stable base context injected once at process startup
     if (this._baseContext) {
-      args.push('--append-system-prompt', this._baseContext);
+      args.push('--append-system-prompt-file', this._writeBaseContext(this._baseContext));
     }
 
     return args;
+  }
+
+  /** The base context as a private file: argv carries its path, never its text. */
+  private _writeBaseContext(text: string): string {
+    this._removeBaseContext();
+    this._baseContextDir = mkdtempSync(join(tmpdir(), 'agent-session-base-'));
+    const file = join(this._baseContextDir, 'append-system-prompt.md');
+    writeFileSync(file, text, { mode: 0o600 });
+    return file;
+  }
+
+  /** Remove a spawn's base context directory: the current one by default. */
+  private _removeBaseContext(dir = this._baseContextDir): void {
+    if (!dir) return;
+    rmSync(dir, { recursive: true, force: true });
+    if (dir === this._baseContextDir) this._baseContextDir = undefined;
   }
 
   // ---------------------------------------------------------------------------

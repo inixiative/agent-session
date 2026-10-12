@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, test } from 'bun:test';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   AcpSession,
   ApiSession,
@@ -438,6 +441,21 @@ describe('Codex app-server transport additions', () => {
 });
 
 describe('Agent SDK transport', () => {
+  test('the appended system prompt file maps to the SDK preset append', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sdk-append-'));
+    const file = join(dir, 'base.md');
+    writeFileSync(file, 'BASE FROM FILE');
+    try {
+      expect(sdkOptionsFromArgv(['--append-system-prompt-file', file]).systemPrompt).toEqual({
+        type: 'preset',
+        preset: 'claude_code',
+        append: 'BASE FROM FILE',
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test('argv maps to SDK options; unmapped flags pass through extraArgs', () => {
     const options = sdkOptionsFromArgv([
       '--print',

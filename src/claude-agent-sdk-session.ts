@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 // ---------------------------------------------------------------------------
 // ClaudeAgentSdkSession — Claude through @anthropic-ai/claude-agent-sdk
 // ---------------------------------------------------------------------------
@@ -89,6 +90,13 @@ export function sdkOptionsFromArgv(argv: readonly string[]): Record<string, unkn
         break;
       case '--append-system-prompt':
         options.systemPrompt = { type: 'preset', preset: 'claude_code', append: value() };
+        break;
+      case '--append-system-prompt-file':
+        options.systemPrompt = {
+          type: 'preset',
+          preset: 'claude_code',
+          append: readFileSync(value(), 'utf8'),
+        };
         break;
       case '--no-session-persistence':
         options.persistSession = false;

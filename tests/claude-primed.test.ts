@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test';
+import { readFileSync } from 'node:fs';
 import { CLAUDE_TEXT_ONLY_ARGS, ClaudePrimedSessions, type PrimedEvent } from '../src';
 import { fakeProcess, tick } from './helpers/fake-process';
 
@@ -15,10 +16,14 @@ function claudeCli(
   } = {},
 ) {
   const spawns: string[][] = [];
+  /** Each spawn's appended system prompt, read while its file exists. */
+  const systemPrompts: (string | undefined)[] = [];
   const processes: ReturnType<typeof fakeProcess>[] = [];
   let forks = 0;
   const spawn = (argv: string[]) => {
     spawns.push(argv);
+    const file = argv.indexOf('--append-system-prompt-file');
+    systemPrompts.push(file >= 0 ? readFileSync(argv[file + 1]!, 'utf8') : undefined);
     const resumeAt = argv.indexOf('--resume');
     const sid =
       resumeAt >= 0 && argv.includes('--fork-session')
@@ -130,7 +135,7 @@ function claudeCli(
     processes.push(fake);
     return fake.proc;
   };
-  return { spawn, spawns, processes };
+  return { spawn, spawns, systemPrompts, processes };
 }
 
 function host(
@@ -167,7 +172,8 @@ describe('ClaudePrimedSessions', () => {
     const base = cli.spawns[0]!;
     for (const flag of CLAUDE_TEXT_ONLY_ARGS) expect(base).toContain(flag);
     expect(base).not.toContain('--no-session-persistence');
-    expect(base[base.indexOf('--append-system-prompt') + 1]).toBe('BASE\n\nROLE');
+    expect(base).not.toContain('--append-system-prompt');
+    expect(cli.systemPrompts[0]).toBe('BASE\n\nROLE');
     expect(base).toEqual(expect.arrayContaining(['--max-turns', '1']));
     const fork = cli.spawns[1]!;
     expect(fork).toEqual(
@@ -178,7 +184,7 @@ describe('ClaudePrimedSessions', () => {
         '--no-session-persistence',
       ]),
     );
-    expect(fork[fork.indexOf('--append-system-prompt') + 1]).toBe('BASE\n\nROLE');
+    expect(cli.systemPrompts[1]).toBe('BASE\n\nROLE');
     expect(cli.processes[0]!.lines[0].message.content[0].text).toStartWith('DOMAIN CACHE');
   });
 
