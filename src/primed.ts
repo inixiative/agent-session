@@ -46,6 +46,8 @@ export interface DecisionRequest {
   readonly outputSchema?: Readonly<Record<string, unknown>>;
   /** Cancel: refused before dispatch, or the running turn is interrupted and settled. */
   readonly signal?: AbortSignal;
+  /** Decisions of one group share a side session (ClaudeSubagentSessions): a Foundry thread. */
+  readonly group?: string;
 }
 
 export interface DecisionResult {
