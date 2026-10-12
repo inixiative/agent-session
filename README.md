@@ -188,7 +188,7 @@ Opaque runtimes degrade gracefully — fewer event types, never a hard failure.
 ## Provenance
 
 Extracted from [`inixiative/foundry`](https://github.com/inixiative/foundry),
-where this drives the Artificer session. Consumed by foundry, foundry-oracle,
+where this drives the Artificer session. Consumed by foundry, oracle,
 and the inixiative bench.
 
 ## License
