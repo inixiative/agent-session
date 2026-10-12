@@ -17,6 +17,7 @@ export {
   type ClaudeCodeSessionConfig,
 } from './claude-code-session';
 export { type ClaudePrimedConfig, ClaudePrimedSessions } from './claude-primed';
+export { type ClaudeSubagentConfig, ClaudeSubagentSessions } from './claude-subagents';
 export { parseClaudeUsage } from './claude-usage';
 export {
   CODEX_DECISION_DISABLED_FEATURES,
