@@ -94,14 +94,22 @@ session.onToolRequest(async (call) => {
 });
 ```
 
-- `pre-use` runs before every call in every mode, `bypassPermissions` included;
-  only a deny counts. Claude: a PreToolUse callback over the control protocol.
+- `pre-use` (Claude only) runs before every call in every mode,
+  `bypassPermissions` included; only a deny counts. A PreToolUse callback over
+  the control protocol; one the session cannot read is denied.
 - `permission` is an ask the runtime's mode raised; the answer is final (no gate:
-  denied). Claude: `--permission-prompt-tool stdio`. Codex app-server: command
-  and file-change `requestApproval`, answered accept/decline, under
-  `appServer: codexPermissions(mode)`.
+  denied). Claude: `--permission-prompt-tool stdio`; `decisionReason` says why it
+  asked, `agentId` marks a subagent's call. Codex app-server: command and
+  file-change `requestApproval`, answered accept/decline, under
+  `appServer: codexPermissions(mode)`. File-change asks carry the item's
+  `toolInput.changes` (path, kind, bounded diff); command asks carry
+  `networkApprovalContext`. Gated threads pin `approvalsReviewer: "user"` and
+  are refused if a config routes approvals elsewhere. Under the default `never`
+  policy nothing is asked, so `onToolRequest` throws.
 - `call.signal` aborts when the runtime withdraws the request or the session
-  ends; a decision after that is never written.
+  ends (kill, exit, transport failure); a decision after that is never written.
+  A turn timeout does not withdraw a pending Claude ask; `interruptNative()` does.
+- A fork starts with a snapshot of the parent's gates.
 
 ## Primed decision sessions
 

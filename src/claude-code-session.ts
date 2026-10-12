@@ -120,7 +120,9 @@ export interface ClaudeCodeSessionConfig {
   /**
    * Launch for per-call tool decisions: `--permission-prompt-tool stdio` plus a PreToolUse
    * callback registered over the control protocol at start(). Gates added with
-   * onToolRequest() decide (a `permission` ask with no gate is denied). Not with textOnly.
+   * onToolRequest() decide (a `permission` ask with no gate is denied). A callback or ask that
+   * cannot be read as a tool request is denied (fail closed). A turn timeout leaves a pending
+   * ask open; interruptNative() withdraws it. Not with textOnly.
    */
   toolGate?: boolean;
   /**
@@ -393,6 +395,7 @@ export class ClaudeCodeSession implements HarnessSession {
     };
   }
 
+  /** Register a tool gate. A fork gets a snapshot of the gates registered at fork() time. */
   onToolRequest(gate: ToolGate): () => void {
     if (!this._toolGate) throw new Error('Tool gates need a session launched with toolGate: true');
     return this._gates.add(gate);
@@ -572,7 +575,7 @@ export class ClaudeCodeSession implements HarnessSession {
   }
 
   // ---------------------------------------------------------------------------
-  // fork() — branch from current conversation state
+  // fork() — branch from current conversation state (and a snapshot of the tool gates)
   // ---------------------------------------------------------------------------
 
   fork(opts?: {
@@ -992,6 +995,13 @@ export class ClaudeCodeSession implements HarnessSession {
         this._answerToolRequest(this._proc!, id, toolRequest);
         return;
       }
+      // A gated ask or our own callback that cannot be read is denied: an error reply allows.
+      const unreadable = id && this._toolGate && this._proc ? this._unreadable(request) : undefined;
+      if (id && unreadable) {
+        this._writeControlResponse(this._proc!, id, unreadable);
+        this._unattributed(raw, 'unrecognized-event');
+        return;
+      }
       // No other client-side handlers are registered on this transport.
       if (id && this._proc) {
         try {
@@ -1170,7 +1180,7 @@ export class ClaudeCodeSession implements HarnessSession {
     let source: Record<string, unknown> | undefined;
     let toolName: string | undefined;
     let toolInput: Record<string, unknown> | undefined;
-    if (request?.subtype === 'hook_callback' && request.callback_id === this._hookCallbackId) {
+    if (request && this._ownHookCallback(request)) {
       source = record(request.input);
       if (source?.hook_event_name !== 'PreToolUse') return undefined;
       stage = 'pre-use';
@@ -1184,6 +1194,7 @@ export class ClaudeCodeSession implements HarnessSession {
     } else return undefined;
     if (!toolName) return undefined;
     const callId = text(source?.tool_use_id) ?? text(request.tool_use_id);
+    const agentId = text(source?.agent_id) ?? text(request.agent_id);
     const turn = this._inflight;
     return {
       stage,
@@ -1195,8 +1206,28 @@ export class ClaudeCodeSession implements HarnessSession {
         ? { admissionId: turn.evidence.admissionId }
         : {}),
       ...(text(request.description) ? { description: text(request.description) } : {}),
+      ...(text(request.decision_reason) ? { decisionReason: text(request.decision_reason) } : {}),
       ...(text(request.blocked_path) ? { blockedPath: text(request.blocked_path) } : {}),
+      ...(agentId ? { agentId } : {}),
     };
+  }
+
+  private _ownHookCallback(request: Record<string, unknown> | undefined): boolean {
+    return request?.subtype === 'hook_callback' && request.callback_id === this._hookCallbackId;
+  }
+
+  /** The deny for a gated request _toolRequestFrom could not read; undefined when not ours. */
+  private _unreadable(
+    request: Record<string, unknown> | undefined,
+  ): Record<string, unknown> | undefined {
+    if (this._ownHookCallback(request))
+      return this._toolResponse(
+        { stage: 'pre-use', toolName: '', toolInput: {} },
+        { behavior: 'deny', message: 'Tool gate: unreadable PreToolUse callback' },
+      );
+    if (request?.subtype === 'can_use_tool')
+      return { behavior: 'deny', message: 'Tool gate: unreadable permission request' };
+    return undefined;
   }
 
   private _answerToolRequest(

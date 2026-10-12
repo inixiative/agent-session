@@ -197,7 +197,14 @@ function bridge(
           canUseTool: async (
             toolName: string,
             input: Record<string, unknown>,
-            context: { signal?: AbortSignal; toolUseID?: string; blockedPath?: string } = {},
+            context: {
+              signal?: AbortSignal;
+              toolUseID?: string;
+              blockedPath?: string;
+              decisionReason?: string;
+              description?: string;
+              agentID?: string;
+            } = {},
           ) =>
             ((await ask(
               {
@@ -206,6 +213,13 @@ function bridge(
                 input,
                 ...(context.toolUseID ? { tool_use_id: context.toolUseID } : {}),
                 ...(context.blockedPath ? { blocked_path: context.blockedPath } : {}),
+                ...(typeof context.decisionReason === 'string' && context.decisionReason
+                  ? { decision_reason: context.decisionReason }
+                  : {}),
+                ...(typeof context.description === 'string' && context.description
+                  ? { description: context.description }
+                  : {}),
+                ...(context.agentID ? { agent_id: context.agentID } : {}),
               },
               context.signal,
             )) as Record<string, unknown> | undefined) ?? {
@@ -230,7 +244,14 @@ function bridge(
                         ...(toolUseID ? { tool_use_id: toolUseID } : {}),
                       },
                       context.signal,
-                    )) as Record<string, unknown> | undefined) ?? {},
+                    )) as Record<string, unknown> | undefined) ?? {
+                      // No answer (bridge closed, or the session could not read it): fail closed.
+                      hookSpecificOutput: {
+                        hookEventName: 'PreToolUse',
+                        permissionDecision: 'deny',
+                        permissionDecisionReason: 'Tool gate unavailable',
+                      },
+                    },
                 ],
               },
             ],

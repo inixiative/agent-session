@@ -32,6 +32,7 @@ export {
 export {
   type CodexApprovalPolicy,
   CodexAppServerSession,
+  type CodexFileChange,
   CodexMcpSession,
   type CodexSandbox,
   CodexSession,

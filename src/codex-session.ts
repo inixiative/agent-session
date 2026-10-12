@@ -71,7 +71,8 @@ export type HostPermissionMode = 'default' | 'acceptEdits' | 'plan' | 'bypassPer
 
 /**
  * The app-server approval policy and sandbox for a host permission mode (Claude's mode ids).
- * `acceptEdits` asks like `default`; auto-accepting file changes is the gate's decision.
+ * `acceptEdits` maps like `default`: under workspace-write, edits inside the workspace are never
+ * asked about; only escalations (writes outside it, commands needing more access) reach the gates.
  */
 export function codexPermissions(mode: HostPermissionMode): {
   approvalPolicy: CodexApprovalPolicy;
@@ -119,7 +120,10 @@ export interface CodexSessionConfig {
     /**
      * Native approval policy and sandbox for the thread. Default `never` / `danger-full-access`.
      * With `on-request` or `untrusted`, approval requests go to the gates registered through
-     * onToolRequest() (stage `permission`); with none registered they are declined.
+     * onToolRequest() (stage `permission` only; Codex has no pre-use stage); with none registered
+     * they are declined. The thread is started with `approvalsReviewer: "user"` and refused if the
+     * runtime reports another reviewer (a config.toml `approvals_reviewer` would bypass the gates).
+     * Under `never` nothing reaches a gate and onToolRequest() throws.
      * `codexPermissions(mode)` maps the host permission modes.
      */
     approvalPolicy?: CodexApprovalPolicy;
@@ -347,6 +351,7 @@ abstract class BaseCodexSession implements HarnessSession {
     this._rejectQueue(new Error('Session killed'));
     for (const p of this._pending.values()) p.reject(new Error('Session killed'));
     this._pending.clear();
+    this._withdrawRequests();
 
     try {
       this._proc.stdin.end();
@@ -431,6 +436,7 @@ abstract class BaseCodexSession implements HarnessSession {
       this._rejectQueue(new Error('Session ended'));
       for (const p of this._pending.values()) p.reject(new Error('Session ended'));
       this._pending.clear();
+      this._withdrawRequests();
       this._emit({ kind: 'session_end', timestamp: Date.now(), transportOutcome: 'failed' });
     });
 
@@ -638,6 +644,7 @@ abstract class BaseCodexSession implements HarnessSession {
     this._emit({ kind: 'session_end', timestamp: Date.now(), transportOutcome: 'failed' });
     for (const p of this._pending.values()) p.reject(err);
     this._pending.clear();
+    this._withdrawRequests();
   }
 
   protected _rejectQueue(err: Error): void {
@@ -833,6 +840,9 @@ abstract class BaseCodexSession implements HarnessSession {
   protected abstract _classify(msg: Record<string, unknown>): SessionEvent[];
 
   protected _observeRpcResult(_id: number, _result: unknown): void {}
+
+  /** The process is gone (kill, exit, transport failure): withdraw server requests still pending. */
+  protected _withdrawRequests(): void {}
 
   /** Shared fork constructor — subclass passes its own ctor. */
   fork(opts?: { cwd?: string; baseContext?: string }): HarnessSession {
@@ -1283,6 +1293,8 @@ export class CodexAppServerSession extends BaseCodexSession {
   private _gates = new ToolGates();
   /** Approval requests awaiting a gate decision, by JSON-RPC request id. */
   private _approvals = new Map<string, AbortController>();
+  /** The owned turn's in-progress fileChange items' changes, by item id, for their approvals. */
+  private _fileChanges = new Map<string, readonly CodexFileChange[]>();
   private _items = new Map<
     string,
     {
@@ -1330,18 +1342,27 @@ export class CodexAppServerSession extends BaseCodexSession {
     }
   }
 
+  /** Needs an `approvalPolicy` other than `never`. Gates registered here are not copied (no fork). */
   onToolRequest(gate: ToolGate): () => void {
+    if (this._approvalPolicy === 'never')
+      throw new Error(
+        'Tool gates need an app-server session launched with approvalPolicy "on-request" or "untrusted"; under "never" no approval reaches them',
+      );
     return this._gates.add(gate);
   }
 
-  override kill(): void {
+  protected override _withdrawRequests(): void {
     for (const approval of this._approvals.values()) approval.abort();
     this._approvals.clear();
-    super.kill();
   }
 
   private get _approvalPolicy(): CodexApprovalPolicy {
     return this._options.approvalPolicy ?? 'never';
+  }
+
+  /** Approval requests are asked of this client, so they must reach the gates. */
+  private get _gated(): boolean {
+    return this._approvalPolicy !== 'never';
   }
 
   private get _sandbox(): CodexSandbox {
@@ -1363,13 +1384,21 @@ export class CodexAppServerSession extends BaseCodexSession {
       return false;
     const str = (value: unknown) => (typeof value === 'string' && value ? value : undefined);
     const command = method === 'item/commandExecution/requestApproval';
+    const network = object(params.networkApprovalContext);
+    const host = str(network?.host),
+      protocol = str(network?.protocol);
+    const changes = str(params.itemId) ? this._fileChanges.get(params.itemId as string) : undefined;
     const toolInput: Record<string, unknown> = command
       ? {
           ...(str(params.command) ? { command: params.command } : {}),
           ...(str(params.cwd) ? { cwd: params.cwd } : {}),
           ...(str(params.kind) ? { kind: params.kind } : {}),
+          ...(host ? { networkApprovalContext: { host, ...(protocol ? { protocol } : {}) } } : {}),
         }
-      : { ...(str(params.grantRoot) ? { grantRoot: params.grantRoot } : {}) };
+      : {
+          ...(str(params.grantRoot) ? { grantRoot: params.grantRoot } : {}),
+          ...(changes ? { changes: structuredClone(changes) } : {}),
+        };
     const proc = this._proc;
     const id = request.id;
     const key = JSON.stringify(id);
@@ -1571,6 +1600,8 @@ export class CodexAppServerSession extends BaseCodexSession {
           model: this._model,
           cwd: this._cwd,
           approvalPolicy: this._approvalPolicy,
+          // Approvals go to the gates, never to a config-selected reviewer (auto_review, guardian).
+          ...(this._gated ? { approvalsReviewer: 'user' } : {}),
           sandbox: this._sandbox,
           ...(this._options.config ? { config: this._options.config } : {}),
         }),
@@ -1591,6 +1622,16 @@ export class CodexAppServerSession extends BaseCodexSession {
           'not-idle',
           ['active', 'notLoaded', 'systemError'].includes(String(object(thread?.status)?.type))
             ? String(object(thread?.status)?.type)
+            : 'unknown',
+        );
+      if (
+        this._gated &&
+        (response?.approvalsReviewer !== 'user' || response.approvalPolicy !== this._approvalPolicy)
+      )
+        this._refuse(
+          'approvals-not-routed-to-user',
+          ['user', 'auto_review', 'guardian_subagent'].includes(String(response?.approvalsReviewer))
+            ? String(response?.approvalsReviewer)
             : 'unknown',
         );
       if (
@@ -1787,6 +1828,7 @@ export class CodexAppServerSession extends BaseCodexSession {
       if (turn.error != null && typeof error?.message !== 'string')
         return unowned('unrecognized-event');
       this._seenTerminals.add(turnId);
+      this._fileChanges.clear();
       this._turnDone?.();
       this._turnDone = undefined;
       return [
@@ -1845,8 +1887,19 @@ export class CodexAppServerSession extends BaseCodexSession {
         },
       ];
     }
+    if (method === 'item/fileChange/patchUpdated') {
+      // Changes only feed the item's approval request; the event itself stays a diagnostic.
+      if (itemId && this._fileChanges.has(itemId))
+        this._fileChanges.set(itemId, fileChanges(params?.changes));
+      return unowned('unrecognized-event');
+    }
     if (method === 'item/completed' || method === 'item/started') {
       if (!itemId || !item || typeof item.type !== 'string') return unowned('unrecognized-event');
+      if (item.type === 'fileChange') {
+        if (method === 'item/started') this._fileChanges.set(itemId, fileChanges(item.changes));
+        else this._fileChanges.delete(itemId);
+        return unowned('unrecognized-event');
+      }
       if (item.type === 'agentMessage') {
         if (method !== 'item/completed') return status();
         if (this._items.get(itemId)?.completed) return unowned('after-terminal');
@@ -1985,6 +2038,49 @@ const object = (value: unknown): Record<string, unknown> | undefined =>
   value !== null && typeof value === 'object' && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : undefined;
+
+/** A fileChange item's change as a file-change gate sees it (`toolInput.changes`). */
+export interface CodexFileChange {
+  readonly path: string;
+  readonly kind: 'add' | 'delete' | 'update';
+  /** Rename target of an `update`. */
+  readonly movePath?: string;
+  /** Unified diff, present while it fits the bound; otherwise `diffOmitted`. */
+  readonly diff?: string;
+  readonly diffOmitted?: true;
+}
+const FILE_CHANGE_DIFF_LIMIT = 16 * 1024;
+const FILE_CHANGE_DIFF_TOTAL = 64 * 1024;
+
+/** Native FileUpdateChange[] (codex 0.155.1) → CodexFileChange[]; diffs only within the bound. */
+function fileChanges(value: unknown): readonly CodexFileChange[] {
+  if (!Array.isArray(value)) return [];
+  let budget = FILE_CHANGE_DIFF_TOTAL;
+  const out: CodexFileChange[] = [];
+  for (const entry of value) {
+    const change = object(entry);
+    const kind = object(change?.kind);
+    if (
+      typeof change?.path !== 'string' ||
+      !change.path ||
+      (kind?.type !== 'add' && kind?.type !== 'delete' && kind?.type !== 'update')
+    )
+      continue;
+    const diff = typeof change.diff === 'string' ? change.diff : undefined;
+    const fits =
+      diff !== undefined && diff.length <= FILE_CHANGE_DIFF_LIMIT && diff.length <= budget;
+    if (fits) budget -= diff.length;
+    out.push({
+      path: change.path,
+      kind: kind.type,
+      ...(kind.type === 'update' && typeof kind.move_path === 'string' && kind.move_path
+        ? { movePath: kind.move_path }
+        : {}),
+      ...(fits ? { diff } : diff ? { diffOmitted: true as const } : {}),
+    });
+  }
+  return out;
+}
 
 function publicMcpArguments(value: unknown): Pick<SessionEvent, 'toolInput' | 'toolInputOmitted'> {
   if (!object(value)) return { toolInputOmitted: 'Native arguments absent or not an object' };

@@ -238,9 +238,9 @@ export interface SessionSendOptions {
 
 export interface ToolRequest {
   /**
-   * `pre-use`: before every tool call, in every permission mode (bypass included). Only a deny
-   * counts; an allow leaves the runtime's own mode to decide. `permission`: the runtime's own
-   * mode would ask the user; the decision is final.
+   * `pre-use` (Claude only; Codex has no pre-use stage): before every tool call, in every
+   * permission mode (bypass included). Only a deny counts; an allow leaves the runtime's own mode
+   * to decide. `permission`: the runtime's own mode would ask the user; the decision is final.
    */
   readonly stage: 'pre-use' | 'permission';
   readonly toolName: string;
@@ -254,9 +254,17 @@ export interface ToolRequest {
   readonly admissionId?: string;
   /** The runtime's own description of, or reason for, the call. */
   readonly description?: string;
+  /** Claude `can_use_tool` decision_reason: why the runtime's mode escalated to an ask. */
+  readonly decisionReason?: string;
   /** Claude `can_use_tool` blocked_path. */
   readonly blockedPath?: string;
-  /** Aborted when the runtime withdraws the request or the session ends; a later decision is discarded. */
+  /** Claude subagent id (`agent_id`) when a subagent, not the main thread, makes the call. */
+  readonly agentId?: string;
+  /**
+   * Aborted when the runtime withdraws the request or the session ends; a later decision is
+   * discarded. A turn timeout does not withdraw a pending Claude ask; interruptNative() does
+   * (the CLI sends control_cancel_request).
+   */
   readonly signal?: AbortSignal;
 }
 export type ToolDecision =
@@ -310,7 +318,8 @@ export interface HarnessSession {
 
   /**
    * Fork: create a new (unstarted) session branching from current state.
-   * Caller must call start() on the forked session.
+   * Caller must call start() on the forked session. A fork starts with a snapshot of the
+   * parent's tool gates; gates registered or unregistered afterwards on either side stay local.
    */
   fork(opts?: { cwd?: string; baseContext?: string }): HarnessSession;
 
@@ -332,7 +341,9 @@ export interface HarnessSession {
 
   /**
    * Register a tool gate. Present where the transport declares `approvals: "callback"`; the
-   * session must be launched for callbacks (Claude: `toolGate: true`). Returns an unregister function.
+   * session must be launched for callbacks (Claude: `toolGate: true`; Codex app-server: an
+   * `approvalPolicy` other than `never`), otherwise this throws. Forks copy the gates registered
+   * at fork() time. Returns an unregister function.
    */
   onToolRequest?(gate: ToolGate): () => void;
 
