@@ -1,5 +1,9 @@
 # S0 native protocol evidence — review pending
 
+> **2026-10-12:** the Codex MCP transport (`CodexMcpSession`, `codex mcp-server`) was removed;
+> app-server is the only Codex transport. Its recordings in this run were deleted. The text
+> below is the historical report as written.
+
 One probe per existing path was authorized and run. No runtime source, installed
 package, dependency, lockfile or engine default changed. Foundry still resolves
 registry agent-session0.1.0; these tests import the clean sibling source revision

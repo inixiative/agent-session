@@ -1,6 +1,5 @@
 import {
   ClaudeCodeSession,
-  CodexMcpSession,
   type CodexSpawn,
   type SessionAttempt,
   type SessionResult,
@@ -46,7 +45,7 @@ const pause = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 
 /** Observes the existing production classes. No transport, parser, replay or resume implementation. */
 export class ContinuationCapture {
-  readonly session: ClaudeCodeSession | CodexMcpSession;
+  readonly session: ClaudeCodeSession;
   private readonly sanitizer = new Sanitizer('continuation');
   private readonly input = new FrameRecorder(this.sanitizer);
   private readonly output = new FrameRecorder(this.sanitizer);
@@ -157,10 +156,7 @@ export class ContinuationCapture {
       timeout: options.sendDeadlineMs ?? 180_000,
       spawn,
     };
-    this.session =
-      path === 'claude'
-        ? new ClaudeCodeSession({ ...config, maxTurns: 8 })
-        : new CodexMcpSession(config);
+    this.session = new ClaudeCodeSession({ ...config, maxTurns: 8 });
     this.session.onEvent((event) => {
       observe('event', () => this.normalized.push(this.sanitizer.clean(event)));
       queueMicrotask(() => this.notify());
@@ -171,11 +167,7 @@ export class ContinuationCapture {
     this.wake.clear();
   }
   private turnWrites() {
-    return this.input.frames.filter((frame) =>
-      this.path === 'claude'
-        ? (frame.value as any)?.type === 'user'
-        : (frame.value as any)?.method === 'tools/call',
-    );
+    return this.input.frames.filter((frame) => (frame.value as any)?.type === 'user');
   }
   private owned(): SessionAttempt | undefined {
     const id = this.turns.at(-1)?.admissionId;
@@ -206,7 +198,7 @@ export class ContinuationCapture {
       this.turnWrites().length !== turn.index + 1
     )
       return false;
-    const binding = this.path === 'claude' ? a.nativeSessionId : a.threadId;
+    const binding = a.nativeSessionId;
     if (
       !binding ||
       this.session.externalSessionId !== binding ||
@@ -216,35 +208,15 @@ export class ContinuationCapture {
     const observed = this.output.frames.slice(turn.firstFrame);
     if (observed.some((frame) => (frame.value as any)?.malformedJson)) return false;
     const frames = observed.map((frame) => frame.value as any);
-    const terminal =
-      this.path === 'claude'
-        ? frames.find(
-            (v) =>
-              v.type === 'result' &&
-              a.terminal?.eventId &&
-              v.uuid === this.sanitizer.ref(a.terminal.eventId) &&
-              v.session_id === this.sanitizer.ref(binding) &&
-              v.subtype === 'success',
-          )
-        : frames.find(
-            (v) =>
-              v.params?.msg?.type === 'task_complete' &&
-              a.turnId &&
-              v.params.msg.turn_id === this.sanitizer.ref(a.turnId),
-          );
+    const terminal = frames.find(
+      (v) =>
+        v.type === 'result' &&
+        a.terminal?.eventId &&
+        v.uuid === this.sanitizer.ref(a.terminal.eventId) &&
+        v.session_id === this.sanitizer.ref(binding) &&
+        v.subtype === 'success',
+    );
     if (!terminal) return false;
-    if (
-      this.path === 'codex-mcp' &&
-      (!frames.some(
-        (v) =>
-          v.params?.msg?.type === 'task_started' &&
-          v.params.msg.turn_id === this.sanitizer.ref(a.turnId),
-      ) ||
-        !frames.some(
-          (v) => v.id === a.rpcRequestId && v.result && !v.error && v.result.isError !== true,
-        ))
-    )
-      return false;
     // Join actual tool begin/results by native call ID, not by adjacency or final response text.
     const begins = a.events.filter((e) => e.kind === 'tool_use' && e.callId);
     const commands = new Set([

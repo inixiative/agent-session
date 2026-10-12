@@ -30,7 +30,7 @@ export function sanitizeArgv(cmd: readonly string[], sanitizer: Sanitizer) {
   const args: string[] = [];
   for (let i = 1; i < cmd.length; i++) {
     const token = cmd[i];
-    if (executable === 'codex' && i === 1 && ['mcp-server', 'app-server'].includes(token)) {
+    if (executable === 'codex' && i === 1 && token === 'app-server') {
       args.push(token);
       continue;
     }

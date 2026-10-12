@@ -12,7 +12,6 @@ import { join, resolve } from 'node:path';
 import {
   ClaudeCodeSession,
   CodexAppServerSession,
-  CodexMcpSession,
   type CodexSpawn,
   type HarnessSession,
 } from '../../src';
@@ -21,8 +20,8 @@ import { CaptureState } from './observation';
 import { FrameRecorder, PROMPT, Sanitizer } from './sanitize';
 
 const path = process.argv[2];
-if (!['claude', 'codex-mcp', 'codex-app-server'].includes(path))
-  throw Error('Choose one path: claude | codex-mcp | codex-app-server');
+if (!['claude', 'codex-app-server'].includes(path))
+  throw Error('Choose one path: claude | codex-app-server');
 const runId = process.argv[3];
 if (!runId || !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,80}$/.test(runId))
   throw Error('An explicit, new recording run ID is required');
@@ -229,9 +228,7 @@ const spawn: CodexSpawn = (cmd, opts) => {
 const session: HarnessSession =
   path === 'claude'
     ? new ClaudeCodeSession({ ...requested, cwd: sample, maxTurns: 8, timeout: 180_000, spawn })
-    : path === 'codex-mcp'
-      ? new CodexMcpSession({ ...requested, cwd: sample, timeout: 180_000, spawn })
-      : new CodexAppServerSession({ ...requested, cwd: sample, timeout: 180_000, spawn });
+    : new CodexAppServerSession({ ...requested, cwd: sample, timeout: 180_000, spawn });
 session.onEvent((e) => observed(() => normalized.push(s.clean(e))));
 const pause = (ms: number) => new Promise((r) => setTimeout(r, ms));
 function terminal(): string | undefined {
@@ -239,8 +236,6 @@ function terminal(): string | undefined {
     const v = frame.value as any;
     if (path === 'claude' && v.type === 'result')
       return v.subtype === 'success' && v.is_error === false ? 'success' : 'failure';
-    const msg = v.params?.msg;
-    if (msg?.type === 'task_complete') return 'task_complete';
     if (v.method === 'turn/completed') return v.params?.turn?.status ?? 'terminal-status-missing';
   }
 }

@@ -1,5 +1,9 @@
 # Real two-admission continuation captures
 
+> **2026-10-12:** the Codex MCP transport (`CodexMcpSession`, `codex mcp-server`) was removed;
+> app-server is the only Codex transport. Its recordings in this run were deleted. The text
+> below is the historical report as written.
+
 Supervisor-authorized captures, 2026-09-07. Source preparation and Fable's deadline
 latch received Astra's opposite-model review in Foundry
 `docs/S1-recorder-correction-review.md`. Supervisor inspected source, plan commands,

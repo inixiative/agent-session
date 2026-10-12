@@ -1,20 +1,34 @@
 import { expect, test } from 'bun:test';
-import { ClaudeCodeSession, CodexMcpSession, type SessionEvent } from '../src';
+import { ClaudeCodeSession, CodexAppServerSession, type SessionEvent } from '../src';
 
 const tick = () => new Promise((r) => setTimeout(r, 5));
-function setup(engine: 'claude' | 'mcp', resume = 'native-session') {
+type Write = { id?: number; method?: string; type?: string; params?: Record<string, unknown> };
+function setup(engine: 'claude' | 'app', resume = 'native-session') {
   let out!: ReadableStreamDefaultController<Uint8Array>, exit!: (code: number) => void;
-  const writes: any[] = [],
+  const writes: Write[] = [],
     spawns: string[][] = [];
   let writeFailure: Error | undefined;
+  let turnId = 'turn-1',
+    item = 0;
   const emit = (v: unknown) => out.enqueue(new TextEncoder().encode(`${JSON.stringify(v)}\n`));
+  const handshake = (v: Write) => {
+    if (v.method === 'initialize') return { result: {} };
+    if (v.method === 'thread/resume')
+      return { result: { thread: { id: resume, status: { type: 'idle' }, turns: [] } } };
+  };
   const proc = {
     stdin: {
       write(data: string) {
-        const v = JSON.parse(data);
+        const v: Write = JSON.parse(data);
         writes.push(v);
-        if (['initialize', 'tools/list'].includes(v.method))
-          queueMicrotask(() => emit({ jsonrpc: '2.0', id: v.id, result: {} }));
+        const reply = handshake(v);
+        // A handshake reply may land after the test closed the stream.
+        if (reply)
+          queueMicrotask(() => {
+            try {
+              emit({ jsonrpc: '2.0', id: v.id, ...reply });
+            } catch {}
+          });
         else if (writeFailure) throw writeFailure;
       },
       flush() {},
@@ -40,30 +54,30 @@ function setup(engine: 'claude' | 'mcp', resume = 'native-session') {
       exit(143);
     },
   };
+  const config = {
+    externalSessionId: resume,
+    timeout: 1000,
+    spawn: (cmd: string[]) => {
+      spawns.push(cmd);
+      return proc;
+    },
+  };
   const session =
-    engine === 'claude'
-      ? new ClaudeCodeSession({
-          externalSessionId: resume,
-          timeout: 1000,
-          spawn: (cmd) => {
-            spawns.push(cmd);
-            return proc;
-          },
-        })
-      : new CodexMcpSession({
-          externalSessionId: resume,
-          timeout: 1000,
-          spawn: (cmd) => {
-            spawns.push(cmd);
-            return proc;
-          },
-        });
+    engine === 'claude' ? new ClaudeCodeSession(config) : new CodexAppServerSession(config);
   const calls = () =>
-    writes.filter((v) => (engine === 'claude' ? v.type === 'user' : v.method === 'tools/call'));
-  const native = (msg: any) =>
-    emit({ jsonrpc: '2.0', method: 'codex/event', params: { id: msg.turn_id, msg } });
-  const begin = (id = 'turn-1') =>
-    engine === 'mcp' && native({ type: 'task_started', turn_id: id });
+    writes.filter((v) => (engine === 'claude' ? v.type === 'user' : v.method === 'turn/start'));
+  const notify = (method: string, params: Record<string, unknown>) =>
+    emit({ jsonrpc: '2.0', method, params: { threadId: resume, ...params } });
+  const turn = (id: string, status = 'inProgress') => ({ id, status, items: [], error: null });
+  /** Waits for the count-th turn write: app-server writes turn/start only after thread/resume answers. */
+  const sent = async (count: number) => {
+    for (let i = 0; i < 20 && calls().length < count; i++) await tick();
+  };
+  const begin = (id = 'turn-1') => {
+    if (engine !== 'app') return;
+    turnId = id;
+    notify('turn/started', { turn: turn(id) });
+  };
   const text = (value = 'completed output', id = 'turn-1') =>
     engine === 'claude'
       ? emit({
@@ -71,7 +85,10 @@ function setup(engine: 'claude' | 'mcp', resume = 'native-session') {
           session_id: resume,
           message: { id: 'message-1', content: [{ type: 'text', text: value }] },
         })
-      : native({ type: 'agent_message', turn_id: id, message: value });
+      : notify('item/completed', {
+          turnId: id,
+          item: { id: `message-${++item}`, type: 'agentMessage', text: value },
+        });
   const terminal = (id = 'turn-1', failed = false, sessionId = resume) =>
     engine === 'claude'
       ? emit({
@@ -82,20 +99,21 @@ function setup(engine: 'claude' | 'mcp', resume = 'native-session') {
           is_error: failed,
           result: 'completed output',
         })
-      : native({ type: 'task_complete', turn_id: id });
+      : notify('turn/completed', { turn: turn(id, failed ? 'failed' : 'completed') });
   const rpc = (error?: string) =>
     emit({
       jsonrpc: '2.0',
-      id: calls().at(-1).id,
-      ...(error
-        ? { error: { code: -1, message: error } }
-        : { result: { structuredContent: { threadId: resume, content: 'completed output' } } }),
+      id: calls().at(-1)!.id,
+      ...(error ? { error: { code: -1, message: error } } : { result: { turn: turn(turnId) } }),
     });
   return {
     session,
     calls,
+    writes,
     spawns,
     emit,
+    notify,
+    sent,
     begin,
     text,
     terminal,
@@ -113,7 +131,7 @@ function setup(engine: 'claude' | 'mcp', resume = 'native-session') {
   };
 }
 // Synthetic ownership/lifecycle cases. No native process or extra recording.
-for (const engine of ['claude', 'mcp'] as const) {
+for (const engine of ['claude', 'app'] as const) {
   test(`${engine}: required admission registration precedes write and rejection never delivers`, async () => {
     const f = setup(engine);
     await f.session.start();
@@ -138,7 +156,7 @@ for (const engine of ['claude', 'mcp'] as const) {
       expect(f.calls()).toHaveLength(1);
       f.begin();
       f.terminal();
-      if (engine === 'mcp') f.rpc();
+      if (engine === 'app') f.rpc();
       expect((await first).admissionId).toBe(registered);
       const original = Error('journal registration failed');
       const refused = await f.session
@@ -153,9 +171,10 @@ for (const engine of ['claude', 'mcp'] as const) {
       expect(refused.attempt.dispatch).toBe('not-dispatched');
       expect(f.calls()).toHaveLength(1);
       const next = f.session.send('three');
+      await f.sent(2);
       f.begin('turn-3');
       f.terminal('turn-3');
-      if (engine === 'mcp') f.rpc();
+      if (engine === 'app') f.rpc();
       expect((await next).nativeOutcome).toBe('completed');
       expect(f.calls()).toHaveLength(2);
     } finally {
@@ -188,11 +207,13 @@ for (const engine of ['claude', 'mcp'] as const) {
       await f.session.start();
       try {
         const one = f.session.send('one');
+        await f.sent(1);
         f.begin();
         f.terminal();
-        if (engine === 'mcp') f.rpc();
+        if (engine === 'app') f.rpc();
         const first = await one;
         const two = f.session.send('two').catch((error) => error);
+        await f.sent(2);
         f.begin('turn-2');
         f.text('second output', 'turn-2');
         if (bufferedTerminal) f.terminal('turn-2');
@@ -204,7 +225,7 @@ for (const engine of ['claude', 'mcp'] as const) {
         expect(after[0].transportOutcome).toBe('open');
         expect(after[0].nativeOutcome).toBe('completed');
         expect(after[1].nativeOutcome).toBe(bufferedTerminal ? 'completed' : 'unknown');
-        // Claude's terminal settles its stream send. MCP still owns an unanswered RPC.
+        // Claude's terminal settles its stream send. App-server still owns an unanswered turn/start.
         const settled = bufferedTerminal && engine === 'claude';
         expect(after[1].transportOutcome).toBe(settled ? 'open' : 'failed');
         expect(after[1].localOutcome).toBe(settled ? 'resolved' : 'rejected');
@@ -222,7 +243,8 @@ for (const engine of ['claude', 'mcp'] as const) {
     const f = setup(engine);
     await f.session.start();
     try {
-      const pending = f.session.send('one', { timeout: 10 }).catch((error) => error);
+      const pending = f.session.send('one', { timeout: 30 }).catch((error) => error);
+      await f.sent(1);
       f.begin();
       const error = await pending,
         before = error.attempt;
@@ -249,13 +271,13 @@ for (const engine of ['claude', 'mcp'] as const) {
             model: 'controlled-model',
           })
         : f.emit({
-            method: 'codex/event',
-            params: { msg: { type: 'session_configured', thread_id: sessionId } },
+            method: 'thread/status/changed',
+            params: { threadId: sessionId, status: { type: 'idle' } },
           });
     try {
       lifecycle('native-session');
       await tick();
-      // A Claude init is session configuration evidence; a Codex session_configured before any admission is no-admission history.
+      // A Claude init is session configuration evidence; a Codex thread notification before any admission is no-admission history.
       const startup = f.session.events.find(
         (e) =>
           e.unattributedReason === (engine === 'claude' ? 'session-configuration' : 'no-admission'),
@@ -264,23 +286,24 @@ for (const engine of ['claude', 'mcp'] as const) {
       expect(startup?.admissionId).toBeUndefined();
       expect(f.session.events.filter((e) => e.kind === 'session_compact')).toHaveLength(0);
       const first = f.session.send('one');
+      await f.sent(1);
       f.begin();
       f.terminal();
-      if (engine === 'mcp') f.rpc();
+      if (engine === 'app') f.rpc();
       await first;
       f.text('late text');
       await tick();
       const late = f.session.events.find((e) =>
         engine === 'claude'
-          ? (e.raw as any)?.message?.content?.[0]?.text === 'late text'
-          : (e.raw as any)?.params?.msg?.message === 'late text',
+          ? (e.raw as { message?: { content?: { text?: string }[] } })?.message?.content?.[0]
+              ?.text === 'late text'
+          : e.unattributedReason === 'no-admission' && e.turnId === 'turn-1' && !!e.itemId,
       );
       expect(late).toBeDefined();
       expect(late?.admissionId).toBeUndefined();
-      expect(late?.unattributedReason).toBe(
-        engine === 'claude' ? 'no-admission' : 'after-terminal',
-      );
+      expect(late?.unattributedReason).toBe('no-admission');
       const second = f.session.send('two');
+      await f.sent(2);
       f.begin('turn-2');
       lifecycle('foreign-session');
       if (engine === 'claude') {
@@ -292,9 +315,9 @@ for (const engine of ['claude', 'mcp'] as const) {
         });
       } else {
         f.terminal('foreign-turn');
-        f.emit({
-          method: 'codex/event',
-          params: { msg: { type: 'unknown-native-event', nested: { evidence: ['controlled'] } } },
+        f.notify('unknown-native-event', {
+          turnId: 'turn-2',
+          nested: { evidence: ['controlled'] },
         });
       }
       await tick();
@@ -308,7 +331,7 @@ for (const engine of ['claude', 'mcp'] as const) {
       const unknown = diagnostics.find((e) => e.unattributedReason === 'unrecognized-event')!;
       expect(Object.isFrozen(unknown.raw)).toBe(true);
       f.terminal('turn-2');
-      if (engine === 'mcp') f.rpc();
+      if (engine === 'app') f.rpc();
       const result = await second;
       expect(result.events.some((e) => e.unattributedReason)).toBe(false);
       expect(f.session.artifact().events).toContain(startup!);
@@ -328,6 +351,7 @@ for (const engine of ['claude', 'mcp'] as const) {
     });
     try {
       const pending = f.session.send('one').catch((error) => error);
+      await f.sent(1);
       f.begin();
       f.text();
       await tick();
@@ -358,7 +382,7 @@ for (const engine of ['claude', 'mcp'] as const) {
     const f = setup(engine);
     await f.session.start();
     try {
-      const error = await f.session.send('one', { timeout: 5 }).catch((error) => error);
+      const error = await f.session.send('one', { timeout: 30 }).catch((error) => error);
       for (let i = 0; i < 100; i++) await f.session.send('refused').catch(() => {});
       const attempts = f.session.attempts;
       expect(attempts).toHaveLength(101);
@@ -385,32 +409,39 @@ for (const engine of ['claude', 'mcp'] as const) {
   });
 }
 
-test('MCP RPC-only resolution still owns later EOF, while its historical returned result stays fixed', async () => {
-  const f = setup('mcp');
+test('app RPC acknowledgement without a native terminal keeps the turn owned; EOF leaves it unknown', async () => {
+  const f = setup('app');
   await f.session.start();
   try {
-    const pending = f.session.send('one');
+    const pending = f.session.send('one').catch((e) => e);
+    await f.sent(1);
     f.begin();
     f.rpc();
-    const result = await pending;
-    f.exit();
     await tick();
-    expect(result.transportOutcome).toBe('open');
-    expect(result.nativeOutcome).toBe('unknown');
-    expect(f.session.attempts[0].transportOutcome).toBe('failed');
-    expect(f.session.attempts[0].localOutcome).toBe('resolved');
-    expect(f.session.attempts[0].nativeOutcome).toBe('unknown');
+    expect(f.session.attempts[0]).toMatchObject({
+      localOutcome: 'pending',
+      rpcOutcome: 'resolved',
+      nativeOutcome: 'unknown',
+    });
+    f.exit();
+    const error = await pending;
+    expect(error.attempt).toMatchObject({
+      transportOutcome: 'failed',
+      localFailure: 'transport',
+      nativeOutcome: 'unknown',
+    });
     await expect(f.session.send('two')).rejects.toThrow();
     expect(f.calls()).toHaveLength(1);
   } finally {
     f.session.kill();
   }
 });
-for (const engine of ['claude', 'mcp'] as const) {
+for (const engine of ['claude', 'app'] as const) {
   test(`${engine}: timeout retains ownership; queued and new sends never execute while unknown; late terminal stays original`, async () => {
     const f = setup(engine);
     await f.session.start();
-    const first = f.session.send('one', { timeout: 15 }).catch((e) => e);
+    const first = f.session.send('one', { timeout: 30 }).catch((e) => e);
+    await f.sent(1);
     f.begin();
     f.text('partial');
     const queued = f.session.send('queued').catch((e) => e);
@@ -424,20 +455,21 @@ for (const engine of ['claude', 'mcp'] as const) {
     expect(error.attempt.nativeOutcome).toBe('unknown');
     f.text();
     f.terminal();
-    if (engine === 'mcp') f.rpc();
+    if (engine === 'app') f.rpc();
     await tick();
     expect(error.attempt.nativeOutcome).toBe('completed');
     expect(error.attempt.content).toBe('completed output');
     expect(error.attempt.admissionId).toBe(id);
     expect(error.attempt.localOutcome).toBe('rejected');
     const next = f.session.send('next');
+    await f.sent(2);
     f.begin('turn-2');
     f.terminal('turn-1');
     await tick();
     expect(f.calls()).toHaveLength(2);
     expect(f.session.attempts.at(-1)?.nativeOutcome).toBe('unknown');
     f.terminal('turn-2');
-    if (engine === 'mcp') f.rpc();
+    if (engine === 'app') f.rpc();
     const result = await next;
     expect(result.nativeOutcome).toBe('completed');
     expect(result.admissionId).not.toBe(id);
@@ -449,13 +481,14 @@ for (const engine of ['claude', 'mcp'] as const) {
     const f = setup(engine);
     await f.session.start();
     const result = f.session.send('one');
+    await f.sent(1);
     f.begin();
-    if (engine === 'mcp') f.terminal('wrong-turn');
+    if (engine === 'app') f.terminal('wrong-turn');
     else f.terminal('wrong-result', false, 'wrong-session');
     await tick();
     expect(f.session.attempts[0].nativeOutcome).toBe('unknown');
     f.terminal();
-    if (engine === 'mcp') f.rpc();
+    if (engine === 'app') f.rpc();
     expect((await result).nativeOutcome).toBe('completed');
     f.session.kill();
   });
@@ -466,15 +499,16 @@ for (const engine of ['claude', 'mcp'] as const) {
     });
     await f.session.start();
     const pending = f.session.send('one').catch((e) => e);
+    await f.sent(1);
     f.begin();
     f.text();
     f.terminal();
-    if (engine === 'mcp') f.rpc('commit-like local infrastructure error');
+    if (engine === 'app') f.rpc('commit-like local infrastructure error');
     const result = await pending;
-    expect(engine === 'mcp' ? result.attempt.nativeOutcome : result.nativeOutcome).toBe(
+    expect(engine === 'app' ? result.attempt.nativeOutcome : result.nativeOutcome).toBe(
       'completed',
     );
-    if (engine === 'mcp') {
+    if (engine === 'app') {
       expect(result.message).toBe('commit-like local infrastructure error');
       expect(result.attempt.content).toBe('completed output');
     }
@@ -487,6 +521,7 @@ for (const engine of ['claude', 'mcp'] as const) {
     const f = setup(engine);
     await f.session.start();
     const pending = f.session.send('one').catch((e) => e);
+    await f.sent(1);
     f.begin();
     f.text('partial');
     await tick(); // Let the production reader observe partial text before the stream discards unread bytes.
@@ -513,21 +548,6 @@ for (const engine of ['claude', 'mcp'] as const) {
     f.session.kill();
   });
 }
-test('MCP RPC resolution without native terminal stays unknown and blocks new work', async () => {
-  const f = setup('mcp');
-  await f.session.start();
-  const pending = f.session.send('one');
-  f.begin();
-  f.rpc();
-  const result = await pending;
-  expect(result.nativeOutcome).toBe('unknown');
-  await expect(f.session.send('two')).rejects.toThrow();
-  expect(f.calls()).toHaveLength(1);
-  f.terminal();
-  await tick();
-  expect(f.session.attempts[0].nativeOutcome).toBe('completed');
-  f.session.kill();
-});
 test('Claude error result is native failed, not successful completion; missing usage stays unavailable', async () => {
   const f = setup('claude');
   await f.session.start();
@@ -539,11 +559,12 @@ test('Claude error result is native failed, not successful completion; missing u
   f.session.kill();
 });
 
-for (const engine of ['claude', 'mcp'] as const) {
+for (const engine of ['claude', 'app'] as const) {
   test(`${engine}: terminal buffered immediately before exit survives transport failure`, async () => {
     const f = setup(engine);
     await f.session.start();
     const pending = f.session.send('one').catch((e) => e);
+    await f.sent(1);
     f.begin();
     f.text();
     f.terminal();
@@ -552,12 +573,13 @@ for (const engine of ['claude', 'mcp'] as const) {
     await tick();
     expect(f.session.attempts[0].nativeOutcome).toBe('completed');
     expect(f.session.attempts[0].content).toBe('completed output');
-    expect(engine === 'mcp' ? value.attempt.nativeOutcome : value.nativeOutcome).toBe('completed');
+    expect(engine === 'app' ? value.attempt.nativeOutcome : value.nativeOutcome).toBe('completed');
   });
   test(`${engine}: interrupt keeps native work unknown and prevents queued dispatch`, async () => {
     const f = setup(engine);
     await f.session.start();
     const first = f.session.send('one').catch((e) => e);
+    await f.sent(1);
     const second = f.session.send('two').catch((e) => e);
     f.session.interrupt();
     const error = await first;
@@ -592,40 +614,18 @@ for (const engine of ['claude', 'mcp'] as const) {
     expect(f.session.attempts[0].turnId).toBeUndefined();
     if (engine === 'claude') expect(f.spawns[0].slice(-2)).toEqual(['--resume', 'native-session']);
     else
-      expect(f.calls()[0].params).toMatchObject({
-        name: 'codex-reply',
-        arguments: { threadId: 'native-session' },
+      expect(f.writes.find((w) => w.method === 'thread/resume')?.params).toMatchObject({
+        threadId: 'native-session',
       });
     f.session.kill();
     await pending;
   });
 }
-test('MCP wrong envelope ID without inner turn_id cannot contaminate a later admission', async () => {
-  const f = setup('mcp');
-  await f.session.start();
-  const first = f.session.send('one');
-  f.begin();
-  f.terminal();
-  f.rpc();
-  await first;
-  const second = f.session.send('two');
-  f.emit({
-    jsonrpc: '2.0',
-    method: 'codex/event',
-    params: { id: 'turn-1', msg: { type: 'agent_message', message: 'stale' } },
-  });
-  f.begin('turn-2');
-  await tick();
-  expect(f.session.attempts[1].content).toBe('');
-  f.terminal('turn-2');
-  f.rpc();
-  await second;
-  f.session.kill();
-});
-test('MCP RPC failure without native terminal is unresolved, not native failed/cancelled', async () => {
-  const f = setup('mcp');
+test('app turn/start failure without native terminal is unresolved, not native failed/cancelled', async () => {
+  const f = setup('app');
   await f.session.start();
   const pending = f.session.send('one').catch((e) => e);
+  await f.sent(1);
   f.begin();
   f.rpc('RPC failed');
   const error = await pending;
@@ -635,7 +635,7 @@ test('MCP RPC failure without native terminal is unresolved, not native failed/c
   await expect(f.session.send('two')).rejects.toThrow();
   f.session.kill();
 });
-for (const engine of ['claude', 'mcp'] as const)
+for (const engine of ['claude', 'app'] as const)
   test(`${engine}: asynchronous observer rejection cannot hide native completion`, async () => {
     const f = setup(engine);
     f.session.onEvent(async () => {
@@ -643,14 +643,15 @@ for (const engine of ['claude', 'mcp'] as const)
     });
     await f.session.start();
     const result = f.session.send('one');
+    await f.sent(1);
     f.begin();
     f.terminal();
-    if (engine === 'mcp') f.rpc();
+    if (engine === 'app') f.rpc();
     expect((await result).nativeOutcome).toBe('completed');
     await tick();
     f.session.kill();
   });
-for (const engine of ['claude', 'mcp'] as const)
+for (const engine of ['claude', 'app'] as const)
   test(`${engine}: transport EOF emits session_end exactly once`, async () => {
     const f = setup(engine);
     await f.session.start();
@@ -662,49 +663,6 @@ for (const engine of ['claude', 'mcp'] as const)
     f.session.kill();
     expect(f.session.events.filter((e) => e.kind === 'session_end')).toHaveLength(1);
   });
-test('MCP native success followed by tools/call error preserves output and distinguishes RPC settlement', async () => {
-  const f = setup('mcp');
-  await f.session.start();
-  const pending = f.session.send('one').catch((e) => e);
-  f.begin();
-  f.text();
-  f.terminal();
-  f.emit({
-    jsonrpc: '2.0',
-    id: f.calls()[0].id,
-    result: {
-      isError: true,
-      content: [{ type: 'text', text: 'post-success infrastructure failure' }],
-    },
-  });
-  const error = await pending;
-  expect(error.message).toBe('post-success infrastructure failure');
-  expect(error.attempt.content).toBe('completed output');
-  expect(error.attempt.nativeOutcome).toBe('completed');
-  expect(error.attempt.rpcOutcome).toBe('resolved');
-  expect(error.attempt.localOutcome).toBe('rejected');
-  f.session.kill();
-});
-test('MCP conflicting result binding cannot replace the original resume binding', async () => {
-  const f = setup('mcp');
-  await f.session.start();
-  const pending = f.session.send('one').catch((e) => e);
-  f.begin();
-  f.text();
-  f.terminal();
-  f.emit({
-    jsonrpc: '2.0',
-    id: f.calls()[0].id,
-    result: { structuredContent: { threadId: 'foreign-session', content: 'foreign' } },
-  });
-  const error = await pending;
-  expect(error.message).toContain('resume binding');
-  expect(f.session.externalSessionId).toBe('native-session');
-  expect(error.attempt.content).toBe('completed output');
-  expect(error.attempt.nativeOutcome).toBe('completed');
-  f.session.kill();
-});
-
 // Synthetic contradictory envelopes; these variants are not native recordings.
 for (const fields of [
   { api_error_status: 429 },
@@ -794,7 +752,7 @@ function mutateEvent(event: any) {
   });
 }
 
-for (const engine of ['claude', 'mcp'] as const) {
+for (const engine of ['claude', 'app'] as const) {
   test(`${engine}: observers, results, snapshots and artifacts cannot rewrite nested retained evidence`, async () => {
     const f = setup(engine);
     const observerValues: SessionEvent[] = [];
@@ -808,6 +766,7 @@ for (const engine of ['claude', 'mcp'] as const) {
     await f.session.start();
     try {
       const pending = f.session.send('one');
+      await f.sent(1);
       f.begin();
       const annotation = { values: ['ORIGINAL'] };
       if (engine === 'claude') {
@@ -828,25 +787,20 @@ for (const engine of ['claude', 'mcp'] as const) {
           usage: { input_tokens: 12, output_tokens: 3 },
         });
       } else {
-        f.emit({
-          method: 'codex/event',
-          params: {
-            id: 'turn-1',
-            msg: {
-              type: 'exec_command_begin',
-              turn_id: 'turn-1',
-              call_id: 'call-1',
-              command: 'ORIGINAL',
-              annotation,
-            },
+        f.notify('item/started', {
+          turnId: 'turn-1',
+          item: {
+            id: 'call-1',
+            type: 'mcpToolCall',
+            server: 'owned',
+            tool: 'annotate',
+            arguments: { annotation },
+            status: 'inProgress',
           },
         });
-        f.emit({
-          method: 'codex/event',
-          params: {
-            id: 'turn-1',
-            msg: { type: 'token_count', info: { input_tokens: 12, output_tokens: 3 } },
-          },
+        f.notify('thread/tokenUsage/updated', {
+          turnId: 'turn-1',
+          tokenUsage: { last: { inputTokens: 12, outputTokens: 3 } },
         });
         f.text();
         f.terminal();
@@ -880,15 +834,13 @@ for (const engine of ['claude', 'mcp'] as const) {
             ? { input: 12, output: 3, providerUsage: { input_tokens: 12, output_tokens: 3 } }
             : { input: 12, output: 3 },
         );
-        expect(value.terminal?.type).toBe(engine === 'claude' ? 'result' : 'task_complete');
+        expect(value.terminal?.type).toBe(engine === 'claude' ? 'result' : 'turn/completed');
         const tool = value.events.find((e) => e.kind === 'tool_use')!;
-        const raw = tool.raw as any;
-        expect(engine === 'claude' ? raw.input.annotation.values : raw.annotation.values).toEqual([
-          'ORIGINAL',
-        ]);
-        expect(tool.toolInput).toEqual(
-          engine === 'claude' ? { annotation: { values: ['ORIGINAL'] } } : { command: 'ORIGINAL' },
-        );
+        if (engine === 'claude')
+          expect(
+            (tool.raw as { input: { annotation: { values: string[] } } }).input.annotation.values,
+          ).toEqual(['ORIGINAL']);
+        expect(tool.toolInput).toEqual({ annotation: { values: ['ORIGINAL'] } });
       }
       expect(observerValues.find((e) => e.kind === 'tool_use')).toBe(
         snapshot.events.find((e) => e.kind === 'tool_use'),
@@ -899,9 +851,10 @@ for (const engine of ['claude', 'mcp'] as const) {
       // Immutable events are safely shared; historical result arrays do not grow.
       const historicalLength = result.events.length;
       const next = f.session.send('two');
+      await f.sent(2);
       f.begin('turn-2');
       f.terminal('turn-2');
-      if (engine === 'mcp') f.rpc();
+      if (engine === 'app') f.rpc();
       await next;
       expect(result.events).toHaveLength(historicalLength);
     } finally {
@@ -938,15 +891,14 @@ for (const engine of ['claude', 'mcp'] as const) {
       f.session.kill();
     }
   });
-
-  test(`${engine}: event ownership detaches caller data without freezing the caller's object`, async () => {
-    const f = setup(engine);
-    const payload = { kind: 'controlled', text: 'payload', nested: { values: ['ORIGINAL'] } };
-    await f.session.push(payload);
-    payload.nested.values[0] = 'CALLER_CHANGED';
-    const event = f.session.events[0];
-    expect((event.raw as typeof payload).nested.values).toEqual(['ORIGINAL']);
-    expect(Object.isFrozen(payload.nested)).toBe(false);
-    expect(Object.isFrozen((event.raw as typeof payload).nested.values)).toBe(true);
-  });
 }
+test("claude: event ownership detaches caller data without freezing the caller's object", async () => {
+  const f = setup('claude');
+  const payload = { kind: 'controlled', text: 'payload', nested: { values: ['ORIGINAL'] } };
+  await f.session.push(payload);
+  payload.nested.values[0] = 'CALLER_CHANGED';
+  const event = f.session.events[0];
+  expect((event.raw as typeof payload).nested.values).toEqual(['ORIGINAL']);
+  expect(Object.isFrozen(payload.nested)).toBe(false);
+  expect(Object.isFrozen((event.raw as typeof payload).nested.values)).toBe(true);
+});

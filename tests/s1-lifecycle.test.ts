@@ -54,7 +54,7 @@ test('config and malformed argv never carry arbitrary text or numeric values', (
   const value = sanitizeArgv(
     [
       'codex',
-      'mcp-server',
+      'app-server',
       '-c',
       'approval_policy="never"',
       '--config=model_reasoning_effort="xhigh"',

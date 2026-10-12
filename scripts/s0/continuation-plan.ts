@@ -10,10 +10,10 @@ export const CONTINUATION_TASKS = Object.freeze(
     }),
   ),
 );
-export type ActivePath = 'claude' | 'codex-mcp';
+/** Claude only: the recorder joins tool evidence by native call ID, which app-server items do not carry. */
+export type ActivePath = 'claude';
 export const REQUESTED = {
   claude: { model: 'claude-fable-5-1', effort: 'max' },
-  'codex-mcp': { model: 'gpt-6-astra', effort: 'xhigh' },
 } as const;
 /**
  * This controlled experiment pins the Bun runtime version and the sanitizer's controlled
@@ -23,8 +23,8 @@ export const REQUESTED = {
  */
 export const PINNED_BUN_VERSION = '1.4.2';
 export function continuationPlan(path: string, runId: string) {
-  if (path !== 'claude' && path !== 'codex-mcp')
-    throw Error('Choose claude or codex-mcp; app-server is excluded');
+  if (path !== 'claude')
+    throw Error('Choose claude; app-server is not a continuation capture path');
   if (!/^s1-continuation-\d{8}T\d{6}Z$/.test(runId))
     throw Error('Use a new s1-continuation-YYYYMMDDTHHMMSSZ run ID');
   return {
@@ -32,39 +32,27 @@ export function continuationPlan(path: string, runId: string) {
     runId,
     mode: 'plan-only',
     requested: REQUESTED[path],
-    expectedSpawn:
-      path === 'claude'
-        ? [
-            'claude',
-            '--print',
-            '--verbose',
-            '--input-format',
-            'stream-json',
-            '--output-format',
-            'stream-json',
-            '--model',
-            'claude-fable-5-1',
-            '--effort',
-            'max',
-            '--max-turns',
-            '8',
-            '--permission-mode',
-            'bypassPermissions',
-            '--include-hook-events',
-          ]
-        : [
-            'codex',
-            'mcp-server',
-            '-c',
-            'sandbox_mode="danger-full-access"',
-            '-c',
-            'approval_policy="never"',
-            '-c',
-            'model_reasoning_effort="xhigh"',
-          ],
+    expectedSpawn: [
+      'claude',
+      '--print',
+      '--verbose',
+      '--input-format',
+      'stream-json',
+      '--output-format',
+      'stream-json',
+      '--model',
+      'claude-fable-5-1',
+      '--effort',
+      'max',
+      '--max-turns',
+      '8',
+      '--permission-mode',
+      'bypassPermissions',
+      '--include-hook-events',
+    ],
     versionCommands: [
       ['bun', '--version'],
-      [path === 'claude' ? 'claude' : 'codex', '--version'],
+      ['claude', '--version'],
     ],
     output: `fixtures/s0/${runId}/${path}-continuation`,
     tasks: CONTINUATION_TASKS,

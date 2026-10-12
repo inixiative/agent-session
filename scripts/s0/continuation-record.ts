@@ -89,7 +89,7 @@ async function main(argv: string[]) {
   };
   const versions = {
     bun: version(['bun', '--version']),
-    cli: version([path === 'claude' ? 'claude' : 'codex', '--version']),
+    cli: version(['claude', '--version']),
   };
   const revision = Bun.spawnSync(['git', 'rev-parse', 'HEAD'], {
     cwd: root,
@@ -99,7 +99,6 @@ async function main(argv: string[]) {
   const commit = new TextDecoder().decode(revision.stdout).trim();
   const sources = [
     'src/claude-code-session.ts',
-    'src/codex-session.ts',
     'src/harness-session.ts',
     'src/turn-state.ts',
     'src/retained-evidence.ts',

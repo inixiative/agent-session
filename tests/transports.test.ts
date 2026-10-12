@@ -9,7 +9,6 @@ import {
   ClaudeAgentSdkSession,
   ClaudeCodeSession,
   CodexAppServerSession,
-  CodexMcpSession,
   createSession,
   describeTransport,
   type HarnessSession,
@@ -106,7 +105,6 @@ describe('transport matrix', () => {
   test('every implemented session reports its own descriptor; stubs are declared as stubs', () => {
     const spawn = () => fakeProcess().proc;
     expect(new ClaudeCodeSession({ spawn }).transport).toBe(TRANSPORTS['claude-cli']);
-    expect(new CodexMcpSession({ spawn }).transport).toBe(TRANSPORTS['codex-mcp']);
     expect(new CodexAppServerSession({ spawn }).transport).toBe(TRANSPORTS['codex-app-server']);
     expect(
       new ClaudeAgentSdkSession({
@@ -128,9 +126,8 @@ describe('transport matrix', () => {
 
   test('capability flags match the methods each implementation exposes', () => {
     const spawn = () => fakeProcess().proc;
-    const sessions: Record<'claude-cli' | 'codex-mcp' | 'codex-app-server', HarnessSession> = {
+    const sessions: Record<'claude-cli' | 'codex-app-server', HarnessSession> = {
       'claude-cli': new ClaudeCodeSession({ spawn }),
-      'codex-mcp': new CodexMcpSession({ spawn }),
       'codex-app-server': new CodexAppServerSession({ spawn }),
     };
     for (const [kind, session] of Object.entries(sessions)) {
@@ -144,7 +141,6 @@ describe('transport matrix', () => {
     const spawn = () => fakeProcess().proc;
     expect(createSession('claude-cli', { spawn })).toBeInstanceOf(ClaudeCodeSession);
     expect(createSession('codex-app-server', { spawn })).toBeInstanceOf(CodexAppServerSession);
-    expect(createSession('codex-mcp', { spawn })).toBeInstanceOf(CodexMcpSession);
     expect(() => createSession('acp', { command: ['agent'] })).toThrow(TransportUnavailableError);
     expect(() => new AcpSession({ command: ['agent'] })).toThrow('acp');
     expect(
@@ -423,9 +419,9 @@ describe('Codex app-server transport additions', () => {
     await pending;
   });
 
-  test('profile env reaches the Codex launch and forks', async () => {
+  test('profile env reaches the Codex launch', async () => {
     const envs: Record<string, string | undefined>[] = [];
-    const s = new CodexMcpSession({
+    const s = new CodexAppServerSession({
       env: { CODEX_HOME: '/profiles/c' },
       spawn: (_cmd, o) => {
         envs.push(o.env);

@@ -1,5 +1,9 @@
 # S0 recorder correction — independent review pending
 
+> **2026-10-12:** the Codex MCP transport (`CodexMcpSession`, `codex mcp-server`) was removed;
+> app-server is the only Codex transport. Its recordings in this run were deleted. The text
+> below is the historical report as written.
+
 This is a newly authorized recording run, not a retry of unknown work. All three
 original attempts had recorded native-terminal/no-turn evidence and owned process
 exit before this correction. The original ../2026-09-07 recordings, manifest,

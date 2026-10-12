@@ -10,7 +10,7 @@
 // HarnessSession is stateful: it owns a running process, tracks turns,
 // captures every event for Oracle, and supports fork/interrupt.
 //
-// Implementations: ClaudeCodeSession, CodexMcpSession, CodexAppServerSession,
+// Implementations: ClaudeCodeSession, CodexAppServerSession,
 // ClaudeAgentSdkSession. How a model is reached is the session's transport
 // (see transport.ts); every transport implements this one contract.
 // ---------------------------------------------------------------------------

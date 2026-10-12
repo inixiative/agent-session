@@ -27,15 +27,12 @@ export {
   codexTokens,
 } from './codex-primed';
 
-// Codex CLI adapter (persistent JSON-RPC session). CodexSession defaults to the
-// mcp-server variant; CodexAppServerSession is the app-server one.
+// Codex CLI adapter: one persistent `codex app-server` JSON-RPC session.
 export {
   type CodexApprovalPolicy,
   CodexAppServerSession,
   type CodexFileChange,
-  CodexMcpSession,
   type CodexSandbox,
-  CodexSession,
   type CodexSessionConfig,
   type CodexSpawn,
   codexPermissions,

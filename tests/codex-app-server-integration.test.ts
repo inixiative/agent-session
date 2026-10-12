@@ -379,6 +379,99 @@ for (const mode of ['tool-error', 'non-text', 'foreign', 'mismatch'] as const)
       expect(JSON.stringify(r)).not.toContain('PRIVATE');
     } else expect(end).toBeUndefined();
   });
+const mcpItem = (id: string, args?: unknown) => ({
+  id,
+  type: 'mcpToolCall',
+  server: 'owned',
+  tool: 'foundry_memory',
+  ...(args === undefined ? {} : { arguments: args }),
+  status: 'inProgress',
+});
+const mcpDone = (item: Record<string, unknown>) => ({
+  ...item,
+  status: 'completed',
+  result: { content: [{ type: 'text', text: 'PUBLIC' }] },
+});
+const turnStarted = (f: ReturnType<typeof appFixture>) =>
+  f.emit({
+    id: f.requests.find((v) => v.method === 'turn/start').id,
+    result: { turn: { id: 'turn-1', status: 'inProgress', items: [] } },
+  });
+test('app MCP arguments drop secret subfields, absent arguments stay unavailable, and tool input is immutable', async () => {
+  const f = appFixture();
+  await f.session.start();
+  f.session.onEvent((e) => {
+    if (e.kind === 'tool_use' && e.toolInput)
+      try {
+        (e.toolInput as Record<string, unknown>).id = 'FORGED';
+      } catch {}
+  });
+  const p = f.send();
+  await tick();
+  turnStarted(f);
+  const args = {
+    id: 'owned',
+    nested: { credentials: { key: 'PRIVATE' }, reasoning: 'PRIVATE', value: 3 },
+  };
+  const owned = mcpItem('owned-item', args),
+    absent = mcpItem('absent-item');
+  f.notify('item/started', { item: owned });
+  f.notify('item/completed', { item: mcpDone(owned) });
+  f.notify('item/started', { item: absent });
+  f.notify('item/completed', { item: mcpDone(absent) });
+  f.notify('turn/completed', { turn: { id: 'turn-1', status: 'completed', items: [] } });
+  const r = await p;
+  const begins = r.events.filter((e) => e.kind === 'tool_use');
+  expect(begins).toHaveLength(2);
+  expect(begins[0].toolInput).toEqual({ id: 'owned', nested: { value: 3 } });
+  expect(begins[0].toolInputOmitted).toBeDefined();
+  expect(Object.isFrozen(begins[0].toolInput)).toBe(true);
+  expect(begins[1].toolInput).toBeUndefined();
+  expect(begins[1].toolInputOmitted).toBeDefined();
+  expect(r.events.filter((e) => e.kind === 'tool_result')).toHaveLength(2);
+  expect(JSON.stringify(f.session.events)).not.toContain('PRIVATE');
+});
+test('app MCP result after the native terminal stays unowned and never joins the call', async () => {
+  const f = appFixture();
+  await f.session.start();
+  const p = f.send();
+  await tick();
+  const item = mcpItem('item', { query: 'PUBLIC' });
+  f.notify('turn/started', { turn: { id: 'turn-1', status: 'inProgress', items: [] } });
+  f.notify('item/started', { item });
+  f.notify('turn/completed', { turn: { id: 'turn-1', status: 'completed', items: [] } });
+  f.notify('item/completed', { item: mcpDone(item) });
+  turnStarted(f);
+  const r = await p;
+  expect(r.nativeOutcome).toBe('completed');
+  expect(r.events.filter((e) => e.kind === 'tool_result')).toHaveLength(0);
+  expect(
+    f.session.events.some(
+      (e) => e.unattributedReason === 'after-terminal' && e.itemId === 'item' && !e.admissionId,
+    ),
+  ).toBe(true);
+});
+test('app MCP evidence after a local timeout stays with the timed-out admission', async () => {
+  const f = appFixture();
+  await f.session.start();
+  const p = f.send();
+  await tick();
+  turnStarted(f);
+  const item = mcpItem('item', { query: 'PUBLIC' });
+  f.notify('item/started', { item });
+  const error = await p.catch((e) => e);
+  expect(error.attempt.localFailure).toBe('timeout');
+  const local = f.session.attempts[0];
+  f.notify('item/completed', { item: mcpDone(item) });
+  f.notify('turn/completed', { turn: { id: 'turn-1', status: 'completed', items: [] } });
+  await tick();
+  const attempt = f.session.attempts[0];
+  expect(attempt).toMatchObject({ nativeOutcome: 'completed', localOutcome: 'rejected' });
+  expect(attempt.events.filter((e) => e.kind === 'tool_result')).toHaveLength(1);
+  expect(local.nativeOutcome).toBe('unknown');
+  expect(local.events.some((e) => e.kind === 'tool_result')).toBe(false);
+  expect(f.requests.filter((v) => v.method === 'turn/start')).toHaveLength(1);
+});
 test('streamed public text survives failed native terminal and rejecting observers', async () => {
   const f = appFixture();
   await f.session.start();

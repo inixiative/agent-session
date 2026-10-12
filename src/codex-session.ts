@@ -5,32 +5,15 @@ import { ToolGates } from './tool-gate';
 import { TRANSPORTS } from './transport';
 import { TurnState } from './turn-state';
 // ---------------------------------------------------------------------------
-// CodexSession — long-lived OpenAI Codex CLI process with full event capture
-// ---------------------------------------------------------------------------
+// CodexAppServerSession — one persistent `codex app-server --listen stdio://`
+// process per session, driven over JSON-RPC (thread/start, thread/resume,
+// turn/start). Every notification is classified into the shared SessionEvent
+// taxonomy; a turn resolves once its native terminal and RPC have both settled.
+// Approvals and sandbox default to never / danger-full-access (the container
+// is the jail); appServer.approvalPolicy routes approvals to onToolRequest().
+// The native thread ID is the externalSessionId used for cold resume.
 //
-// Two implementations of the SAME HarnessSession interface, mirroring
-// ClaudeCodeSession. Both keep one persistent `codex` process alive and stream
-// turns over a JSON-RPC channel on stdin/stdout, classifying every event into
-// the shared SessionEvent taxonomy and resolving a turn on completion.
-//
-//   CodexMcpSession        (default)      — `codex mcp-server`  (stdio MCP JSON-RPC)
-//   CodexAppServerSession  (experimental) — `codex app-server`  (stdio JSON-RPC)
-//
-// Both DISABLE codex's own approvals + sandbox (the union of
-// `--dangerously-bypass-approvals-and-sandbox`) so OUR container is the only
-// jail — identical intent to ClaudeCodeSession's `bypassPermissions`.
-//
-// Architecture (mirrors claude-code-session.ts):
-//   start()  → spawn one process, start background stdout reader, MCP handshake
-//   send()   → JSON-RPC tools/call (codex / codex-reply), resolve on completion
-//   fork()   → new (unstarted) session resuming from the captured threadId
-//   kill()   → close stdin, kill process
-//
-// codex's native "session ID" is the threadId returned by the `codex` tool's
-// structuredContent — captured into externalSessionId and used for multi-turn
-// (`codex-reply`) and fork.
-//
-// Verified against codex 0.140.
+// Wire contract: codex-cli 0.155.1 v2 JSON schema.
 // ---------------------------------------------------------------------------
 
 import type {
@@ -109,8 +92,7 @@ export type CodexSpawn = (
 // ---------------------------------------------------------------------------
 
 export interface CodexSessionConfig {
-  /** Explicit app-server integration. Never applied by the default MCP engine.
-   * Config is native launch data, not event/recording data. */
+  /** Thread launch options. Config is native launch data, not event/recording data. */
   appServer?: {
     /** Persist the actual returned binding before model admission; failure blocks work. */
     onThreadReady?: (binding: string) => void | Promise<void>;
@@ -144,14 +126,13 @@ export interface CodexSessionConfig {
   timeout?: number;
   /**
    * Base context to pre-load. Codex has no `--append-system-prompt`; we prepend
-   * it to the first turn's prompt (and keep it for fork). Persists logically for
-   * the session via the continued thread.
+   * it to the first turn's prompt. Persists logically for the session via the
+   * continued thread.
    */
   baseContext?: string;
   /**
-   * codex's native thread ID (the value the `codex` tool returns). When set, the
-   * first send() uses `codex-reply` on MCP (loaded threads only), or
-   * `thread/resume` on app-server. Only app-server supports cold resume by ID.
+   * codex's native thread ID. When set, the first send() resumes it with
+   * `thread/resume` (cold resume by ID).
    */
   externalSessionId?: string;
   /** Environment merged over process.env (e.g. CODEX_HOME for a profile). */
@@ -180,64 +161,58 @@ interface QueuedTurn {
 // codex reasoning-effort levels (model_reasoning_effort), low→high.
 const VALID_EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh'];
 
-// ---------------------------------------------------------------------------
-// Base class — shared queue, event log, classification helpers, lifecycle
-// ---------------------------------------------------------------------------
-//
-// CodexMcpSession and CodexAppServerSession differ only in the wire protocol
-// (how start() handshakes, how a turn is sent, and how a raw message maps to
-// SessionEvents). Everything else — the turn queue, token accounting, the
-// stdout read loop, event emission, fork, artifact — is shared here, exactly as
-// ClaudeCodeSession structures it.
+class NativeValidationError extends Error {}
 
-abstract class BaseCodexSession implements HarnessSession {
+export class CodexAppServerSession implements HarnessSession {
+  get transport() {
+    return TRANSPORTS['codex-app-server'];
+  }
+  readonly appServerProtocol = 'owned-thread-v1';
+
   // -- Config --
-  protected _bin: string;
-  protected _model: string;
-  protected _effort?: string;
-  protected _cwd: string;
-  protected _defaultTimeout: number;
-  protected _baseContext?: string;
-  protected _spawn?: CodexSpawn;
-  protected _env?: Record<string, string | undefined>;
+  private _bin: string;
+  private _model: string;
+  private _effort?: string;
+  private _cwd: string;
+  private _defaultTimeout: number;
+  private _baseContext?: string;
+  private _spawn?: CodexSpawn;
+  private _env?: Record<string, string | undefined>;
 
   // -- Process --
-  protected _proc: PipedSubprocess | null = null;
-  protected _stderr = '';
+  private _proc: PipedSubprocess | null = null;
+  private _stderr = '';
 
   // -- Session state --
-  protected _externalSessionId?: string;
-  protected _alive = false;
+  private _externalSessionId?: string;
+  private _alive = false;
   private _endEmitted = false;
-  protected _eventLog: SessionEvent[] = [];
-  protected _handlers: SessionEventHandler[] = [];
+  private _eventLog: SessionEvent[] = [];
+  private _handlers: SessionEventHandler[] = [];
   private _observerFailures = { synchronous: 0, asynchronous: 0 };
-  protected _beforeSendHooks: BeforeSendHook[] = [];
-  protected _turns = 0;
-  protected _totalTokens = { input: 0, output: 0 };
-  protected _startedAt: number;
+  private _beforeSendHooks: BeforeSendHook[] = [];
+  private _turns = 0;
+  private _totalTokens = { input: 0, output: 0 };
+  private _startedAt: number;
   /** Whether baseContext has been prepended onto a sent turn yet. */
-  protected _injectedBaseContext = false;
-  /** Whether this session was created via fork() (continues a thread). */
-  protected _forking = false;
+  private _injectedBaseContext = false;
 
   // -- JSON-RPC --
   /** Monotonic JSON-RPC request id. */
-  protected _rpcId = 0;
+  private _rpcId = 0;
   /** Pending JSON-RPC responses, keyed by request id. */
-  protected _pending = new Map<
+  private _pending = new Map<
     number,
     { resolve: (result: unknown) => void; reject: (e: Error) => void }
   >();
 
   // -- Turn queue (identical to ClaudeCodeSession) --
-  protected _queue: QueuedTurn[] = [];
-  protected _attempts: TurnState[] = [];
-  protected _seenTerminals = new Set<string>();
-  protected _inflight: QueuedTurn | null = null;
-  protected _turnEvents: SessionEvent[] = [];
-  protected _resultText = '';
-  protected _turnTimer: ReturnType<typeof setTimeout> | null = null;
+  private _queue: QueuedTurn[] = [];
+  private _attempts: TurnState[] = [];
+  private _seenTerminals = new Set<string>();
+  private _inflight: QueuedTurn | null = null;
+  private _resultText = '';
+  private _turnTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(config?: CodexSessionConfig) {
     const bin = config?.bin ?? 'codex';
@@ -259,6 +234,17 @@ abstract class BaseCodexSession implements HarnessSession {
     this._spawn = config?.spawn;
     this._env = config?.env;
     this._startedAt = Date.now();
+    const { onThreadReady, ...options } = config?.appServer ?? {};
+    this._onThreadReady = onThreadReady;
+    this._options = retainEvidence(options);
+    const required = this._options.requiredMcpServer;
+    if (
+      required &&
+      (!/^[a-zA-Z0-9_-]+$/.test(required.name) ||
+        !required.tools.length ||
+        required.tools.some((t) => !/^[a-zA-Z0-9_-]+$/.test(t)))
+    )
+      throw new NativeValidationError('Invalid required MCP inventory');
   }
 
   // ---------------------------------------------------------------------------
@@ -309,21 +295,6 @@ abstract class BaseCodexSession implements HarnessSession {
       const idx = this._beforeSendHooks.indexOf(hook);
       if (idx !== -1) this._beforeSendHooks.splice(idx, 1);
     };
-  }
-
-  /**
-   * Mid-turn push. Like Claude Code's stream-json stdin, codex's tools/call has
-   * no out-of-band signal channel mid-turn; we emit a "push_ignored" error event
-   * so callers observe the attempt without the model seeing the payload until the
-   * next turn.
-   */
-  async push(payload: { kind: string; text: string }): Promise<void> {
-    this._emit({
-      kind: 'error',
-      timestamp: Date.now(),
-      text: `push_ignored: kind=${payload.kind} — codex turn has no OOB channel`,
-      raw: payload,
-    });
   }
 
   // ---------------------------------------------------------------------------
@@ -386,10 +357,24 @@ abstract class BaseCodexSession implements HarnessSession {
   }
 
   // ---------------------------------------------------------------------------
-  // start() — spawn the persistent process + handshake (subclass-specific)
+  // start() — spawn the persistent process + handshake
   // ---------------------------------------------------------------------------
 
   async start(): Promise<void> {
+    if (this._inflight)
+      throw Error('Native call ownership unresolved; automatic resume is blocked');
+    if (this._startedOnce && !this._alive)
+      throw Error('App-server restart requires a new owned instance and preflight');
+    this._startedOnce = true;
+    try {
+      await this._launch();
+    } catch (error) {
+      this.kill();
+      throw error;
+    }
+  }
+
+  private async _launch(): Promise<void> {
     if (this._attempts.some((a) => a.dispatch === 'attempted' && a.nativeOutcome === 'unknown'))
       throw new Error('Native outcome unresolved; automatic resume is blocked');
     if (this._proc) throw new Error('Session already started');
@@ -551,11 +536,9 @@ abstract class BaseCodexSession implements HarnessSession {
 
   private _writeTurn(turn: QueuedTurn): void {
     turn.evidence.dispatch = 'attempted';
-    this._turnEvents = turn.evidence.events;
     this._resultText = '';
 
-    // Send via the subclass's wire protocol. The returned promise resolves when
-    // the tools/call (or turn) completes; that resolves the turn.
+    // Resolves once the native terminal and the turn/start RPC have both settled.
     this._sendTurn(turn.message)
       .then((tokens) => {
         if (this._inflight !== turn) return;
@@ -610,10 +593,6 @@ abstract class BaseCodexSession implements HarnessSession {
     this._processNextTurn();
   }
 
-  protected _canReleaseAttempt(attempt: TurnState): boolean {
-    return attempt.rpcSettled;
-  }
-
   private _processNextTurn(): void {
     if (!this._inflight && this._queue.length > 0 && this._alive) {
       const next = this._queue.shift()!;
@@ -621,7 +600,7 @@ abstract class BaseCodexSession implements HarnessSession {
     }
   }
 
-  protected _rejectInflight(
+  private _rejectInflight(
     err: Error,
     reason: import('./harness-session').SessionAttempt['localFailure'] = 'transport',
   ): void {
@@ -647,7 +626,7 @@ abstract class BaseCodexSession implements HarnessSession {
     this._withdrawRequests();
   }
 
-  protected _rejectQueue(err: Error): void {
+  private _rejectQueue(err: Error): void {
     for (const turn of this._queue) turn.reject(turn.evidence.fail(err, 'blocked'));
     this._queue = [];
   }
@@ -701,7 +680,7 @@ abstract class BaseCodexSession implements HarnessSession {
   }
 
   // ---------------------------------------------------------------------------
-  // Private — JSON-RPC line processor (shared envelope; payload is per-protocol)
+  // Private — JSON-RPC line processor
   // ---------------------------------------------------------------------------
 
   private _processLine(line: string): void {
@@ -770,7 +749,7 @@ abstract class BaseCodexSession implements HarnessSession {
   // Private — emit (identical to ClaudeCodeSession)
   // ---------------------------------------------------------------------------
 
-  protected _emit(event: SessionEvent): void {
+  private _emit(event: SessionEvent): void {
     event = retainEvidence(event);
     if (event.kind === 'session_end') {
       if (this._endEmitted) return;
@@ -795,9 +774,9 @@ abstract class BaseCodexSession implements HarnessSession {
   // Private — JSON-RPC request helper (resolves on the matching response)
   // ---------------------------------------------------------------------------
 
-  protected _rpcRequest(method: string, params?: unknown): Promise<unknown> {
+  private _rpcRequest(method: string, params?: unknown): Promise<unknown> {
     const id = ++this._rpcId;
-    if ((method === 'tools/call' || method === 'turn/start') && this._inflight) {
+    if (method === 'turn/start' && this._inflight) {
       this._inflight.evidence.identity = { ...this._inflight.evidence.identity, rpcRequestId: id };
       this._inflight.evidence.rpcOutcome = 'pending';
     }
@@ -814,346 +793,16 @@ abstract class BaseCodexSession implements HarnessSession {
     });
   }
 
-  protected _serverRequest(_request: Record<string, unknown>): boolean {
-    return false;
-  }
-
-  protected _rpcNotify(method: string, params?: unknown): void {
+  private _rpcNotify(method: string, params?: unknown): void {
     const payload = `${JSON.stringify({ jsonrpc: '2.0', method, params })}\n`;
     this._proc!.stdin.write(payload);
     this._proc!.stdin.flush();
   }
 
   // ---------------------------------------------------------------------------
-  // Subclass hooks — the only protocol-specific surface
+  // Account limits, native interrupt, steer
   // ---------------------------------------------------------------------------
 
-  /** CLI args for the persistent process. */
-  protected abstract _buildSpawnArgs(): string[];
-  /** Protocol handshake after spawn (initialize / initialized / etc.). */
-  protected abstract _handshake(): Promise<void>;
-  /** Send one turn; resolve with token usage when the turn completes. */
-  protected abstract _sendTurn(
-    message: string,
-  ): Promise<{ input: number; output: number } | undefined>;
-  /** Map a streamed notification to SessionEvents. */
-  protected abstract _classify(msg: Record<string, unknown>): SessionEvent[];
-
-  protected _observeRpcResult(_id: number, _result: unknown): void {}
-
-  /** The process is gone (kill, exit, transport failure): withdraw server requests still pending. */
-  protected _withdrawRequests(): void {}
-
-  /** Shared fork constructor — subclass passes its own ctor. */
-  fork(opts?: { cwd?: string; baseContext?: string }): HarnessSession {
-    if (this._inflight) throw new Error('Cannot fork while native ownership is unresolved');
-    if (!this._externalSessionId) {
-      throw new Error('Cannot fork — no thread ID yet (send at least one message first)');
-    }
-    const Ctor = this.constructor as new (c?: CodexSessionConfig) => BaseCodexSession;
-    const forked = new Ctor({
-      bin: this._bin,
-      model: this._model,
-      effort: this._effort,
-      cwd: opts?.cwd ?? this._cwd,
-      timeout: this._defaultTimeout,
-      baseContext: opts?.baseContext ?? this._baseContext,
-      externalSessionId: this._externalSessionId,
-      spawn: this._spawn,
-      env: this._env,
-    });
-    forked._forking = true;
-    return forked;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// CodexMcpSession (DEFAULT) — `codex mcp-server` over stdio MCP JSON-RPC
-// ---------------------------------------------------------------------------
-//
-// Handshake: initialize → notifications/initialized → tools/list.
-// A turn is an MCP `tools/call`:
-//   - first turn        → tool "codex"        (params: prompt, model, cwd, ...)
-//   - subsequent turns  → tool "codex-reply"  (params: prompt, threadId)
-// During the call, codex streams `codex/event` notifications (agent message,
-// reasoning, command execution, token usage) — mapped to SessionEvents. The
-// threadId comes back in the call result's structuredContent (captured for
-// multi-turn + fork).
-
-export class CodexMcpSession extends BaseCodexSession {
-  get transport() {
-    return TRANSPORTS['codex-mcp'];
-  }
-  private _mcpAdmission?: string;
-  private _mcpCalls = new Map<string, { invocation: Record<string, unknown>; ended: boolean }>();
-  protected _buildSpawnArgs(): string[] {
-    // Disable codex's own approvals + sandbox (the union of
-    // --dangerously-bypass-approvals-and-sandbox) so OUR container is the jail.
-    // model_reasoning_effort sets the effort level; passed as TOML-ish `-c` values.
-    const args = [
-      'mcp-server',
-      '-c',
-      `sandbox_mode="danger-full-access"`,
-      '-c',
-      `approval_policy="never"`,
-    ];
-    if (this._effort) {
-      args.push('-c', `model_reasoning_effort="${this._effort}"`);
-    }
-    return args;
-  }
-
-  protected async _handshake(): Promise<void> {
-    await this._rpcRequest('initialize', {
-      protocolVersion: '2025-06-18',
-      capabilities: {},
-      clientInfo: { name: 'inixiative-bench', version: '0.1.0' },
-    });
-    this._rpcNotify('notifications/initialized');
-    // tools/list confirms the `codex` + `codex-reply` tools are present.
-    await this._rpcRequest('tools/list', {});
-  }
-
-  protected async _sendTurn(
-    message: string,
-  ): Promise<{ input: number; output: number } | undefined> {
-    const isReply = this._externalSessionId !== undefined;
-    const name = isReply ? 'codex-reply' : 'codex';
-    const args: Record<string, unknown> = isReply
-      ? { prompt: message, threadId: this._externalSessionId }
-      : {
-          prompt: message,
-          model: this._model,
-          cwd: this._cwd,
-          // Belt-and-suspenders: also disable per-call (matches spawn `-c` flags).
-          sandbox: 'danger-full-access',
-          'approval-policy': 'never',
-          ...(this._effort ? { config: { model_reasoning_effort: this._effort } } : {}),
-        };
-
-    const result = (await this._rpcRequest('tools/call', {
-      name,
-      arguments: args,
-    })) as Record<string, unknown> | undefined;
-
-    // Capture the threadId for multi-turn (codex-reply) + fork.
-    const structured = result?.structuredContent as Record<string, unknown> | undefined;
-    const threadId = structured?.threadId as string | undefined;
-    if (threadId && this._externalSessionId && threadId !== this._externalSessionId)
-      throw new Error('MCP response changed the native resume binding');
-    if (threadId && !this._externalSessionId) {
-      this._externalSessionId = threadId;
-    }
-    if (threadId && this._inflight)
-      this._inflight.evidence.identity = { ...this._inflight.evidence.identity, threadId };
-    // Final text: prefer structuredContent.content, else the tool result content.
-    const finalText =
-      (structured?.content as string | undefined) ?? this._extractToolText(result?.content);
-    if (result?.isError === true) throw new Error(finalText ?? 'MCP tools/call failed');
-    if (finalText) {
-      this._resultText = finalText;
-      if (this._inflight) this._inflight.evidence.content = finalText;
-    }
-
-    // Usage, when the call result reports it. Streamed token_count events are
-    // already accounted by the base loop; the call result is the authoritative
-    // turn total, returned to _dispatchTurn for the SessionResult. To avoid
-    // double-counting against streamed events, we only return it if no streamed
-    // token event was seen this turn.
-    const sawStreamedTokens = this._turnEvents.some((e) => e.tokens);
-    const usage = structured?.usage as Record<string, number> | undefined;
-    if (
-      usage &&
-      !sawStreamedTokens &&
-      typeof (usage.input_tokens ?? usage.inputTokens) === 'number' &&
-      typeof (usage.output_tokens ?? usage.outputTokens) === 'number'
-    ) {
-      return {
-        input: (usage.input_tokens ?? usage.inputTokens ?? 0) as number,
-        output: (usage.output_tokens ?? usage.outputTokens ?? 0) as number,
-      };
-    }
-    return undefined;
-  }
-
-  private _extractToolText(content: unknown): string | undefined {
-    if (!Array.isArray(content)) return undefined;
-    const parts: string[] = [];
-    for (const block of content) {
-      const b = block as Record<string, unknown>;
-      if (b.type === 'text' && typeof b.text === 'string') parts.push(b.text);
-    }
-    return parts.length ? parts.join('\n') : undefined;
-  }
-
-  protected _classify(msg: Record<string, unknown>): SessionEvent[] {
-    // Streamed events arrive as JSON-RPC notifications: method "codex/event"
-    // with params carrying a `msg` of a tagged type.
-    if (msg.method !== 'codex/event') return [];
-    const params = msg.params as Record<string, unknown> | undefined;
-    const ev = (params?.msg ?? params) as Record<string, unknown> | undefined;
-    if (!ev) return [];
-    const a = this._inflight?.evidence;
-    const str = (v: unknown) => (typeof v === 'string' ? v : undefined);
-    const nativeSessionId = str(ev.session_id),
-      threadId = str(ev.thread_id);
-    const turnId = str(ev.turn_id),
-      envelopeId = str(params?.id);
-    const item = ev.item as Record<string, unknown> | undefined;
-    const unowned = (reason: NonNullable<SessionEvent['unattributedReason']>): SessionEvent[] => [
-      {
-        kind: 'native_status',
-        timestamp: Date.now(),
-        correlation: 'unknown',
-        unattributedReason: reason,
-        nativeSessionId,
-        threadId,
-        turnId,
-        callId: str(ev.call_id),
-        itemId: str(item?.id) ?? str(ev.item_id),
-        // Keep the envelope too: params.id may explain a rejected correlation.
-        // Unowned MCP calls retain identity/type diagnostics, never unrelated tool payloads.
-        raw:
-          ev.type === 'mcp_tool_call_begin' || ev.type === 'mcp_tool_call_end'
-            ? { type: ev.type }
-            : msg,
-      },
-    ];
-    if (threadId && this._externalSessionId && threadId !== this._externalSessionId)
-      return unowned('foreign-session');
-    if (
-      nativeSessionId &&
-      a?.identity.nativeSessionId &&
-      nativeSessionId !== a.identity.nativeSessionId
-    )
-      return unowned('foreign-session');
-    if (
-      (envelopeId && this._seenTerminals.has(envelopeId)) ||
-      (turnId && this._seenTerminals.has(turnId))
-    ) {
-      return unowned(ev.type === 'task_complete' ? 'duplicate-terminal' : 'after-terminal');
-    }
-    if (!a) {
-      if (ev.type === 'task_complete' && turnId) this._seenTerminals.add(turnId);
-      return unowned('no-admission');
-    }
-    if (ev.type === 'session_configured') {
-      if (!this._externalSessionId && threadId) this._externalSessionId = threadId;
-      a.identity = { ...a.identity, nativeSessionId, threadId };
-    }
-    if (
-      ev.type !== 'session_configured' &&
-      a.identity.turnId &&
-      envelopeId &&
-      envelopeId !== a.identity.turnId
-    )
-      return unowned('foreign-turn');
-    if (threadId && a.identity.threadId && threadId !== a.identity.threadId)
-      return unowned('foreign-session');
-    if (ev.type === 'task_started' && turnId && !a.identity.turnId)
-      a.identity = { ...a.identity, turnId, correlation: 'native-turn' };
-    if (turnId && turnId !== a.identity.turnId) return unowned('foreign-turn');
-    if (ev.type === 'task_complete') {
-      if (!turnId || turnId !== a.identity.turnId) return unowned('unrecognized-event');
-      this._seenTerminals.add(turnId);
-      return [
-        {
-          ...a.identity,
-          kind: 'result',
-          timestamp: Date.now(),
-          nativeOutcome: 'completed',
-          terminal: { type: 'task_complete', turnId },
-          raw: ev,
-        },
-      ];
-    }
-    const identity = {
-      ...a.identity,
-      threadId: threadId ?? a.identity.threadId,
-      turnId: turnId ?? a.identity.turnId,
-      callId: str(ev.call_id),
-      itemId: str(item?.id) ?? str(ev.item_id),
-    };
-    if (ev.type === 'mcp_tool_call_begin' || ev.type === 'mcp_tool_call_end') {
-      const invocation = object(ev.invocation);
-      if (
-        !identity.callId ||
-        !invocation ||
-        typeof invocation.server !== 'string' ||
-        !invocation.server ||
-        typeof invocation.tool !== 'string' ||
-        !invocation.tool
-      )
-        return unowned('malformed-tool');
-      if (this._mcpAdmission !== a.identity.admissionId) {
-        this._mcpAdmission = a.identity.admissionId;
-        this._mcpCalls.clear();
-      }
-      // Compare the original argument value, including absence. Never join a result
-      // for another server/tool or silently substitute arguments from its envelope.
-      const join = {
-        server: invocation.server,
-        tool: invocation.tool,
-        arguments: invocation.arguments,
-      };
-      const prior = this._mcpCalls.get(identity.callId);
-      const tool = {
-        toolName: `mcp__${invocation.server}__${invocation.tool}`,
-        toolServer: invocation.server,
-        toolMethod: invocation.tool,
-      };
-      if (ev.type === 'mcp_tool_call_begin') {
-        if (prior) return unowned('duplicate-tool');
-        this._mcpCalls.set(identity.callId, { invocation: structuredClone(join), ended: false });
-        const args = publicMcpArguments(invocation.arguments);
-        return [{ ...identity, ...tool, kind: 'tool_use', timestamp: Date.now(), ...args }];
-      }
-      if (!prior || !isDeepStrictEqual(prior.invocation, join)) return unowned('unmatched-tool');
-      if (prior.ended) return unowned('duplicate-tool');
-      const result = publicMcpResult(ev.result);
-      if (!result) return unowned('malformed-tool');
-      prior.ended = true;
-      return [{ ...identity, ...tool, kind: 'tool_result', timestamp: Date.now(), ...result }];
-    }
-    if (
-      ['session_configured', 'task_started', 'item_started', 'item_completed'].includes(
-        String(ev.type),
-      )
-    ) {
-      return [
-        {
-          ...identity,
-          kind: 'native_status',
-          timestamp: Date.now(),
-          nativeOutcome: a.nativeOutcome,
-          raw: ev,
-        },
-      ];
-    }
-    // Notifications without a turn ID are associated only with the single owned RPC.
-    const classified = classifyCodexEvent(ev, 'type');
-    return classified.length
-      ? classified.map((event) => ({ ...identity, ...event }))
-      : unowned('unrecognized-event');
-  }
-}
-
-// ---------------------------------------------------------------------------
-// CodexAppServerSession (EXPERIMENTAL) — `codex app-server` over stdio
-// ---------------------------------------------------------------------------
-//
-// Wire contract: installed codex-cli 0.153.4 v2 JSON schema. Controlled tests
-// establish source behavior, not a real create/resume/native-completion capture.
-// No default switch. Full history hydration, native fork and cancellation remain
-// separate integration work; a local interrupt never acknowledges native stop.
-
-class NativeValidationError extends Error {}
-
-export class CodexAppServerSession extends BaseCodexSession {
-  get transport() {
-    return TRANSPORTS['codex-app-server'];
-  }
-  readonly appServerProtocol = 'owned-thread-v1';
   private _limits?: LimitSnapshot;
 
   /** Latest account limits observed on this session (stream or poll). */
@@ -1229,7 +878,7 @@ export class CodexAppServerSession extends BaseCodexSession {
   }
 
   /** Mid-turn steer (turn/steer) into the owned in-flight turn; otherwise records push_ignored. */
-  override async push(payload: { kind: string; text: string }): Promise<void> {
+  async push(payload: { kind: string; text: string }): Promise<void> {
     const a = this._inflight?.evidence;
     const ignored = (reason: string) =>
       this._emit({
@@ -1307,39 +956,10 @@ export class CodexAppServerSession extends BaseCodexSession {
     }
   >();
 
-  constructor(config?: CodexSessionConfig) {
-    super(config);
-    const { onThreadReady, ...options } = config?.appServer ?? {};
-    this._onThreadReady = onThreadReady;
-    this._options = retainEvidence(options);
-    const required = this._options.requiredMcpServer;
-    if (
-      required &&
-      (!/^[a-zA-Z0-9_-]+$/.test(required.name) ||
-        !required.tools.length ||
-        required.tools.some((t) => !/^[a-zA-Z0-9_-]+$/.test(t)))
-    )
-      throw new NativeValidationError('Invalid required MCP inventory');
-  }
-
-  override fork(): HarnessSession {
+  fork(): HarnessSession {
     throw Error(
       'Native app-server fork is not implemented; a same-thread wrapper cannot create a native fork or inherit a process capability',
     );
-  }
-
-  override async start(): Promise<void> {
-    if (this._inflight)
-      throw Error('Native call ownership unresolved; automatic resume is blocked');
-    if (this._startedOnce && !this._alive)
-      throw Error('App-server restart requires a new owned instance and preflight');
-    this._startedOnce = true;
-    try {
-      await super.start();
-    } catch (error) {
-      this.kill();
-      throw error;
-    }
   }
 
   /** Needs an `approvalPolicy` other than `never`. Gates registered here are not copied (no fork). */
@@ -1351,7 +971,7 @@ export class CodexAppServerSession extends BaseCodexSession {
     return this._gates.add(gate);
   }
 
-  protected override _withdrawRequests(): void {
+  private _withdrawRequests(): void {
     for (const approval of this._approvals.values()) approval.abort();
     this._approvals.clear();
   }
@@ -1447,7 +1067,7 @@ export class CodexAppServerSession extends BaseCodexSession {
     return true;
   }
 
-  protected override _serverRequest(request: Record<string, unknown>): boolean {
+  private _serverRequest(request: Record<string, unknown>): boolean {
     if (this._approval(request)) return true;
     // JSON-RPC's explicit method-not-supported refusal also covers unknown future
     // requests. Never approve native work or echo private request parameters.
@@ -1557,17 +1177,17 @@ export class CodexAppServerSession extends BaseCodexSession {
     this._refuse('mcp-inventory-page-limit');
   }
 
-  protected override _canReleaseAttempt(a: TurnState): boolean {
+  private _canReleaseAttempt(a: TurnState): boolean {
     // An observer/write failure may occur after delivery. A terminal alone does
     // not settle the unanswered turn/start call or authorize another admission.
     return a.rpcSettled && (a.rpcOutcome === 'resolved' || a.rpcOutcome === 'failed');
   }
 
-  protected _buildSpawnArgs(): string[] {
+  private _buildSpawnArgs(): string[] {
     return ['app-server', '--listen', 'stdio://'];
   }
 
-  protected async _handshake(): Promise<void> {
+  private async _handshake(): Promise<void> {
     this._threadReady = false;
     const initialized = object(
       await this._rpcRequest('initialize', {
@@ -1587,9 +1207,7 @@ export class CodexAppServerSession extends BaseCodexSession {
     this._rpcNotify('initialized');
   }
 
-  protected async _sendTurn(
-    message: string,
-  ): Promise<{ input: number; output: number } | undefined> {
+  private async _sendTurn(message: string): Promise<{ input: number; output: number } | undefined> {
     const a = this._inflight!.evidence;
     if (!this._threadReady) {
       const binding = this._externalSessionId;
@@ -1673,6 +1291,7 @@ export class CodexAppServerSession extends BaseCodexSession {
         timestamp: Date.now(),
         threadId: id,
         nativeSessionId: this._nativeSessionId,
+        correlation: 'unknown',
         unattributedReason: 'session-configuration',
         raw: {
           type: 'thread-configured',
@@ -1728,7 +1347,7 @@ export class CodexAppServerSession extends BaseCodexSession {
     return a.tokens;
   }
 
-  protected override _observeRpcResult(id: number, result: unknown): void {
+  private _observeRpcResult(id: number, result: unknown): void {
     const a = this._inflight?.evidence;
     if (!a || this._appAdmission !== a.admissionId || a.identity.rpcRequestId !== id) return;
     const turn = this._turn(object(result)?.turn);
@@ -1756,7 +1375,7 @@ export class CodexAppServerSession extends BaseCodexSession {
     return turn as { id: string; status: string; error?: unknown };
   }
 
-  protected _classify(msg: Record<string, unknown>): SessionEvent[] {
+  private _classify(msg: Record<string, unknown>): SessionEvent[] {
     const method = typeof msg.method === 'string' ? msg.method : undefined;
     if (!method) return [];
     if (method === 'account/rateLimits/updated') {
@@ -1995,7 +1614,7 @@ export class CodexAppServerSession extends BaseCodexSession {
           return unowned('malformed-tool');
         const error = object(item.error),
           result = object(item.result);
-        const output = result ? publicMcpResult({ Ok: { content: result.content } }) : undefined;
+        const output = result ? publicMcpResult(result.content) : undefined;
         if (item.error != null && typeof error?.message !== 'string')
           return unowned('malformed-tool');
         prior.completed = true;
@@ -2022,17 +1641,8 @@ export class CodexAppServerSession extends BaseCodexSession {
 }
 
 // ---------------------------------------------------------------------------
-// Shared event mapping — codex item/event → SessionEvent
+// Helpers
 // ---------------------------------------------------------------------------
-//
-// Both protocols carry the same ThreadItem / event shapes (agent message,
-// reasoning, command execution, token usage). `tag` is the discriminant field
-// ("type" for both mcp `codex/event.msg.type` and app-server `item.type`).
-//
-//   agent_message / agentMessage     → text
-//   reasoning / agent_reasoning      → thinking
-//   command_execution / commandExecution → tool_use (+ tool_result when done)
-//   token_count / usage              → tokens (attached to a result event)
 
 const object = (value: unknown): Record<string, unknown> | undefined =>
   value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -2117,25 +1727,15 @@ function publicMcpArguments(value: unknown): Pick<SessionEvent, 'toolInput' | 't
   };
 }
 
-/** Rust Result<CallToolResult,String> from protocol.rs. This is legacy event
- * normalization, not the app-server ThreadItem schema. Keep all public text
- * blocks (including the bridge's JSON receipt), not arbitrary envelope fields. */
+/** An mcpToolCall result's content: public text blocks (including the bridge's JSON receipt)
+ * are kept; any other block keeps only a known type label. */
 function publicMcpResult(
   value: unknown,
-): Pick<SessionEvent, 'toolOutput' | 'toolError' | 'toolOutputOmitted'> | undefined {
-  const result = object(value);
-  if (!result || Object.keys(result).length !== 1) return;
-  if (typeof result.Err === 'string') return { toolOutput: result.Err, toolError: true };
-  const ok = object(result.Ok);
-  if (
-    !ok ||
-    !Array.isArray(ok.content) ||
-    (ok.isError !== undefined && typeof ok.isError !== 'boolean')
-  )
-    return;
-  let omitted = Object.keys(ok).some((k) => k !== 'content' && k !== 'isError');
-  const content = ok.content.map((value) => {
-    const block = object(value);
+): Pick<SessionEvent, 'toolOutput' | 'toolOutputOmitted'> | undefined {
+  if (!Array.isArray(value)) return;
+  let omitted = false;
+  const content = value.map((entry) => {
+    const block = object(entry);
     if (block?.type === 'text' && typeof block.text === 'string') {
       if (Object.keys(block).some((k) => k !== 'type' && k !== 'text')) omitted = true;
       return { type: 'text', text: block.text };
@@ -2149,113 +1749,7 @@ function publicMcpResult(
     };
   });
   return {
-    toolOutput: JSON.stringify({
-      content,
-      ...(ok.isError !== undefined ? { isError: ok.isError } : {}),
-    }),
-    ...(ok.isError !== undefined ? { toolError: ok.isError as boolean } : {}),
+    toolOutput: JSON.stringify({ content }),
     ...(omitted ? { toolOutputOmitted: true } : {}),
   };
 }
-
-function classifyCodexEvent(ev: Record<string, unknown>, tag: string): SessionEvent[] {
-  const ts = Date.now();
-  const type = String(ev[tag] ?? '').toLowerCase();
-  const events: SessionEvent[] = [];
-
-  // Agent message → text.
-  if (type === 'agent_message' || type === 'agentmessage' || type === 'agent_message_delta') {
-    const text = (ev.message ?? ev.text ?? ev.delta) as string | undefined;
-    if (text) events.push({ kind: 'text', timestamp: ts, text, raw: ev });
-    return events;
-  }
-
-  // Reasoning → thinking.
-  if (
-    type === 'reasoning' ||
-    type === 'agent_reasoning' ||
-    type === 'agentreasoning' ||
-    type === 'agent_reasoning_delta'
-  ) {
-    const text = (ev.text ?? ev.reasoning ?? ev.delta ?? ev.summary) as string | undefined;
-    if (text) events.push({ kind: 'thinking', timestamp: ts, text, raw: ev });
-    return events;
-  }
-
-  // Command execution → tool_use, plus tool_result if output is present.
-  if (
-    type === 'command_execution' ||
-    type === 'commandexecution' ||
-    type === 'exec_command_begin' ||
-    type === 'exec_command_end'
-  ) {
-    const command = (ev.command ?? ev.cmd) as string | string[] | undefined;
-    const cmdStr = Array.isArray(command) ? command.join(' ') : command;
-    if (type !== 'exec_command_end')
-      events.push({
-        kind: 'tool_use',
-        timestamp: ts,
-        toolName: 'shell',
-        toolInput: cmdStr ? { command: cmdStr } : (ev as Record<string, unknown>),
-        raw: ev,
-      });
-    const output = (ev.output ?? ev.stdout ?? ev.aggregated_output) as string | undefined;
-    const exitCode = (ev.exit_code ?? ev.exitCode) as number | undefined;
-    if (output !== undefined || exitCode !== undefined) {
-      events.push({
-        kind: 'tool_result',
-        timestamp: ts,
-        toolOutput: output ?? '',
-        toolError: exitCode !== undefined && exitCode !== 0,
-        raw: ev,
-      });
-    }
-    return events;
-  }
-
-  // Token usage → carried on a result-less event so accounting picks it up.
-  if (
-    type === 'token_count' ||
-    type === 'token_usage' ||
-    type === 'usage' ||
-    type === 'tokenusage'
-  ) {
-    const u = (ev.info ?? ev.usage ?? ev) as Record<string, unknown>;
-    const input = (u.input_tokens ?? u.inputTokens ?? u.total_input_tokens ?? 0) as number;
-    const output = (u.output_tokens ?? u.outputTokens ?? u.total_output_tokens ?? 0) as number;
-    if (input || output) {
-      events.push({
-        kind: 'result',
-        timestamp: ts,
-        tokens: { input, output },
-        raw: ev,
-      });
-    }
-    return events;
-  }
-
-  // Errors.
-  if (type === 'error' || type === 'stream_error') {
-    events.push({
-      kind: 'error',
-      timestamp: ts,
-      text: (ev.message ?? ev.error ?? JSON.stringify(ev)) as string,
-      raw: ev,
-    });
-    return events;
-  }
-
-  // Unclassified events are preserved via `raw` on nothing — but we keep them
-  // out of turn content. Oracle can still introspect via the live stream.
-  return events;
-}
-
-// ---------------------------------------------------------------------------
-// Default export selection
-// ---------------------------------------------------------------------------
-
-/**
- * The default CodexSession is the MCP variant (stdio mcp-server). Import
- * CodexAppServerSession explicitly for the experimental app-server variant.
- */
-export const CodexSession = CodexMcpSession;

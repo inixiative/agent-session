@@ -292,11 +292,9 @@ describe('SubscriptionPool', () => {
     });
   });
 
-  test('continuity refusals are explicit: no shared history, no native resume, unresolved native work', async () => {
+  test('continuity refusals are explicit: no shared history, unresolved native work', async () => {
     const { p, events } = pool([
       { id: 'solo', transport: 'claude-cli' },
-      { id: 'mcp-1', transport: 'codex-mcp', continuationKey: 'k' },
-      { id: 'mcp-2', transport: 'codex-mcp', continuationKey: 'k' },
       { id: 'app-1', transport: 'codex-app-server', continuationKey: 'shared' },
       { id: 'app-2', transport: 'codex-app-server', continuationKey: 'shared' },
     ]);
@@ -315,9 +313,6 @@ describe('SubscriptionPool', () => {
     expect(await reason({ instanceId: 'solo', externalSessionId: 's' }, 'claude')).toBe(
       'no-shared-history',
     );
-    expect(await reason({ instanceId: 'mcp-1', externalSessionId: 't' }, 'codex')).toBe(
-      'resume-unsupported',
-    );
     const unresolved = {
       attempts: [{ dispatch: 'attempted', nativeOutcome: 'unknown' }],
       kill() {
@@ -330,7 +325,7 @@ describe('SubscriptionPool', () => {
     expect(await reason({ instanceId: 'app-1', externalSessionId: 't' }, 'codex')).toBe(
       'targets-unavailable',
     );
-    expect(events.filter((e) => e.type === 'handoff-refused')).toHaveLength(4);
+    expect(events.filter((e) => e.type === 'handoff-refused')).toHaveLength(3);
   });
 });
 

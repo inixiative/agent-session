@@ -6,7 +6,7 @@ import {
   type ClaudeAgentSdkSessionConfig,
 } from './claude-agent-sdk-session';
 import { ClaudeCodeSession, type ClaudeCodeSessionConfig } from './claude-code-session';
-import { CodexAppServerSession, CodexMcpSession, type CodexSessionConfig } from './codex-session';
+import { CodexAppServerSession, type CodexSessionConfig } from './codex-session';
 import type { HarnessSession } from './harness-session';
 import {
   TRANSPORTS,
@@ -36,7 +36,6 @@ export interface ApiSessionConfig {
 
 export interface TransportConfigs {
   'claude-cli': ClaudeCodeSessionConfig;
-  'codex-mcp': CodexSessionConfig;
   'codex-app-server': CodexSessionConfig;
   'claude-agent-sdk': ClaudeAgentSdkSessionConfig;
   acp: AcpSessionConfig;
@@ -81,8 +80,6 @@ export function createSession<K extends TransportKind>(
   switch (kind) {
     case 'claude-cli':
       return new ClaudeCodeSession(config as ClaudeCodeSessionConfig);
-    case 'codex-mcp':
-      return new CodexMcpSession(config as CodexSessionConfig);
     case 'codex-app-server':
       return new CodexAppServerSession(config as CodexSessionConfig);
     case 'claude-agent-sdk':

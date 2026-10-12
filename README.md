@@ -2,7 +2,7 @@
 
 Drive coding-agent CLIs as **persistent, streaming, event-captured sessions** —
 one interface, any agent, over interchangeable **transports**. Claude Code
-(CLI or Agent SDK) and Codex (MCP or app-server) today; Gemini and Grok planned.
+(CLI or Agent SDK) and Codex (app-server) today; Gemini and Grok planned.
 Also: warm **primed decision sessions**, **subscription pools** with
 deterministic routing, **limit polling** and **session continuity**.
 
@@ -64,20 +64,23 @@ arrive as `rate_limit` events.
 ```ts
 import { createSession, TRANSPORTS } from "@inixiative/agent-session";
 
-const kind = "codex-app-server";            // or claude-cli, claude-agent-sdk, codex-mcp
+const kind = "codex-app-server";            // or claude-cli, claude-agent-sdk
 if (TRANSPORTS[kind].capabilities.interrupt === "acknowledged") { /* … */ }
 const session = createSession(kind, { cwd, model: "gpt-6-luna", env: { CODEX_HOME: profile } });
 ```
 
-| | claude-cli | codex-mcp | codex-app-server | claude-agent-sdk | acp | api |
-|---|---|---|---|---|---|---|
-| Status | ✅ live | ✅ live | ✅ live | ✅ live | stub | stub |
-| Resume / fork | native / native | loaded-only / same-thread | native / – | native / native | – | – |
-| Interrupt | acknowledged | local-only | acknowledged | acknowledged | – | – |
-| Push | – | – | steer | – | – | – |
-| Approvals | callback | mode | callback | callback | – | – |
-| Limits stream / poll | ✅ / ✅ | – / – | ✅ / ✅ | ✅ / – | – | – |
-| Primed reset | fork | – | fork | – | – | – |
+| | claude-cli | codex-app-server | claude-agent-sdk | acp | api |
+|---|---|---|---|---|---|
+| Status | ✅ live | ✅ live | ✅ live | stub | stub |
+| Resume / fork | native / native | native / – | native / native | – | – |
+| Interrupt | acknowledged | acknowledged | acknowledged | – | – |
+| Push | – | steer | – | – | – |
+| Approvals | callback | callback | callback | – | – |
+| Limits stream / poll | ✅ / ✅ | ✅ / ✅ | ✅ / – | – | – |
+| Primed reset | fork | fork | – | – | – |
+
+Codex runs only over `codex app-server --listen stdio://` (`CodexAppServerSession`);
+Codex CLI 0.155 has no `mcp-server` subcommand.
 
 Full matrix, notes and what is stubbed: [docs/transports-pools-routing.md](docs/transports-pools-routing.md).
 
@@ -174,7 +177,6 @@ snapshots in the artifact but do not fabricate a completed-turn total.
 | Runtime | Status |
 |---|---|
 | Claude Code | ✅ shipped |
-| Codex CLI (`codex mcp-server`, JSON-RPC) | ✅ shipped (`CodexSession`) |
 | Codex app-server | ✅ shipped (`CodexAppServerSession`, `CodexPrimedSessions`) |
 | Claude Agent SDK | ✅ shipped (`ClaudeAgentSdkSession`; caller supplies `query`) |
 | ACP agents / direct API | typed stubs |

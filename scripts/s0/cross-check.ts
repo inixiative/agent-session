@@ -32,10 +32,8 @@ const allowed = [
   'native-turn-ownership',
   'native-terminal-evidence',
   'native-historical-evidence',
-  'native-continuation-ordering',
   'native-continuation-recordings',
   'native-compaction-evidence',
-  'native-mcp-tool-normalization',
   'native-bridge-late-settlement',
 ].map((name) => `fixtures/harness-qa/acceptance/${name}.test.ts`);
 const requested = process.argv.slice(2);

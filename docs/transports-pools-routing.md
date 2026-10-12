@@ -22,21 +22,24 @@ Each transport declares its real capabilities (`TRANSPORTS[kind].capabilities`),
 describing this package's implementation rather than the runtime in principle.
 Callers branch on capabilities, not on kinds.
 
-| Capability | claude-cli | codex-mcp | codex-app-server | claude-agent-sdk | acp | api |
-|---|---|---|---|---|---|---|
-| Status | implemented | implemented | implemented | implemented | **stub** | **stub** |
-| Verified | live | live | live | live | none | none |
-| Resume by ID in a new process | native | loaded-only | native | native | – | – |
-| Fork | native | same-thread | none | native | – | – |
-| Rollback | none¹ | none | none² | none | – | – |
-| Interrupt | acknowledged | local-only | acknowledged | acknowledged | – | – |
-| Mid-turn push | none | none | steer | none | – | – |
-| Approvals | callback (`toolGate`) | mode | callback | callback | – | – |
-| Usage per turn | yes | yes | yes | yes | – | – |
-| Limits: stream / poll | yes / yes | no / no | yes / yes | yes / no | – | – |
-| Text-only session | yes | no | no³ | yes | – | – |
-| Primed reset | fork | none | fork | none | – | – |
-| Billing | subscription | subscription | subscription | subscription | subscription | api |
+| Capability | claude-cli | codex-app-server | claude-agent-sdk | acp | api |
+|---|---|---|---|---|---|
+| Status | implemented | implemented | implemented | **stub** | **stub** |
+| Verified | live | live | live | none | none |
+| Resume by ID in a new process | native | native | native | – | – |
+| Fork | native | none | native | – | – |
+| Rollback | none¹ | none² | none | – | – |
+| Interrupt | acknowledged | acknowledged | acknowledged | – | – |
+| Mid-turn push | none | steer | none | – | – |
+| Approvals | callback (`toolGate`) | callback | callback | – | – |
+| Usage per turn | yes | yes | yes | – | – |
+| Limits: stream / poll | yes / yes | yes / yes | yes / no | – | – |
+| Text-only session | yes | no³ | yes | – | – |
+| Primed reset | fork | fork | none | – | – |
+| Billing | subscription | subscription | subscription | subscription | api |
+
+Codex has one transport, `codex app-server --listen stdio://`; Codex CLI 0.155 has no
+`mcp-server` subcommand.
 
 ¹ `--resume-session-at` exists natively but is not wired.
 ² codex-cli 0.155.1 refuses `thread/rollback` for ephemeral threads ("requires persisted
@@ -276,5 +279,5 @@ first, because `preferred` outranks `utilization` in that preset. Put
   the draft `routing/subscription-routing.ts` in Foundry. Decision profiles become
   pool instances; `maxConcurrent` becomes per-instance `concurrencyLimit` plus the
   caller's own global cap.
-- Existing `ClaudeCodeSession`/`CodexSession` behavior is unchanged unless the new
+- Existing `ClaudeCodeSession`/`CodexAppServerSession` behavior is unchanged unless the new
   options are used; `interrupt()` still only releases the local waiter.

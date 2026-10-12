@@ -13,21 +13,15 @@
 // is declared absent, with a note.
 // ---------------------------------------------------------------------------
 
-export type TransportKind =
-  | 'claude-cli'
-  | 'codex-mcp'
-  | 'codex-app-server'
-  | 'claude-agent-sdk'
-  | 'acp'
-  | 'api';
+export type TransportKind = 'claude-cli' | 'codex-app-server' | 'claude-agent-sdk' | 'acp' | 'api';
 
 export type TransportRuntime = 'claude' | 'codex' | 'external';
 
 export interface TransportCapabilities {
-  /** Continue a thread by native ID in a new process (`loaded-only`: only while the original process holds it). */
-  readonly resume: 'native' | 'loaded-only' | 'none';
-  /** `native`: a new branch with its own ID; `same-thread`: continues the parent thread (not a real fork). */
-  readonly fork: 'native' | 'same-thread' | 'none';
+  /** Continue a thread by native ID in a new process. */
+  readonly resume: 'native' | 'none';
+  /** `native`: a new branch with its own ID. */
+  readonly fork: 'native' | 'none';
   /** Drop the last N turns of native history. */
   readonly rollback: 'native' | 'none';
   /** `acknowledged`: interruptNative() confirms the stop through the turn's terminal; `local-only`: interrupt() releases the local waiter only. */
@@ -86,29 +80,6 @@ export const TRANSPORTS: Readonly<Record<TransportKind, TransportDescriptor>> = 
       "interruptNative() and readLimits() use the CLI's stdio control protocol (`interrupt`, `get_usage`).",
       'toolGate: true launches with `--permission-prompt-tool stdio` and registers a PreToolUse callback over the control protocol: onToolRequest() gates see every call (`pre-use`, any mode, bypass included; only a deny counts) and the asks the permission mode raises (`permission`, final).',
       'Rollback (`--resume-session-at`) exists natively but is not wired here.',
-    ],
-  },
-  'codex-mcp': {
-    kind: 'codex-mcp',
-    runtime: 'codex',
-    status: 'implemented',
-    verified: 'live',
-    capabilities: {
-      resume: 'loaded-only',
-      fork: 'same-thread',
-      rollback: 'none',
-      interrupt: 'local-only',
-      push: 'none',
-      approvals: 'mode',
-      usage: true,
-      limits: none,
-      textOnly: false,
-      primed: 'none',
-      billing: 'subscription',
-    },
-    notes: [
-      '`codex mcp-server`; `codex-reply` continues only threads loaded in the same process.',
-      'fork() continues the parent thread; it is not a native fork.',
     ],
   },
   'codex-app-server': {

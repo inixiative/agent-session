@@ -21,11 +21,11 @@ import { Sanitizer } from '../scripts/s0/sanitize';
 
 const runId = 's1-continuation-20260907T040000Z';
 
-// Synthetic controlled transports through BOTH production classes, never native processes.
+// Synthetic controlled transports through the production class, never native processes.
 function fixture(
   path: ActivePath,
   scenario = 'success',
-  fault?: 'stdin' | 'stdout' | 'event' | 'handshake',
+  fault?: 'stdin' | 'stdout' | 'event',
   checkpoint?: () => void,
 ) {
   let controller!: ReadableStreamDefaultController<Uint8Array>, finish!: (code: number) => void;
@@ -48,34 +48,19 @@ function fixture(
       finish(code);
     }
   };
-  const native = (msg: Record<string, unknown>) =>
-    emit({ jsonrpc: '2.0', method: 'codex/event', params: { id: msg.turn_id, msg } });
   const nativeSession = 'PRIVATE_NATIVE_SESSION';
   const terminal = (index: number, wrong = false, failed = false) =>
-    path === 'claude'
-      ? emit({
-          type: 'result',
-          subtype: failed ? 'error_during_execution' : 'success',
-          is_error: failed,
-          session_id: wrong ? 'FOREIGN_SESSION' : nativeSession,
-          uuid: `PRIVATE_RESULT_${index}`,
-          result: CONTINUATION_TASKS[index].marker,
-          ...(scenario === 'missing-identity' ? { uuid: undefined } : {}),
-          ...(scenario === 'api-error'
-            ? { is_error: false, api_error_status: 429, terminal_reason: 'api_error' }
-            : {}),
-        })
-      : native({
-          type: 'task_complete',
-          turn_id: wrong ? 'FOREIGN_TURN' : `PRIVATE_TURN_${index}`,
-        });
-  const rpc = (index: number) =>
     emit({
-      jsonrpc: '2.0',
-      id: writes.filter((v) => v.method === 'tools/call')[index]?.id,
-      result: {
-        structuredContent: { threadId: nativeSession, content: CONTINUATION_TASKS[index].marker },
-      },
+      type: 'result',
+      subtype: failed ? 'error_during_execution' : 'success',
+      is_error: failed,
+      session_id: wrong ? 'FOREIGN_SESSION' : nativeSession,
+      uuid: `PRIVATE_RESULT_${index}`,
+      result: CONTINUATION_TASKS[index].marker,
+      ...(scenario === 'missing-identity' ? { uuid: undefined } : {}),
+      ...(scenario === 'api-error'
+        ? { is_error: false, api_error_status: 429, terminal_reason: 'api_error' }
+        : {}),
     });
   const tool = (index: number) => {
     const task = CONTINUATION_TASKS[index];
@@ -83,83 +68,47 @@ function fixture(
       `bun --version && cat ${task.file}` +
       (scenario === 'extra-command' ? ' && PRIVATE_UNRELATED_COMMAND' : '');
     const content = `${PINNED_BUN_VERSION}\n${task.content}`;
-    if (path === 'claude') {
-      emit({
-        type: 'assistant',
-        session_id: nativeSession,
-        message: {
-          id: `PRIVATE_MESSAGE_${index}`,
-          content: [
-            { type: 'thinking', thinking: 'PRIVATE_REASONING_SENTINEL' },
-            {
-              type: 'tool_use',
-              name: 'Bash',
-              id: `PRIVATE_CALL_${index}`,
-              input: { command, env: { private: 'SECRET' } },
-            },
-          ],
-        },
-      });
-      emit({
-        type: 'user',
-        session_id: nativeSession,
-        message: {
-          content: [
-            {
-              type: 'tool_result',
-              tool_use_id: `PRIVATE_CALL_${index}`,
-              is_error: false,
-              ...(scenario === 'wrong-call' ? { tool_use_id: 'PRIVATE_WRONG_CALL' } : {}),
-              content: scenario === 'missing-output' ? 'PRIVATE_OUTPUT' : content,
-            },
-          ],
-        },
-      });
-    } else {
-      native({
-        type: 'session_configured',
-        thread_id: nativeSession,
-        session_id: nativeSession,
-        model: 'gpt-6-astra',
-        reasoning_effort: 'xhigh',
-      });
-      native({ type: 'task_started', turn_id: `PRIVATE_TURN_${index}` });
-      native({
-        type: 'agent_reasoning',
-        turn_id: `PRIVATE_TURN_${index}`,
-        text: 'PRIVATE_REASONING_SENTINEL',
-      });
-      native({
-        type: 'exec_command_begin',
-        turn_id: `PRIVATE_TURN_${index}`,
-        call_id: `PRIVATE_CALL_${index}`,
-        command: ['/bin/zsh', '-lc', command],
-      });
-      native({
-        type: 'exec_command_end',
-        turn_id: `PRIVATE_TURN_${index}`,
-        call_id: scenario === 'wrong-call' ? 'PRIVATE_WRONG_CALL' : `PRIVATE_CALL_${index}`,
-        exit_code: 0,
-        stdout: scenario === 'missing-output' ? 'PRIVATE_OUTPUT' : content,
-      });
-    }
+    emit({
+      type: 'assistant',
+      session_id: nativeSession,
+      message: {
+        id: `PRIVATE_MESSAGE_${index}`,
+        content: [
+          { type: 'thinking', thinking: 'PRIVATE_REASONING_SENTINEL' },
+          {
+            type: 'tool_use',
+            name: 'Bash',
+            id: `PRIVATE_CALL_${index}`,
+            input: { command, env: { private: 'SECRET' } },
+          },
+        ],
+      },
+    });
+    emit({
+      type: 'user',
+      session_id: nativeSession,
+      message: {
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: `PRIVATE_CALL_${index}`,
+            is_error: false,
+            ...(scenario === 'wrong-call' ? { tool_use_id: 'PRIVATE_WRONG_CALL' } : {}),
+            content: scenario === 'missing-output' ? 'PRIVATE_OUTPUT' : content,
+          },
+        ],
+      },
+    });
   };
   const complete = (index: number) => {
     tool(index);
     terminal(index);
-    if (path === 'codex-mcp') rpc(index);
   };
   const proc = {
     stdin: {
       write(data: string) {
         const value = JSON.parse(data);
         writes.push(value);
-        if (['initialize', 'tools/list'].includes(value.method)) {
-          if (scenario !== 'handshake-timeout')
-            queueMicrotask(() => emit({ jsonrpc: '2.0', id: value.id, result: {} }));
-          return;
-        }
-        if (value.method === 'notifications/initialized') return;
         const index = sends++;
         queueMicrotask(() => {
           if (scenario === 'malformed') {
@@ -172,14 +121,6 @@ function fixture(
           }
           if (scenario === 'timeout') return;
           if (scenario === 'malformed-then-success') bytes('PRIVATE malformed JSON\n');
-          if (
-            scenario === 'rpc-only' ||
-            (scenario === 'missing-identity' && path === 'codex-mcp')
-          ) {
-            tool(index);
-            rpc(index);
-            return;
-          }
           if (scenario === 'foreign') {
             tool(index);
             terminal(index, true);
@@ -187,16 +128,12 @@ function fixture(
           }
           if (scenario === 'error') {
             tool(index);
-            if (path === 'claude') terminal(index, false, true);
-            else {
-              emit({ jsonrpc: '2.0', id: value.id, error: { message: 'PRIVATE_RPC_ERROR' } });
-            }
+            terminal(index, false, true);
             return;
           }
           if (scenario === 'duplicate' && index === 1) {
             tool(index);
             terminal(0);
-            if (path === 'codex-mcp') rpc(index);
             return;
           }
           complete(index);
@@ -233,25 +170,19 @@ function fixture(
     spawn: (cmd) => {
       spawned++;
       argv.push(cmd);
-      if (path === 'claude')
-        queueMicrotask(() =>
-          emit({
-            type: 'system',
-            subtype: 'init',
-            session_id: nativeSession,
-            model: 'claude-fable-5-1',
-          }),
-        );
+      queueMicrotask(() =>
+        emit({
+          type: 'system',
+          subtype: 'init',
+          session_id: nativeSession,
+          model: 'claude-fable-5-1',
+        }),
+      );
       return proc;
     },
     observationFault: (boundary) => {
       if (boundary === 'stdin') stdinObservations++;
-      if (fault === 'handshake' && boundary === 'stdin' && stdinObservations === 1)
-        throw Error('PRIVATE_HANDSHAKE_OBSERVER');
-      if (
-        boundary === fault &&
-        (boundary === 'stdin' ? stdinObservations === (path === 'claude' ? 1 : 4) : sends > 0)
-      )
+      if (boundary === fault && (boundary === 'stdin' ? stdinObservations === 1 : sends > 0))
         throw Error('PRIVATE_OBSERVER_ERROR');
     },
     checkpoint,
@@ -274,7 +205,7 @@ function fixture(
     },
   };
 }
-for (const path of ['claude', 'codex-mcp'] as const) {
+for (const path of ['claude'] as const) {
   test(`${path}: two independent tasks use one instance/process, actual joined evidence and stable pseudonyms`, async () => {
     const f = fixture(path);
     try {
@@ -286,9 +217,7 @@ for (const path of ['claude', 'codex-mcp'] as const) {
       expect(f.argv[0]).toEqual(continuationPlan(path, runId).expectedSpawn);
       const turns = report.turns.map((t) => t.attempt as any);
       expect(turns[0].admissionId).not.toBe(turns[1].admissionId);
-      expect(turns[0][path === 'claude' ? 'nativeSessionId' : 'threadId']).toBe(
-        turns[1][path === 'claude' ? 'nativeSessionId' : 'threadId'],
-      );
+      expect(turns[0].nativeSessionId).toBe(turns[1].nativeSessionId);
       for (const turn of report.turns) {
         const events = turn.eventIndices.map((index) => report.normalized[index] as any);
         const begin = events.find((e: any) => e.kind === 'tool_use');
@@ -299,10 +228,6 @@ for (const path of ['claude', 'codex-mcp'] as const) {
       expect(turns.every((t) => t.nativeOutcome === 'completed')).toBe(true);
       expect(f.argv[0]).not.toContain('--resume');
       expect(f.argv[0]).not.toContain('--fork-session');
-      if (path === 'codex-mcp')
-        expect(f.writes.filter((v) => v.method === 'tools/call').map((v) => v.params.name)).toEqual(
-          ['codex', 'codex-reply'],
-        );
       expect(JSON.stringify(report)).not.toMatch(/PRIVATE|FOREIGN|SECRET|api_key|Bearer|\/Users\//);
       const immutableFirst = JSON.stringify(report.turns[0]);
       expect(await f.capture.closeOwned()).toBe(true);
@@ -472,18 +397,6 @@ for (const path of ['claude', 'codex-mcp'] as const) {
   });
 }
 
-test('MCP handshake deadline admits no send; cleanup is based on explicit no-turn writes', async () => {
-  const f = fixture('codex-mcp', 'handshake-timeout');
-  try {
-    const report = await f.capture.run();
-    expect(report.stop).toBe('start-deadline');
-    expect(f.sends).toBe(0);
-    expect(await f.capture.closeOwned()).toBe(true);
-  } finally {
-    f.exit();
-  }
-});
-
 test('synthetic Claude API-error terminal keeps precedence evidence in the sanitized wire and result', async () => {
   const f = fixture('claude', 'api-error');
   try {
@@ -509,20 +422,6 @@ test('synthetic Claude API-error terminal keeps precedence evidence in the sanit
   }
 });
 
-test('MCP handshake observer failure is not no-turn proof and cannot admit a model call', async () => {
-  const f = fixture('codex-mcp', 'success', 'handshake');
-  try {
-    const report = await f.capture.run();
-    expect(f.sends).toBe(0);
-    expect(report.stop).toBe('evidence-incomplete');
-    expect(report.admission.noTurn).toBe(false);
-    expect(await f.capture.closeOwned()).toBe(false);
-  } finally {
-    f.exit();
-    await f.capture.closeOwned();
-  }
-});
-
 test('plan mode launches no model or version process and creates no files', () => {
   const dir = mkdtempSync(join(tmpdir(), 'continuation-plan-'));
   try {
@@ -537,6 +436,14 @@ test('plan mode launches no model or version process and creates no files', () =
     expect(readdirSync(dir)).toEqual([]);
     expect(() => continuationPlan('codex-app-server', runId)).toThrow();
     expect(() => continuationPlan('claude', '../old')).toThrow();
+    const plan = continuationPlan('claude', runId);
+    expect(plan.preflight).toEqual({
+      pinnedBunVersion: PINNED_BUN_VERSION,
+      pinned: true,
+      portability: expect.stringContaining(PINNED_BUN_VERSION),
+    });
+    expect(plan.limits.admissionDeadline).toContain('one monotonic deadline');
+    expect(plan.limits.afterDeadline).toContain('Never resume');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

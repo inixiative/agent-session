@@ -31,7 +31,7 @@ import {
 import { TRANSPORTS, type TransportKind } from './transport';
 import { createSession } from './transports';
 
-export type PooledTransport = 'claude-cli' | 'codex-mcp' | 'codex-app-server' | 'claude-agent-sdk';
+export type PooledTransport = 'claude-cli' | 'codex-app-server' | 'claude-agent-sdk';
 
 export interface InstanceConfig {
   readonly id: string;

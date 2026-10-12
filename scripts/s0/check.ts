@@ -75,7 +75,7 @@ writeFileSync(
       checks,
       expectedCapabilityFailures: 2,
       interpretation:
-        'Integrity, sanitization and replay checks only. Two S4 test.failing accounting regressions remain unresolved. Offline S1 evidence is not native capability acceptance.',
+        'Integrity, sanitization and replay checks only. One S4 test.failing accounting regression (Claude cached usage) remains unresolved. Offline S1 evidence is not native capability acceptance.',
     },
     null,
     2,
