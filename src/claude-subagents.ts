@@ -100,7 +100,8 @@ interface Member {
   /** Its admission was registered: never registered again, and only then is it sent. */
   admitted?: boolean;
   readonly name: string;
-  readonly token: string;
+  /** Its position in a fan-out (m<n>), or its spare's token: the dispatcher echoes it, so it is deterministic. */
+  token: string;
   readonly started: number;
   readonly deadline: number;
   admissionId?: string;
@@ -279,7 +280,7 @@ export class ClaudeSubagentSessions implements PrimedSessions {
         spec,
         request,
         name,
-        token: `m${crypto.randomUUID().slice(0, 8)}`,
+        token: '',
         started,
         deadline: started + (request.timeoutMs ?? this._config.timeoutMs),
         texts: [],
@@ -310,6 +311,7 @@ export class ClaudeSubagentSessions implements PrimedSessions {
       });
       if (spare) {
         member.spare = spare;
+        member.token = spare.token;
         spare.member = member;
         void this._reserve(spare, member);
         return;
@@ -618,9 +620,10 @@ export class ClaudeSubagentSessions implements PrimedSessions {
       const owner = side;
       owner.busy = true;
       owner.spares = new Map(
-        chunk.map((name) => {
+        chunk.map((name, index) => {
           const desired = group.desired.get(name)!;
-          const token = `s${crypto.randomUUID().slice(0, 8)}`;
+          // A position in this standby turn: deterministic, so a recorded turn replays.
+          const token = `s${index + 1}`;
           const spare: Spare = {
             name,
             standbyHash: desired.standbyHash,
@@ -1338,6 +1341,10 @@ export class ClaudeSubagentSessions implements PrimedSessions {
         );
       return;
     }
+    // Tokens are positions in this fan-out, so a recorded dispatcher turn replays with the same ones.
+    admitted.forEach((m, i) => {
+      m.token = `m${i + 1}`;
+    });
     side.members = new Map(admitted.map((m) => [m.token, m]));
     const uuid = crypto.randomUUID();
     const turnEnded = new Promise<void>((resolve) => {
