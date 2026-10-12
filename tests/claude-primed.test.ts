@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { CLAUDE_TEXT_ONLY_ARGS, ClaudePrimedSessions, type PrimedEvent } from '../src';
-import { fakeProcess, tick } from './helpers/fake-process';
+import { type FakeIo, fakeProcess, tick } from './helpers/fake-process';
 
 const cleanup: Array<() => Promise<void> | void> = [];
 afterEach(async () => {
@@ -13,6 +13,8 @@ function claudeCli(
   opts: {
     behavior?: (input: string) => 'answer' | 'tool' | 'hold' | 'limited';
     usage?: () => number;
+    /** The primer turn answers after this long. */
+    primeDelayMs?: number;
   } = {},
 ) {
   const spawns: string[][] = [];
@@ -67,6 +69,14 @@ function claudeCli(
         return;
       }
       if (m.type !== 'user') return;
+      const input = m.message.content[0].text as string;
+      if (input.includes('standing context') && opts.primeDelayMs && !m.delayed) {
+        setTimeout(() => respond({ ...m, delayed: true }, io), opts.primeDelayMs);
+        return;
+      }
+      respond(m, io);
+    });
+    const respond = (m: any, io: FakeIo) => {
       const input = m.message.content[0].text as string;
       io.emit({ type: 'system', subtype: 'init', session_id: sid, model: 'claude-test' });
       const behavior = input.includes('standing context')
@@ -131,7 +141,7 @@ function claudeCli(
           cache_creation_input_tokens: 0,
         },
       });
-    });
+    };
     processes.push(fake);
     return fake.proc;
   };
@@ -298,6 +308,80 @@ describe('ClaudePrimedSessions', () => {
         .some((l) => l.type === 'user' && l.message.content[0].text === 'after-close'),
     ).toBe(false);
     expect(cli.processes.every((p) => p.killed || p.closed)).toBe(true);
+  });
+
+  test('overlapping decisions on one key run beside each other on one prime', async () => {
+    const cli = claudeCli({ behavior: (input) => (input === 'slow' ? 'hold' : 'answer') });
+    const { h, events } = host(cli, { maxConcurrent: 4 });
+    const order: string[] = [];
+    const slow = h
+      .decide(spec, { input: 'slow', timeoutMs: 400 })
+      .catch((e) => e)
+      .finally(() => order.push('slow'));
+    await tick(20);
+    // The second phase is not queued behind the first: it forks the same primed session.
+    const quick = await h.decide(spec, { input: 'quick' });
+    order.push('quick');
+    expect(quick).toMatchObject({ content: 'decided: quick', prime: 'warm' });
+    expect((await slow).reason).toBe('timeout');
+    expect(order).toEqual(['quick', 'slow']);
+    expect(events.filter((e) => e.type === 'primed')).toHaveLength(1);
+    const persisted = cli.spawns.filter((argv) => !argv.includes('--no-session-persistence'));
+    expect(persisted).toHaveLength(1);
+    await tick(20);
+    // One idle spare per key once both have finished.
+    const live = cli.processes.filter((p) => !p.killed && !p.closed);
+    expect(live).toHaveLength(1);
+    expect(h.snapshot()).toMatchObject({ sessions: 1, active: 0 });
+  });
+
+  test('a re-prime while a decision runs keeps the old transcript until it finishes', async () => {
+    const cli = claudeCli({ behavior: (input) => (input === 'slow' ? 'hold' : 'answer') });
+    const { h, events } = host(cli, { maxConcurrent: 4, spare: false });
+    await h.decide(spec, { input: 'q1' });
+    const slow = h.decide(spec, { input: 'slow', timeoutMs: 300 }).catch((e) => e);
+    await tick(20);
+    await h.decide({ ...spec, context: 'NEW' }, { input: 'q2' });
+    expect(events.some((e) => e.type === 'evicted')).toBe(false);
+    expect((await slow).reason).toBe('timeout');
+    await tick(20);
+    expect(events.filter((e) => e.type === 'evicted' && e.reason === 'reprime')).toHaveLength(1);
+  });
+
+  test('a decision waiting on another phase priming its key gives up at its own deadline, unsent', async () => {
+    const cli = claudeCli({ primeDelayMs: 300 });
+    const { h, events } = host(cli, { maxConcurrent: 4 });
+    const first = h.decide(spec, { input: 'review' });
+    await tick(20);
+    const order: string[] = [];
+    void first.then(() => order.push('prime'));
+    const waiting = await h.decide(spec, { input: 'advice', timeoutMs: 100 }).catch((e) => e);
+    order.push('advice');
+    expect(waiting).toMatchObject({ reason: 'timeout', dispatch: 'not-dispatched', settled: true });
+    expect((await first).prime).toBe('cold');
+    expect(order[0]).toBe('advice');
+    expect(events.filter((e) => e.type === 'primed')).toHaveLength(1);
+    expect((await h.decide(spec, { input: 'advice' })).prime).toBe('warm');
+    expect(
+      cli.processes
+        .flatMap((p) => p.lines)
+        .filter((l) => l.type === 'user' && l.message.content[0].text === 'advice'),
+    ).toHaveLength(1);
+    expect(h.snapshot().active).toBe(0);
+  });
+
+  test('close retires a re-primed session whose decision is still running', async () => {
+    const cli = claudeCli({ behavior: (input) => (input === 'slow' ? 'hold' : 'answer') });
+    const { h, events } = host(cli, { maxConcurrent: 4, spare: false, timeoutMs: 5_000 });
+    await h.decide(spec, { input: 'q1' });
+    const slow = h.decide(spec, { input: 'slow' }).catch((e) => e);
+    await tick(20);
+    await h.decide({ ...spec, context: 'NEW' }, { input: 'q2' });
+    await h.close();
+    expect(
+      events.filter((e) => e.type === 'evicted').map((e) => e.type === 'evicted' && e.reason),
+    ).toEqual(expect.arrayContaining(['reprime', 'close']));
+    expect(await slow).toBeInstanceOf(Error);
   });
 
   test('close kills spares and refuses further decisions', async () => {

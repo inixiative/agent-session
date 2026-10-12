@@ -262,7 +262,7 @@ export class Slots {
   }
 }
 
-/** Per-key serialization: a key's decisions run one at a time, in order. */
+/** Per-key serialization: a key's tasks run one at a time, in order. */
 export class KeyedQueue {
   private _tails = new Map<string, Promise<void>>();
   run<T>(key: string, task: () => Promise<T>): Promise<T> {

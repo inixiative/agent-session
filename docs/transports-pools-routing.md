@@ -127,7 +127,12 @@ A violation or an unacknowledged interrupt recycles the Codex process: every
 decision in flight on it fails at once (`transport`), and the next decision on
 each key re-primes on a fresh process.
 
-Decisions are serialized per key and bounded across keys (`maxConcurrent`).
+Decisions on one key run concurrently on both runtimes and are bounded across keys
+(`maxConcurrent`); only priming is serialized per key. Claude: the first decision
+takes the key's spare fork, an overlapping one starts its own fork (a process
+start, no re-prime), and one spare is kept afterwards. A key replaced or evicted
+while decisions still fork from it keeps its primed transcript until the last one
+finishes.
 `DecisionRequest.signal` cancels: a waiting decision is refused before dispatch,
 a running one is interrupted and reports settlement from the acknowledgment or
 the process exit.
