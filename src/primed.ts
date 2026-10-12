@@ -128,6 +128,15 @@ export type PrimedEvent =
       readonly cacheRead?: number;
       readonly input?: number;
     }
+  | {
+      /** A pre-started member's standby turn, until its moment (or its end): what pre-starting costs. */
+      readonly type: 'standby';
+      readonly key: string;
+      readonly input: number;
+      readonly output: number;
+      readonly cacheRead: number;
+      readonly cacheWrite: number;
+    }
   | { readonly type: 'limits'; readonly limits: LimitSnapshot }
   | { readonly type: 'violation'; readonly key: string; readonly detail: string }
   | { readonly type: 'hedged'; readonly key: string; readonly afterMs: number }

@@ -137,6 +137,9 @@ interface Spare {
   member?: Member;
   violation?: string;
   done: boolean;
+  /** Its standby turn's usage before its moment. */
+  tokens: { input: number; output: number; cacheRead: number; cacheWrite: number };
+  reported?: boolean;
 }
 
 interface Side {
@@ -509,6 +512,12 @@ export class ClaudeSubagentSessions implements PrimedSessions {
     group.timer = setTimeout(() => this._flush(group), 0);
   }
 
+  private _reportStandby(spare: Spare): void {
+    if (spare.reported) return;
+    spare.reported = true;
+    this._emit({ type: 'standby', key: spare.name, ...spare.tokens });
+  }
+
   private _deliver(spare: Spare): void {
     const member = spare.member;
     if (!member || member.settled || !spare.pending || member.deliveredAt || !member.admitted)
@@ -578,6 +587,7 @@ export class ClaudeSubagentSessions implements PrimedSessions {
           result: { isError: true, content: [{ type: 'text', text: 'No moment for this token.' }] },
         });
       spare.pending = { requestId, rpcId: id };
+      this._reportStandby(spare);
       this._deliver(spare);
       return true;
     }
@@ -631,6 +641,7 @@ export class ClaudeSubagentSessions implements PrimedSessions {
             token,
             side: owner,
             done: false,
+            tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
           };
           return [token, spare] as const;
         }),
@@ -1059,6 +1070,13 @@ export class ClaudeSubagentSessions implements PrimedSessions {
         for (const block of (message?.content as Array<Record<string, unknown>>) ?? [])
           if (block.type === 'tool_use' && block.name !== MOMENT_TOOL)
             spare.violation = 'tool activity before its moment';
+        const usage = message?.usage as Record<string, number> | undefined;
+        if (usage) {
+          spare.tokens.input += usage.input_tokens ?? 0;
+          spare.tokens.output += usage.output_tokens ?? 0;
+          spare.tokens.cacheRead += usage.cache_read_input_tokens ?? 0;
+          spare.tokens.cacheWrite += usage.cache_creation_input_tokens ?? 0;
+        }
         return;
       }
       const member = spare?.member ?? this._byToolUse(side, frame.parent_tool_use_id);
@@ -1082,6 +1100,7 @@ export class ClaudeSubagentSessions implements PrimedSessions {
       const spare = this._spareByToolUse(side, frame.tool_use_id);
       if (spare) {
         spare.done = true;
+        this._reportStandby(spare);
         const member = spare.member;
         if (member?.deliveredAt) this._settle(side, member, String(frame.status ?? 'unknown'));
         else if (member) this._fallback(member);
