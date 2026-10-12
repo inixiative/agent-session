@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -1352,7 +1352,11 @@ export class ClaudeCodeSession implements HarnessSession {
   /** The base context as a private file: argv carries its path, never its text. */
   private _writeBaseContext(text: string): string {
     this._removeBaseContext();
-    this._baseContextDir = mkdtempSync(join(tmpdir(), 'agent-session-base-'));
+    if (!swept) {
+      swept = true;
+      sweepOrphanedBaseContexts();
+    }
+    this._baseContextDir = mkdtempSync(join(tmpdir(), `${BASE_CONTEXT_PREFIX}${process.pid}-`));
     const file = join(this._baseContextDir, 'append-system-prompt.md');
     writeFileSync(file, text, { mode: 0o600 });
     return file;
@@ -1520,5 +1524,37 @@ export class ClaudeCodeSession implements HarnessSession {
         this._observerFailures.synchronous++;
       }
     }
+  }
+}
+
+const BASE_CONTEXT_PREFIX = 'agent-session-base-';
+let swept = false;
+
+/**
+ * Remove base context files a crashed or killed process left behind (each holds a whole composed
+ * context). Runs once per process; a directory belongs to the pid in its name and goes only when
+ * that process is gone.
+ */
+export function sweepOrphanedBaseContexts(dir = tmpdir()): void {
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    const pid = Number(new RegExp(`^${BASE_CONTEXT_PREFIX}(\\d+)-`).exec(entry)?.[1]);
+    if (!pid || pid === process.pid || processAlive(pid)) continue;
+    rmSync(join(dir, entry), { recursive: true, force: true });
+  }
+}
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM: it exists under another user.
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
   }
 }

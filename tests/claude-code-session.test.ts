@@ -1,6 +1,20 @@
 import { describe, expect, test } from 'bun:test';
-import { existsSync, readFileSync, statSync } from 'node:fs';
-import { ClaudeCodeSession, type PipedSubprocess } from '../src/claude-code-session';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import {
+  ClaudeCodeSession,
+  type PipedSubprocess,
+  sweepOrphanedBaseContexts,
+} from '../src/claude-code-session';
 import type { SessionEvent } from '../src/harness-session';
 
 // ---------------------------------------------------------------------------
@@ -347,6 +361,23 @@ describe('ClaudeCodeSession', () => {
     expect(statSync(file).mode & 0o777).toBe(0o600);
     session.kill();
     expect(existsSync(file)).toBe(false);
+  });
+
+  test("a dead process's base context directory is swept; a live one's is kept", () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sweep-'));
+    try {
+      const dead = join(dir, 'agent-session-base-2147483646-abc');
+      const live = join(dir, `agent-session-base-${process.ppid}-def`);
+      const other = join(dir, 'unrelated-2147483646-x');
+      for (const path of [dead, live, other]) {
+        mkdirSync(path);
+        writeFileSync(join(path, 'append-system-prompt.md'), 'CONTEXT');
+      }
+      sweepOrphanedBaseContexts(dir);
+      expect([dead, live, other].map((path) => existsSync(path))).toEqual([false, true, true]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   test('a process that exits on its own removes its base context file', async () => {
