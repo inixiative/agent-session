@@ -113,6 +113,8 @@ export class ClaudePrimedSessions implements PrimedSessions {
   private _idleTimer?: ReturnType<typeof setInterval>;
   /** Branches and primers with a live process, so close() can stop them. */
   private _live = new Set<Owned>();
+  /** Sessions dropped while decisions still fork from them: retired by the last one, or by close(). */
+  private _stale = new Set<Primed>();
   private _swept = false;
   private _lastPoll = 0;
 
@@ -204,6 +206,8 @@ export class ClaudePrimedSessions implements PrimedSessions {
     // In-flight branches and primers are stopped, not awaited to completion.
     await Promise.all([...this._live].map((owned) => this._dispose(owned)));
     await Promise.all([...this._sessions.values()].map((s) => this._drop(s, 'close')));
+    // Their forks are stopped, so no decision still reads a stale transcript.
+    for (const session of [...this._stale]) this._retire(session, session.stale ?? 'close');
   }
 
   // -------------------------------------------------------------------------
@@ -431,14 +435,72 @@ export class ClaudePrimedSessions implements PrimedSessions {
     const spare = session.spare;
     session.spare = undefined;
     await this._dispose(spare);
-    // Decisions still forking from it keep its transcript until the last one finishes.
-    if (session.inUse > 0) session.stale ??= reason;
-    else this._retire(session, reason);
+    // Decisions still forking from it keep its transcript until the last one finishes; on close
+    // their processes are already stopped.
+    if (session.inUse > 0 && reason !== 'close') {
+      session.stale ??= reason;
+      this._stale.add(session);
+    } else this._retire(session, reason);
   }
 
   private _retire(session: Primed, reason: NonNullable<Primed['stale']>): void {
+    this._stale.delete(session);
+    session.stale = undefined;
     this._deleteTranscript(session.base?.externalSessionId);
     this._emit({ type: 'evicted', key: session.key, reason });
+  }
+
+  /** A decision's reference is returned; the last one out retires a stale session. */
+  private _release(session: Primed): void {
+    session.inUse--;
+    session.lastUsed = Date.now();
+    if (session.stale && !session.inUse) this._retire(session, session.stale);
+  }
+
+  /** Wait for `task` until the deadline or the signal; neither cancels it. Nothing is dispatched on expiry. */
+  private _bounded<T>(task: Promise<T>, deadline: number, signal?: AbortSignal): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const fail = (error: DecisionError) => {
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
+        reject(error);
+      };
+      const onAbort = () =>
+        fail(
+          new DecisionError(
+            this._closed ? 'Primed sessions closed' : 'Decision aborted before dispatch',
+            this._closed ? 'closed' : 'aborted',
+            'not-dispatched',
+            true,
+          ),
+        );
+      const timer = setTimeout(
+        () =>
+          fail(
+            new DecisionError(
+              'Decision deadline passed waiting for its primed session',
+              'timeout',
+              'not-dispatched',
+              true,
+            ),
+          ),
+        Math.max(0, deadline - Date.now()),
+      );
+      if (signal?.aborted) return onAbort();
+      signal?.addEventListener('abort', onAbort, { once: true });
+      task.then(
+        (value) => {
+          clearTimeout(timer);
+          signal?.removeEventListener('abort', onAbort);
+          resolve(value);
+        },
+        (error) => {
+          clearTimeout(timer);
+          signal?.removeEventListener('abort', onAbort);
+          reject(error);
+        },
+      );
+    });
   }
 
   private async _evictIdle(): Promise<void> {
@@ -473,9 +535,12 @@ export class ClaudePrimedSessions implements PrimedSessions {
     let prime: 'warm' | 'cold' = 'warm',
       primeMs = 0;
     // Only finding or priming the key's session is serialized: priming is single-flight per key,
-    // and the decision itself runs beside any other decision on the key.
-    const session = await this._queue.run(spec.key, async () => {
-      if (this._closed || signal?.aborted) throw closed();
+    // and the decision itself runs beside any other decision on the key. The wait is bounded by
+    // this decision's deadline and signal; a prime it started runs on (host timeout) for the next.
+    let abandoned = false,
+      taken = false;
+    const lookup = this._queue.run(spec.key, async () => {
+      if (this._closed || abandoned) throw closed();
       let found = this._sessions.get(spec.key);
       if (found && found.hash !== hash) {
         await this._drop(found, 'reprime');
@@ -489,21 +554,47 @@ export class ClaudePrimedSessions implements PrimedSessions {
           if (!idle) break;
           await this._drop(idle, 'capacity');
         }
-        if (this._closed || signal?.aborted) throw closed();
+        if (this._closed || abandoned) throw closed();
         const t = performance.now();
-        found = await this._prime(spec, hash, deadline);
+        found = await this._prime(spec, hash, Date.now() + this._config.timeoutMs);
         primeMs = Math.round(performance.now() - t);
         prime = 'cold';
+        // Closed while priming: the drop above has run, so this session is dropped here.
+        if (this._closed) {
+          await this._drop(found, 'close');
+          throw closed();
+        }
       }
+      if (abandoned) return found;
       found.inUse++;
+      taken = true;
       return found;
+    });
+    lookup.catch(() => undefined);
+    const session = await this._bounded(lookup, deadline, signal).catch((error: unknown) => {
+      abandoned = true;
+      // Granted between the deadline firing and this handler: hand the reference back.
+      void lookup.then(
+        (found) => {
+          if (taken) this._release(found);
+        },
+        () => undefined,
+      );
+      throw error;
     });
     let branch: Owned | undefined;
     let admissionId: string | undefined;
     const t1 = performance.now();
     try {
-      await session.cleanup;
+      await this._bounded(session.cleanup ?? Promise.resolve(), deadline, signal);
       if (this._closed || signal?.aborted) throw closed();
+      if (Date.now() >= deadline)
+        throw new DecisionError(
+          'Decision deadline passed before dispatch',
+          'timeout',
+          'not-dispatched',
+          true,
+        );
       session.lastUsed = Date.now();
       branch = session.spare;
       session.spare = undefined;
@@ -649,8 +740,7 @@ export class ClaudePrimedSessions implements PrimedSessions {
         timing: { waitMs, primeMs, branchMs, turnMs },
       };
     } finally {
-      session.inUse--;
-      session.lastUsed = Date.now();
+      this._release(session);
       // The decision settled on its native terminal; process exit and the next spare are off the caller's path.
       const done = branch;
       session.cleanup = (async () => {
@@ -667,11 +757,6 @@ export class ClaudePrimedSessions implements PrimedSessions {
           await spare.session.start().catch(() => {
             if (session.spare === spare) session.spare = undefined;
           });
-        }
-        if (session.stale && !session.inUse) {
-          const reason = session.stale;
-          session.stale = undefined;
-          this._retire(session, reason);
         }
       })();
     }
