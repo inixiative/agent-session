@@ -5,6 +5,7 @@ import {
   mergeLimits,
 } from './limits';
 import { retainEvidence } from './retained-evidence';
+import { mcpToolParts, ToolGates } from './tool-gate';
 import { TRANSPORTS } from './transport';
 import { TurnState } from './turn-state';
 
@@ -53,6 +54,9 @@ import type {
   SessionResult,
   SessionSendOptions,
   SessionTokens,
+  ToolDecision,
+  ToolGate,
+  ToolRequest,
 } from './harness-session';
 
 // Re-export types so existing import paths keep working
@@ -113,6 +117,12 @@ export interface ClaudeCodeSessionConfig {
   textOnly?: boolean;
   /** False adds `--no-session-persistence` (nothing written to history; cannot be resumed). Default true. */
   persistSession?: boolean;
+  /**
+   * Launch for per-call tool decisions: `--permission-prompt-tool stdio` plus a PreToolUse
+   * callback registered over the control protocol at start(). Gates added with
+   * onToolRequest() decide (a `permission` ask with no gate is denied). Not with textOnly.
+   */
+  toolGate?: boolean;
   /**
    * Override for the process spawner. Defaults to Bun.spawn. Tests inject a
    * fake subprocess that emulates the claude CLI's stream-json protocol.
@@ -252,6 +262,11 @@ export class ClaudeCodeSession implements HarnessSession {
   private _env?: ClaudeCodeSessionConfig['env'];
   private _textOnly: boolean;
   private _persistSession: boolean;
+  private _toolGate: boolean;
+  private _gates = new ToolGates();
+  /** Inbound control requests awaiting a gate decision, by request id. */
+  private _inbound = new Map<string, AbortController>();
+  private readonly _hookCallbackId = `agent-session-pre-tool-${crypto.randomUUID()}`;
   private _limits?: LimitSnapshot;
   private _controlSeq = 0;
   private _control = new Map<
@@ -325,6 +340,9 @@ export class ClaudeCodeSession implements HarnessSession {
     this._env = config?.env;
     this._textOnly = config?.textOnly ?? false;
     this._persistSession = config?.persistSession ?? true;
+    this._toolGate = config?.toolGate ?? false;
+    if (this._toolGate && this._textOnly)
+      throw new Error('toolGate requires a session with tools; textOnly sessions have none');
     this._startedAt = Date.now();
   }
 
@@ -373,6 +391,11 @@ export class ClaudeCodeSession implements HarnessSession {
       const idx = this._handlers.indexOf(handler);
       if (idx !== -1) this._handlers.splice(idx, 1);
     };
+  }
+
+  onToolRequest(gate: ToolGate): () => void {
+    if (!this._toolGate) throw new Error('Tool gates need a session launched with toolGate: true');
+    return this._gates.add(gate);
   }
 
   onBeforeSend(hook: BeforeSendHook): () => void {
@@ -456,11 +479,30 @@ export class ClaudeCodeSession implements HarnessSession {
       this._rejectControl(new Error('Session ended'));
       this._emit({ kind: 'session_end', timestamp: Date.now(), transportOutcome: 'failed' });
     });
+
+    // The PreToolUse callback is registered before any turn is written, so it covers the first call.
+    if (this._toolGate) {
+      try {
+        await this._controlRequest(
+          {
+            subtype: 'initialize',
+            hooks: { PreToolUse: [{ matcher: '.*', hookCallbackIds: [this._hookCallbackId] }] },
+          },
+          30_000,
+        );
+      } catch (error) {
+        this.kill();
+        throw new Error(`Tool gate registration failed: ${(error as Error).message}`);
+      }
+    }
   }
 
   private _rejectControl(error: Error): void {
     for (const pending of this._control.values()) pending.reject(error);
     this._control.clear();
+    // Decisions still pending have nowhere to go: withdraw them.
+    for (const inbound of this._inbound.values()) inbound.abort();
+    this._inbound.clear();
   }
 
   // ---------------------------------------------------------------------------
@@ -558,7 +600,9 @@ export class ClaudeCodeSession implements HarnessSession {
       env: this._env,
       textOnly: this._textOnly,
       persistSession: opts?.persistSession ?? this._persistSession,
+      toolGate: this._toolGate,
     });
+    for (const gate of this._gates.list()) forked._gates.add(gate);
     forked._forking = true;
     return forked;
   }
@@ -930,9 +974,25 @@ export class ClaudeCodeSession implements HarnessSession {
       }
       return;
     }
-    if (raw.type === 'control_request') {
-      // No client-side handlers (can_use_tool, hooks) are registered on this transport.
+    if (raw.type === 'control_cancel_request') {
       const id = typeof raw.request_id === 'string' ? raw.request_id : undefined;
+      const inbound = id ? this._inbound.get(id) : undefined;
+      if (inbound && id) {
+        this._inbound.delete(id);
+        inbound.abort();
+      }
+      return;
+    }
+    if (raw.type === 'control_request') {
+      const id = typeof raw.request_id === 'string' ? raw.request_id : undefined;
+      const request = raw.request as Record<string, unknown> | undefined;
+      const toolRequest =
+        id && this._toolGate && this._proc ? this._toolRequestFrom(request) : undefined;
+      if (id && toolRequest) {
+        this._answerToolRequest(this._proc!, id, toolRequest);
+        return;
+      }
+      // No other client-side handlers are registered on this transport.
       if (id && this._proc) {
         try {
           this._proc.stdin.write(
@@ -1095,6 +1155,108 @@ export class ClaudeCodeSession implements HarnessSession {
   }
 
   // ---------------------------------------------------------------------------
+  // Private — tool gate (control protocol: hook_callback, can_use_tool)
+  // ---------------------------------------------------------------------------
+
+  private _toolRequestFrom(
+    request: Record<string, unknown> | undefined,
+  ): Omit<ToolRequest, 'signal'> | undefined {
+    const record = (value: unknown) =>
+      value && typeof value === 'object' && !Array.isArray(value)
+        ? (value as Record<string, unknown>)
+        : undefined;
+    const text = (value: unknown) => (typeof value === 'string' && value ? value : undefined);
+    let stage: ToolRequest['stage'];
+    let source: Record<string, unknown> | undefined;
+    let toolName: string | undefined;
+    let toolInput: Record<string, unknown> | undefined;
+    if (request?.subtype === 'hook_callback' && request.callback_id === this._hookCallbackId) {
+      source = record(request.input);
+      if (source?.hook_event_name !== 'PreToolUse') return undefined;
+      stage = 'pre-use';
+      toolName = text(source.tool_name);
+      toolInput = record(source.tool_input);
+    } else if (request?.subtype === 'can_use_tool') {
+      source = request;
+      stage = 'permission';
+      toolName = text(request.tool_name);
+      toolInput = record(request.input);
+    } else return undefined;
+    if (!toolName) return undefined;
+    const callId = text(source?.tool_use_id) ?? text(request.tool_use_id);
+    const turn = this._inflight;
+    return {
+      stage,
+      toolName,
+      ...mcpToolParts(toolName),
+      toolInput: Object.freeze(structuredClone(toolInput ?? {})),
+      ...(callId ? { callId } : {}),
+      ...(turn?.evidence.dispatch === 'attempted' && turn.evidence.nativeOutcome === 'unknown'
+        ? { admissionId: turn.evidence.admissionId }
+        : {}),
+      ...(text(request.description) ? { description: text(request.description) } : {}),
+      ...(text(request.blocked_path) ? { blockedPath: text(request.blocked_path) } : {}),
+    };
+  }
+
+  private _answerToolRequest(
+    proc: PipedSubprocess,
+    requestId: string,
+    request: Omit<ToolRequest, 'signal'>,
+  ): void {
+    const controller = new AbortController();
+    this._inbound.set(requestId, controller);
+    void this._gates
+      .decide({ ...request, signal: controller.signal })
+      .then((decision) => {
+        // Withdrawn by the runtime, or the process is gone: nothing may be written for it.
+        if (controller.signal.aborted || this._proc !== proc || !this._alive) return;
+        this._inbound.delete(requestId);
+        this._writeControlResponse(proc, requestId, this._toolResponse(request, decision));
+      })
+      .finally(() => {
+        if (this._inbound.get(requestId) === controller) this._inbound.delete(requestId);
+      });
+  }
+
+  private _toolResponse(
+    request: Omit<ToolRequest, 'signal'>,
+    decision: ToolDecision | undefined,
+  ): Record<string, unknown> {
+    if (request.stage === 'pre-use')
+      return decision?.behavior === 'deny'
+        ? {
+            hookSpecificOutput: {
+              hookEventName: 'PreToolUse',
+              permissionDecision: 'deny',
+              permissionDecisionReason: decision.message,
+            },
+          }
+        : {};
+    return decision?.behavior === 'allow'
+      ? { behavior: 'allow', updatedInput: structuredClone(request.toolInput) }
+      : { behavior: 'deny', message: decision?.message ?? 'Denied' };
+  }
+
+  private _writeControlResponse(
+    proc: PipedSubprocess,
+    requestId: string,
+    response: Record<string, unknown>,
+  ): void {
+    try {
+      proc.stdin.write(
+        `${JSON.stringify({
+          type: 'control_response',
+          response: { subtype: 'success', request_id: requestId, response },
+        })}\n`,
+      );
+      proc.stdin.flush();
+    } catch {
+      /* transport failure surfaces on the stream */
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // Private — spawn args (called once at start())
   // ---------------------------------------------------------------------------
 
@@ -1115,6 +1277,7 @@ export class ClaudeCodeSession implements HarnessSession {
       '--permission-mode',
       this._permissionMode,
       '--include-hook-events',
+      ...(this._toolGate ? ['--permission-prompt-tool', 'stdio'] : []),
     ];
 
     // Resume for fork or crash recovery. _externalSessionId is set from

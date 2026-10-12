@@ -34,7 +34,7 @@ export interface TransportCapabilities {
   readonly interrupt: 'acknowledged' | 'local-only';
   /** `steer`: push() adds input to the in-flight turn; `none`: push() records push_ignored. */
   readonly push: 'steer' | 'none';
-  /** `callback`: per-call decision hook; `mode`: a fixed launch policy (bypass); `refuse`: runtime requests are refused. */
+  /** `callback`: per-call decisions through onToolRequest(); `mode`: a fixed launch policy (bypass); `refuse`: runtime requests are refused. */
   readonly approvals: 'callback' | 'mode' | 'refuse';
   /** Token usage reported per turn. */
   readonly usage: boolean;
@@ -72,7 +72,7 @@ export const TRANSPORTS: Readonly<Record<TransportKind, TransportDescriptor>> = 
       rollback: 'none',
       interrupt: 'acknowledged',
       push: 'none',
-      approvals: 'mode',
+      approvals: 'callback',
       usage: true,
       limits: { stream: true, poll: true },
       textOnly: true,
@@ -84,7 +84,8 @@ export const TRANSPORTS: Readonly<Record<TransportKind, TransportDescriptor>> = 
       'textOnly launches with no tools, MCP servers, slash commands or user settings.',
       'Primed decisions (ClaudePrimedSessions) fork a persisted primed session per cycle with a pre-spawned spare.',
       "interruptNative() and readLimits() use the CLI's stdio control protocol (`interrupt`, `get_usage`).",
-      'Rollback (`--resume-session-at`) and per-call approvals (`--permission-prompt-tool stdio`) exist natively but are not wired here.',
+      'toolGate: true launches with `--permission-prompt-tool stdio` and registers a PreToolUse callback over the control protocol: onToolRequest() gates see every call (`pre-use`, any mode, bypass included; only a deny counts) and the asks the permission mode raises (`permission`, final).',
+      'Rollback (`--resume-session-at`) exists natively but is not wired here.',
     ],
   },
   'codex-mcp': {
@@ -121,7 +122,7 @@ export const TRANSPORTS: Readonly<Record<TransportKind, TransportDescriptor>> = 
       rollback: 'none',
       interrupt: 'acknowledged',
       push: 'steer',
-      approvals: 'refuse',
+      approvals: 'callback',
       usage: true,
       limits: { stream: true, poll: true },
       textOnly: false,
@@ -132,6 +133,7 @@ export const TRANSPORTS: Readonly<Record<TransportKind, TransportDescriptor>> = 
       '`codex app-server --listen stdio://` with thread/start, thread/resume, turn/start.',
       "CodexAppServerSession runs with the profile's tools; tool-free text sessions are CodexPrimedSessions (primed: fork).",
       'interruptNative() sends turn/interrupt; push() sends turn/steer against the owned turn.',
+      'appServer.approvalPolicy/sandbox (default never / danger-full-access; `codexPermissions(mode)`) set the thread policy; command and file-change approvals for the owned turn go to onToolRequest() gates (`permission`) and are answered accept/decline. Other server requests are refused (-32601).',
       'Primed decisions (CodexPrimedSessions) host every key as a thread of one process per account and fork the primed thread per cycle.',
       'thread/rollback is refused by codex-cli 0.155 for both ephemeral and paginated threads; session fork() is not wired.',
     ],

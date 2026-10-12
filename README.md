@@ -75,11 +75,33 @@ const session = createSession(kind, { cwd, model: "gpt-6-luna", env: { CODEX_HOM
 | Resume / fork | native / native | loaded-only / same-thread | native / – | native / native | – | – |
 | Interrupt | acknowledged | local-only | acknowledged | acknowledged | – | – |
 | Push | – | – | steer | – | – | – |
-| Approvals | mode | mode | refuse | callback | – | – |
+| Approvals | callback | mode | callback | callback | – | – |
 | Limits stream / poll | ✅ / ✅ | – / – | ✅ / ✅ | ✅ / – | – | – |
 | Primed reset | fork | – | fork | – | – | – |
 
 Full matrix, notes and what is stubbed: [docs/transports-pools-routing.md](docs/transports-pools-routing.md).
+
+### Tool gate
+
+`onToolRequest(gate)` puts a decision on each tool call. Gates compose in
+registration order; the first deny wins and a throwing gate denies.
+
+```ts
+const session = new ClaudeCodeSession({ cwd, permissionMode: hostMode, toolGate: true });
+session.onToolRequest(async (call) => {
+  if (call.stage === "pre-use") return structural(call) ?? { behavior: "allow" };
+  return askTheHuman(call, call.signal); // the runtime's own mode wanted to ask
+});
+```
+
+- `pre-use` runs before every call in every mode, `bypassPermissions` included;
+  only a deny counts. Claude: a PreToolUse callback over the control protocol.
+- `permission` is an ask the runtime's mode raised; the answer is final (no gate:
+  denied). Claude: `--permission-prompt-tool stdio`. Codex app-server: command
+  and file-change `requestApproval`, answered accept/decline, under
+  `appServer: codexPermissions(mode)`.
+- `call.signal` aborts when the runtime withdraws the request or the session
+  ends; a decision after that is never written.
 
 ## Primed decision sessions
 

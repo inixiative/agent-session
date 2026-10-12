@@ -52,7 +52,8 @@ export interface ClaudeAgentSdkSessionConfig extends Omit<ClaudeCodeSessionConfi
 }
 
 const SDK_OWNED = new Set(['--print', '--verbose']);
-const SDK_OWNED_VALUE = new Set(['--input-format', '--output-format']);
+// `--permission-prompt-tool stdio` is the SDK's own canUseTool channel; the bridge wires it.
+const SDK_OWNED_VALUE = new Set(['--input-format', '--output-format', '--permission-prompt-tool']);
 
 /** Map a ClaudeCodeSession argv (without the binary) to SDK options. Exported for tests. */
 export function sdkOptionsFromArgv(argv: readonly string[]): Record<string, unknown> {
@@ -170,6 +171,73 @@ function bridge(
       },
     };
 
+    // Tool gate: the SDK's canUseTool and PreToolUse hook become the CLI's own control requests
+    // on the bridged stdout, so ClaudeCodeSession answers them exactly as on the CLI transport.
+    const gated = cmd.includes('--permission-prompt-tool');
+    let hookCallbackId: string | undefined;
+    const awaiting = new Map<string, (response: unknown) => void>();
+    const ask = (request: Record<string, unknown>, signal?: AbortSignal) =>
+      new Promise<unknown>((resolve) => {
+        const id = `sdk-bridge-${crypto.randomUUID()}`;
+        awaiting.set(id, resolve);
+        signal?.addEventListener(
+          'abort',
+          () => {
+            if (awaiting.delete(id)) {
+              emit({ type: 'control_cancel_request', request_id: id });
+              resolve(undefined);
+            }
+          },
+          { once: true },
+        );
+        emit({ type: 'control_request', request_id: id, request });
+      });
+    const gate = gated
+      ? {
+          canUseTool: async (
+            toolName: string,
+            input: Record<string, unknown>,
+            context: { signal?: AbortSignal; toolUseID?: string; blockedPath?: string } = {},
+          ) =>
+            ((await ask(
+              {
+                subtype: 'can_use_tool',
+                tool_name: toolName,
+                input,
+                ...(context.toolUseID ? { tool_use_id: context.toolUseID } : {}),
+                ...(context.blockedPath ? { blocked_path: context.blockedPath } : {}),
+              },
+              context.signal,
+            )) as Record<string, unknown> | undefined) ?? {
+              behavior: 'deny',
+              message: 'Approval withdrawn',
+            },
+          hooks: {
+            PreToolUse: [
+              {
+                matcher: '.*',
+                hooks: [
+                  async (
+                    input: Record<string, unknown>,
+                    toolUseID: string | undefined,
+                    context: { signal?: AbortSignal } = {},
+                  ) =>
+                    ((await ask(
+                      {
+                        subtype: 'hook_callback',
+                        callback_id: hookCallbackId,
+                        input,
+                        ...(toolUseID ? { tool_use_id: toolUseID } : {}),
+                      },
+                      context.signal,
+                    )) as Record<string, unknown> | undefined) ?? {},
+                ],
+              },
+            ],
+          },
+        }
+      : undefined;
+
     const stringEnv = Object.fromEntries(
       Object.entries(env).filter(
         (entry): entry is [string, string] => typeof entry[1] === 'string',
@@ -181,6 +249,19 @@ function bridge(
       cwd,
       env: stringEnv,
       ...(config.canUseTool ? { canUseTool: config.canUseTool } : {}),
+      ...(gate
+        ? {
+            canUseTool: gate.canUseTool,
+            hooks: {
+              ...((config.sdkOptions?.hooks as Record<string, unknown> | undefined) ?? {}),
+              PreToolUse: [
+                ...(((config.sdkOptions?.hooks as Record<string, unknown[]> | undefined)
+                  ?.PreToolUse ?? []) as unknown[]),
+                ...gate.hooks.PreToolUse,
+              ],
+            },
+          }
+        : {}),
       ...(config.bundledCli ? {} : { pathToClaudeCodeExecutable: Bun.which(cmd[0]!) ?? cmd[0] }),
     };
     let query: ClaudeAgentSdkQuery,
@@ -223,10 +304,27 @@ function bridge(
               inbox.push({ ...message, parent_tool_use_id: null, session_id: '' });
               wake?.();
               wake = undefined;
+            } else if (message.type === 'control_response') {
+              const response = message.response as Record<string, unknown> | undefined;
+              const id = String(response?.request_id);
+              const resolve = awaiting.get(id);
+              if (resolve) {
+                awaiting.delete(id);
+                resolve(response?.subtype === 'success' ? response.response : undefined);
+              }
             } else if (message.type === 'control_request') {
               const id = String(message.request_id);
-              const subtype = (message.request as Record<string, unknown> | undefined)?.subtype;
-              if (subtype === 'interrupt')
+              const request = message.request as Record<string, unknown> | undefined;
+              const subtype = request?.subtype;
+              if (subtype === 'initialize' && gated) {
+                // Hooks were configured as SDK options at launch; only the callback id is new.
+                const pre = (request?.hooks as Record<string, unknown> | undefined)?.PreToolUse;
+                const ids = Array.isArray(pre)
+                  ? (pre[0] as { hookCallbackIds?: unknown } | undefined)?.hookCallbackIds
+                  : undefined;
+                hookCallbackId = Array.isArray(ids) ? String(ids[0]) : undefined;
+                queueMicrotask(() => respond(id));
+              } else if (subtype === 'interrupt')
                 query.interrupt().then(
                   () => respond(id),
                   (e) => respond(id, String((e as Error)?.message ?? e)),
@@ -254,6 +352,8 @@ function bridge(
       kill() {
         if (killed) return;
         killed = true;
+        for (const resolve of awaiting.values()) resolve(undefined);
+        awaiting.clear();
         inputEnded = true;
         wake?.();
         wake = undefined;
@@ -277,6 +377,10 @@ export class ClaudeAgentSdkSession extends ClaudeCodeSession {
   constructor(config: ClaudeAgentSdkSessionConfig) {
     if (typeof config?.query !== 'function')
       throw Error('ClaudeAgentSdkSession requires `query` from @anthropic-ai/claude-agent-sdk');
+    if (config.canUseTool && config.toolGate)
+      throw Error(
+        'ClaudeAgentSdkSession: pass either canUseTool or toolGate (gates registered through onToolRequest), not both',
+      );
     if (config.canUseTool && config.permissionMode === 'bypassPermissions')
       throw Error(
         'ClaudeAgentSdkSession: canUseTool is never consulted under permissionMode "bypassPermissions"; pass another mode or drop canUseTool',

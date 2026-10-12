@@ -31,7 +31,7 @@ Callers branch on capabilities, not on kinds.
 | Rollback | none¹ | none | none² | none | – | – |
 | Interrupt | acknowledged | local-only | acknowledged | acknowledged | – | – |
 | Mid-turn push | none | none | steer | none | – | – |
-| Approvals | mode | mode | refuse | callback | – | – |
+| Approvals | callback (`toolGate`) | mode | callback | callback | – | – |
 | Usage per turn | yes | yes | yes | yes | – | – |
 | Limits: stream / poll | yes / yes | no / no | yes / yes | yes / no | – | – |
 | Text-only session | yes | no | no³ | yes | – | – |

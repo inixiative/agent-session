@@ -1,6 +1,7 @@
 import { isDeepStrictEqual } from 'node:util';
 import { codexLimitSnapshot, type LimitSnapshot, mergeLimits } from './limits';
 import { retainEvidence } from './retained-evidence';
+import { ToolGates } from './tool-gate';
 import { TRANSPORTS } from './transport';
 import { TurnState } from './turn-state';
 // ---------------------------------------------------------------------------
@@ -40,6 +41,7 @@ import type {
   SessionEvent,
   SessionEventHandler,
   SessionResult,
+  ToolGate,
 } from './harness-session';
 
 // Re-export types so importers can stay on one path (mirrors claude-code-session).
@@ -63,6 +65,39 @@ export interface PipedSubprocess {
   kill(): void;
 }
 
+export type CodexApprovalPolicy = 'never' | 'on-request' | 'untrusted';
+export type CodexSandbox = 'read-only' | 'workspace-write' | 'danger-full-access';
+export type HostPermissionMode = 'default' | 'acceptEdits' | 'plan' | 'bypassPermissions';
+
+/**
+ * The app-server approval policy and sandbox for a host permission mode (Claude's mode ids).
+ * `acceptEdits` asks like `default`; auto-accepting file changes is the gate's decision.
+ */
+export function codexPermissions(mode: HostPermissionMode): {
+  approvalPolicy: CodexApprovalPolicy;
+  sandbox: CodexSandbox;
+} {
+  switch (mode) {
+    case 'default':
+    case 'acceptEdits':
+      return { approvalPolicy: 'on-request', sandbox: 'workspace-write' };
+    case 'plan':
+      return { approvalPolicy: 'never', sandbox: 'read-only' };
+    case 'bypassPermissions':
+      return { approvalPolicy: 'never', sandbox: 'danger-full-access' };
+  }
+}
+
+const SANDBOX_TYPES: Record<CodexSandbox, string> = {
+  'read-only': 'readOnly',
+  'workspace-write': 'workspaceWrite',
+  'danger-full-access': 'dangerFullAccess',
+};
+const APPROVAL_METHODS = new Set([
+  'item/commandExecution/requestApproval',
+  'item/fileChange/requestApproval',
+]);
+
 export type CodexSpawn = (
   cmd: string[],
   opts: { cwd: string; env: Record<string, string | undefined> },
@@ -81,6 +116,14 @@ export interface CodexSessionConfig {
     requireConfiguration?: boolean;
     config?: Readonly<Record<string, unknown>>;
     requiredMcpServer?: { readonly name: string; readonly tools: readonly string[] };
+    /**
+     * Native approval policy and sandbox for the thread. Default `never` / `danger-full-access`.
+     * With `on-request` or `untrusted`, approval requests go to the gates registered through
+     * onToolRequest() (stage `permission`); with none registered they are declined.
+     * `codexPermissions(mode)` maps the host permission modes.
+     */
+    approvalPolicy?: CodexApprovalPolicy;
+    sandbox?: CodexSandbox;
   };
   /** Path to codex CLI binary. Defaults to "codex". */
   bin?: string;
@@ -1237,6 +1280,9 @@ export class CodexAppServerSession extends BaseCodexSession {
   private _nativeSessionId?: string;
   private _appAdmission?: string;
   private _turnDone?: () => void;
+  private _gates = new ToolGates();
+  /** Approval requests awaiting a gate decision, by JSON-RPC request id. */
+  private _approvals = new Map<string, AbortController>();
   private _items = new Map<
     string,
     {
@@ -1284,7 +1330,96 @@ export class CodexAppServerSession extends BaseCodexSession {
     }
   }
 
+  onToolRequest(gate: ToolGate): () => void {
+    return this._gates.add(gate);
+  }
+
+  override kill(): void {
+    for (const approval of this._approvals.values()) approval.abort();
+    this._approvals.clear();
+    super.kill();
+  }
+
+  private get _approvalPolicy(): CodexApprovalPolicy {
+    return this._options.approvalPolicy ?? 'never';
+  }
+
+  private get _sandbox(): CodexSandbox {
+    return this._options.sandbox ?? 'danger-full-access';
+  }
+
+  /** A command or file-change approval for the owned turn, decided by the gates. */
+  private _approval(request: Record<string, unknown>): boolean {
+    const method = request.method as string;
+    const params = object(request.params);
+    const a = this._inflight?.evidence;
+    if (
+      !APPROVAL_METHODS.has(method) ||
+      !a?.identity.turnId ||
+      params?.threadId !== a.identity.threadId ||
+      params?.turnId !== a.identity.turnId ||
+      (typeof request.id !== 'string' && typeof request.id !== 'number')
+    )
+      return false;
+    const str = (value: unknown) => (typeof value === 'string' && value ? value : undefined);
+    const command = method === 'item/commandExecution/requestApproval';
+    const toolInput: Record<string, unknown> = command
+      ? {
+          ...(str(params.command) ? { command: params.command } : {}),
+          ...(str(params.cwd) ? { cwd: params.cwd } : {}),
+          ...(str(params.kind) ? { kind: params.kind } : {}),
+        }
+      : { ...(str(params.grantRoot) ? { grantRoot: params.grantRoot } : {}) };
+    const proc = this._proc;
+    const id = request.id;
+    const key = JSON.stringify(id);
+    const controller = new AbortController();
+    this._approvals.get(key)?.abort();
+    this._approvals.set(key, controller);
+    const identity = { ...a.identity, admissionId: a.admissionId };
+    this._emit({
+      ...identity,
+      kind: 'native_status',
+      timestamp: Date.now(),
+      raw: { type: 'approval-request', method },
+    });
+    void this._gates
+      .decide({
+        stage: 'permission',
+        toolName: command ? 'shell' : 'apply_patch',
+        toolInput: Object.freeze(toolInput),
+        ...(str(params.itemId) ? { callId: params.itemId as string } : {}),
+        admissionId: a.admissionId,
+        ...(str(params.reason) ? { description: params.reason as string } : {}),
+        signal: controller.signal,
+      })
+      .then((decision) => {
+        if (controller.signal.aborted || this._proc !== proc || !this._alive || !proc) return;
+        this._approvals.delete(key);
+        const accepted = decision?.behavior === 'allow';
+        try {
+          proc.stdin.write(
+            `${JSON.stringify({ jsonrpc: '2.0', id, result: { decision: accepted ? 'accept' : 'decline' } })}\n`,
+          );
+          proc.stdin.flush();
+        } catch {
+          return;
+        }
+        this._emit({
+          ...identity,
+          kind: 'native_status',
+          timestamp: Date.now(),
+          raw: { type: 'approval-response', method, decision: accepted ? 'accept' : 'decline' },
+        });
+      })
+      .finally(() => {
+        if (this._approvals.get(key) === controller) this._approvals.delete(key);
+      });
+    return true;
+  }
+
   protected override _serverRequest(request: Record<string, unknown>): boolean {
+    if (this._approval(request)) return true;
     // JSON-RPC's explicit method-not-supported refusal also covers unknown future
     // requests. Never approve native work or echo private request parameters.
     const payload = `${JSON.stringify({
@@ -1435,8 +1570,8 @@ export class CodexAppServerSession extends BaseCodexSession {
           ...(binding ? { threadId: binding } : {}),
           model: this._model,
           cwd: this._cwd,
-          approvalPolicy: 'never',
-          sandbox: 'danger-full-access',
+          approvalPolicy: this._approvalPolicy,
+          sandbox: this._sandbox,
           ...(this._options.config ? { config: this._options.config } : {}),
         }),
       );
@@ -1465,9 +1600,9 @@ export class CodexAppServerSession extends BaseCodexSession {
           typeof response.modelProvider !== 'string' ||
           !response.modelProvider ||
           response.cwd !== this._cwd ||
-          response.approvalPolicy !== 'never' ||
+          response.approvalPolicy !== this._approvalPolicy ||
           response.approvalsReviewer !== 'user' ||
-          object(response.sandbox)?.type !== 'dangerFullAccess' ||
+          object(response.sandbox)?.type !== SANDBOX_TYPES[this._sandbox] ||
           !Array.isArray(thread?.turns) ||
           thread.turns.some((value) => !this._turn(value)))
       )
@@ -1586,6 +1721,13 @@ export class CodexAppServerSession extends BaseCodexSession {
     if (method === 'account/rateLimits/updated') {
       const snapshot = codexLimitSnapshot(msg.params, 'stream');
       return snapshot ? [this._observeLimits(snapshot)] : [];
+    }
+    if (method === 'serverRequest/resolved') {
+      // The runtime settled or withdrew an approval itself: a later gate decision is discarded.
+      const requestId = object(msg.params)?.requestId;
+      const key = JSON.stringify(requestId);
+      this._approvals.get(key)?.abort();
+      this._approvals.delete(key);
     }
     const params = object(msg.params),
       turn = this._turn(params?.turn),

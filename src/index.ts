@@ -30,11 +30,15 @@ export {
 // Codex CLI adapter (persistent JSON-RPC session). CodexSession defaults to the
 // mcp-server variant; CodexAppServerSession is the app-server one.
 export {
+  type CodexApprovalPolicy,
   CodexAppServerSession,
   CodexMcpSession,
+  type CodexSandbox,
   CodexSession,
   type CodexSessionConfig,
   type CodexSpawn,
+  codexPermissions,
+  type HostPermissionMode,
 } from './codex-session';
 // The provider-agnostic interface + event taxonomy.
 export * from './harness-session';

@@ -233,6 +233,39 @@ export interface SessionSendOptions {
 }
 
 // ---------------------------------------------------------------------------
+// Tool gate — per-call decisions from the runtime's native approval channel
+// ---------------------------------------------------------------------------
+
+export interface ToolRequest {
+  /**
+   * `pre-use`: before every tool call, in every permission mode (bypass included). Only a deny
+   * counts; an allow leaves the runtime's own mode to decide. `permission`: the runtime's own
+   * mode would ask the user; the decision is final.
+   */
+  readonly stage: 'pre-use' | 'permission';
+  readonly toolName: string;
+  /** `mcp__<server>__<tool>` split, as tool_use events carry it. */
+  readonly toolServer?: string;
+  readonly toolMethod?: string;
+  readonly toolInput: Readonly<Record<string, unknown>>;
+  /** Native tool_use id (Claude) or item id (Codex). */
+  readonly callId?: string;
+  /** The in-flight admission, when one is attributable. */
+  readonly admissionId?: string;
+  /** The runtime's own description of, or reason for, the call. */
+  readonly description?: string;
+  /** Claude `can_use_tool` blocked_path. */
+  readonly blockedPath?: string;
+  /** Aborted when the runtime withdraws the request or the session ends; a later decision is discarded. */
+  readonly signal?: AbortSignal;
+}
+export type ToolDecision =
+  | { readonly behavior: 'allow' }
+  | { readonly behavior: 'deny'; readonly message: string };
+/** Gates compose in registration order: the first deny wins; a thrown or rejected gate denies. */
+export type ToolGate = (request: ToolRequest) => ToolDecision | Promise<ToolDecision>;
+
+// ---------------------------------------------------------------------------
 // HarnessSession interface
 // ---------------------------------------------------------------------------
 
@@ -296,6 +329,12 @@ export interface HarnessSession {
    * Returns an unregister function.
    */
   onBeforeSend(hook: BeforeSendHook): () => void;
+
+  /**
+   * Register a tool gate. Present where the transport declares `approvals: "callback"`; the
+   * session must be launched for callbacks (Claude: `toolGate: true`). Returns an unregister function.
+   */
+  onToolRequest?(gate: ToolGate): () => void;
 
   /**
    * Mid-turn push: out-of-band signal injected into an in-flight turn.
