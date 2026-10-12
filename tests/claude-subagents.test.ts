@@ -350,13 +350,15 @@ describe('ClaudeSubagentSessions', () => {
     expect(cli.subagentInputs).toEqual(['yes']);
   });
 
-  test('deadlines: unsent members are refused; a running subagent is stopped and settles', async () => {
+  test('deadlines: unsent members are refused; a running subagent is rejected on time and stopped', async () => {
     const cli = dispatcherCli({ hold: (input) => input === 'slow' });
     const { h } = host(cli);
     const error = await h
       .decide(role('slow'), { input: 'slow', group: 'T1', timeoutMs: 150 })
       .catch((e) => e);
-    expect(error).toMatchObject({ reason: 'timeout', dispatch: 'attempted', settled: true });
+    // Rejected at its deadline, not after the stop: the stop follows.
+    expect(error).toMatchObject({ reason: 'timeout', dispatch: 'attempted', settled: false });
+    await tick(30);
     expect(cli.controls.some((c) => c.subtype === 'stop_task')).toBe(true);
     const unsent = await h
       .decide(role('late'), { input: 'late', group: 'T1', timeoutMs: 1 })
@@ -371,6 +373,48 @@ describe('ClaudeSubagentSessions', () => {
       reason: 'violation',
     });
     expect(events.some((e) => e.type === 'violation')).toBe(true);
+  });
+
+  test('a hung admission does not hold the other members past their deadlines', async () => {
+    const cli = dispatcherCli();
+    const { h } = host(cli);
+    const started = Date.now();
+    const [hung, ok] = await Promise.all([
+      h
+        .decide(role('hung'), {
+          input: 'hung',
+          group: 'T1',
+          timeoutMs: 200,
+          onAdmission: () => new Promise(() => {}),
+        })
+        .catch((e) => e),
+      h.decide(role('ok'), { input: 'ok', group: 'T1' }),
+    ]);
+    expect(ok.content).toBe('decided: ok');
+    expect(hung).toMatchObject({ reason: 'timeout', dispatch: 'not-dispatched' });
+    expect(Date.now() - started).toBeLessThan(1_000);
+  });
+
+  test('a side session that fails to start is stopped; a launcher that throws refuses the chunk', async () => {
+    let fail = true;
+    const cli = dispatcherCli();
+    const silent = (argv: string[]) => {
+      if (!fail) return cli.spawn(argv);
+      fail = false;
+      return fakeProcess(() => {}).proc; // never answers initialize
+    };
+    const { h, events } = host({ ...cli, spawn: silent }, { timeoutMs: 300 });
+    await expect(h.decide(role('a'), { input: 'a', group: 'T1' })).rejects.toBeInstanceOf(Error);
+    const { h: h2 } = host(cli, {
+      spawn: () => {
+        throw Error('no claude binary');
+      },
+    });
+    await expect(h2.decide(role('b'), { input: 'b', group: 'T1' })).rejects.toMatchObject({
+      reason: 'transport',
+      dispatch: 'not-dispatched',
+    });
+    expect(events.filter((e) => e.type === 'process-started')).toHaveLength(0);
   });
 
   test('close refuses waiting decisions and stops the side sessions', async () => {

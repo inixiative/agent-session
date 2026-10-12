@@ -90,6 +90,8 @@ interface Member {
   model?: string;
   violation?: string;
   settled: boolean;
+  /** Resolves when the member settles either way. */
+  done: Promise<void>;
   resolve(result: DecisionResult): void;
   reject(error: DecisionError): void;
 }
@@ -100,7 +102,10 @@ interface Side {
   readonly proc: PipedSubprocess;
   readonly dir: string;
   readonly generation: number;
+  /** Eligible for new fan-outs; false from the moment it is being killed. */
   alive: boolean;
+  /** Its exit has been handled. */
+  gone: boolean;
   ready: Promise<void>;
   busy: boolean;
   lastUsed: number;
@@ -122,6 +127,9 @@ interface Group {
   /** Chunks waiting for a free side session. */
   waiting: Member[][];
 }
+
+/** Role definitions a group's side sessions launch with; the least recently used beyond it drop. */
+const MAX_DEFINITIONS = 64;
 
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
 
@@ -202,10 +210,21 @@ export class ClaudeSubagentSessions implements PrimedSessions {
       .join('\n\n');
     const name = `d-${hash(prompt).slice(0, 16)}`;
     const group = this._group(request.group ?? 'default');
+    group.defs.delete(name);
     group.defs.set(name, { prompt, lastUsed: Date.now() });
+    // The least recently used definitions beyond the cap leave the next side session's agent file.
+    for (const old of group.defs.keys()) {
+      if (group.defs.size <= MAX_DEFINITIONS) break;
+      group.defs.delete(old);
+    }
     const started = Date.now();
+    let settle!: () => void;
+    const done = new Promise<void>((r) => {
+      settle = r;
+    });
     return new Promise<DecisionResult>((resolve, reject) => {
       const member: Member = {
+        done,
         spec,
         request,
         name,
@@ -219,12 +238,14 @@ export class ClaudeSubagentSessions implements PrimedSessions {
           if (member.settled) return;
           member.settled = true;
           clearTimeout(timer);
+          settle();
           resolve(result);
         },
         reject: (error) => {
           if (member.settled) return;
           member.settled = true;
           clearTimeout(timer);
+          settle();
           reject(error);
         },
       };
@@ -266,9 +287,7 @@ export class ClaudeSubagentSessions implements PrimedSessions {
       for (const m of group.waiting.splice(0).flat()) m.reject(closed());
     }
     await Promise.all(
-      [...this._groups.values()]
-        .flatMap((g) => g.sides.splice(0))
-        .map((s) => this._kill(s, 'close')),
+      [...this._groups.values()].flatMap((g) => [...g.sides]).map((s) => this._kill(s, 'close')),
     );
   }
 
@@ -322,7 +341,21 @@ export class ClaudeSubagentSessions implements PrimedSessions {
           group.sides.splice(group.sides.indexOf(idleLacking), 1);
           void this._kill(idleLacking, 'definitions changed');
         }
-        side = this._spawn(group);
+        try {
+          side = this._spawn(group);
+        } catch (error) {
+          group.waiting.shift();
+          for (const m of chunk)
+            m.reject(
+              new DecisionError(
+                `Side session start failed: ${(error as Error).message}`,
+                'transport',
+                'not-dispatched',
+                true,
+              ),
+            );
+          continue;
+        }
       }
       group.waiting.shift();
       side.busy = true;
@@ -337,6 +370,15 @@ export class ClaudeSubagentSessions implements PrimedSessions {
   private _spawn(group: Group): Side {
     const generation = ++this._generation;
     const dir = mkdtempSync(join(tmpdir(), 'agent-session-agents-'));
+    try {
+      return this._launch(group, generation, dir);
+    } catch (error) {
+      rmSync(dir, { recursive: true, force: true });
+      throw error;
+    }
+  }
+
+  private _launch(group: Group, generation: number, dir: string): Side {
     chmodSync(dir, 0o700);
     const agents: Record<string, unknown> = {};
     for (const [name, def] of group.defs)
@@ -402,6 +444,7 @@ export class ClaudeSubagentSessions implements PrimedSessions {
       dir,
       generation,
       alive: true,
+      gone: false,
       ready: Promise.resolve(),
       busy: false,
       lastUsed: Date.now(),
@@ -420,7 +463,8 @@ export class ClaudeSubagentSessions implements PrimedSessions {
     }).then(() => {
       this._emit({ type: 'process-started', generation, ms: Math.round(performance.now() - t0) });
     });
-    side.ready.catch(() => undefined);
+    // A side session that never initialized serves nothing: it is stopped, not left to fail every fan-out.
+    side.ready.catch(() => void this._kill(side, 'start failed'));
     return side;
   }
 
@@ -662,7 +706,7 @@ export class ClaudeSubagentSessions implements PrimedSessions {
     });
   }
 
-  /** A member past its deadline or aborted: refused unsent, or its running subagent stopped. */
+  /** A member past its deadline or aborted: refused unsent, or rejected and its running subagent stopped. */
   private async _withdraw(member: Member, reason: 'timeout' | 'aborted'): Promise<void> {
     if (member.settled) return;
     const message = reason === 'timeout' ? 'Decision deadline passed' : 'Decision aborted';
@@ -678,28 +722,29 @@ export class ClaudeSubagentSessions implements PrimedSessions {
       );
       return;
     }
-    const side = [...this._groups.values()]
-      .flatMap((g) => g.sides)
-      .find((s) => [...s.members.values()].includes(member));
-    let settled = false;
-    if (side?.alive && member.taskId)
-      settled = await this._control(
-        side,
-        { subtype: 'stop_task', task_id: member.taskId },
-        2_000,
-      ).then(
-        () => true,
-        () => false,
-      );
+    // Rejected at once, so the deadline is never extended by the stop. A stop that cannot be
+    // confirmed recycles the side session.
     member.reject(
       new DecisionError(
-        `${message}; subagent stopped`,
+        `${message}; subagent being stopped`,
         reason,
         'attempted',
-        settled,
+        false,
         member.admissionId,
       ),
     );
+    const side = [...this._groups.values()]
+      .flatMap((g) => g.sides)
+      .find((s) => [...s.members.values()].includes(member));
+    if (!side) return;
+    const stopped =
+      side.alive && member.taskId
+        ? await this._control(side, { subtype: 'stop_task', task_id: member.taskId }, 2_000).then(
+            () => true,
+            () => false,
+          )
+        : false;
+    if (!stopped) await this._kill(side, `${reason}: subagent stop unconfirmed`);
   }
 
   private async _fanOut(side: Side, chunk: Member[], retry = false): Promise<void> {
@@ -718,31 +763,38 @@ export class ClaudeSubagentSessions implements PrimedSessions {
       return;
     }
     // Registration precedes the native write, so a refused admission never reaches the runtime.
+    // Admissions run together, and a member that settles meanwhile (its deadline) is not waited for.
     const admitted: Member[] = [];
-    for (const m of chunk) {
-      if (m.settled) continue;
-      m.admissionId ??= crypto.randomUUID();
-      try {
-        if (!retry)
-          await m.request.onAdmission?.({
-            admissionId: m.admissionId,
-            key: m.spec.key,
-            runtime: 'claude',
-          });
-        if (m.settled) continue;
-        admitted.push(m);
-      } catch {
-        m.reject(
-          new DecisionError(
-            'Decision admission refused before dispatch',
-            'admission',
-            'not-dispatched',
-            true,
-            m.admissionId,
-          ),
-        );
-      }
-    }
+    await Promise.all(
+      chunk.map(async (m) => {
+        if (m.settled) return;
+        m.admissionId ??= crypto.randomUUID();
+        try {
+          if (!retry)
+            await Promise.race([
+              Promise.resolve(
+                m.request.onAdmission?.({
+                  admissionId: m.admissionId,
+                  key: m.spec.key,
+                  runtime: 'claude',
+                }),
+              ),
+              m.done,
+            ]);
+          if (!m.settled) admitted.push(m);
+        } catch {
+          m.reject(
+            new DecisionError(
+              'Decision admission refused before dispatch',
+              'admission',
+              'not-dispatched',
+              true,
+              m.admissionId,
+            ),
+          );
+        }
+      }),
+    );
     if (!admitted.length || !side.alive) {
       for (const m of admitted)
         m.reject(
@@ -762,10 +814,12 @@ export class ClaudeSubagentSessions implements PrimedSessions {
       side.onResult = resolve;
     });
     const deadline = Math.max(...admitted.map((m) => m.deadline)) + 5_000;
-    let interrupted = false;
+    let interrupted = false,
+      ended = false,
+      overdue: ReturnType<typeof setTimeout> | undefined;
     // Every member answered: the dispatcher's own wrap-up is not waited for.
     const allSettled = setInterval(() => {
-      if (!interrupted && admitted.every((m) => m.settled)) {
+      if (!interrupted && !ended && admitted.every((m) => m.settled)) {
         interrupted = true;
         void this._control(side, { subtype: 'interrupt' }, 5_000).catch(() => undefined);
       }
@@ -774,16 +828,17 @@ export class ClaudeSubagentSessions implements PrimedSessions {
       this._write(side, {
         type: 'user',
         uuid,
-        message: {
-          role: 'user',
-          content: admitted.map((m) => `${m.name} ${m.token}`).join('\n'),
-        },
+        message: { role: 'user', content: admitted.map((m) => `${m.name} ${m.token}`).join('\n') },
         parent_tool_use_id: null,
       });
-      const ended = await Promise.race([
+      ended = await Promise.race([
         turnEnded.then(() => true),
-        Bun.sleep(Math.max(0, deadline - Date.now())).then(() => false),
+        new Promise<false>((resolve) => {
+          overdue = setTimeout(() => resolve(false), Math.max(0, deadline - Date.now()));
+        }),
       ]);
+      clearTimeout(overdue);
+      clearInterval(allSettled);
       if (!ended) {
         await this._kill(side, 'fan-out turn did not end');
         return;
@@ -800,17 +855,16 @@ export class ClaudeSubagentSessions implements PrimedSessions {
             m.admissionId,
           ),
         );
-      const rewound = await this._control(side, {
-        subtype: 'rewind_conversation',
-        target_message_uuid: uuid,
-      })
-        .then((r) => r.rewound === true)
-        .catch(() => false);
+      side.members = new Map();
+      const rewound = side.alive
+        ? await this._control(side, { subtype: 'rewind_conversation', target_message_uuid: uuid })
+            .then((r) => r.rewound === true)
+            .catch(() => false)
+        : false;
       if (!rewound) await this._kill(side, 'rewind refused');
       if (skipped.length) {
-        if (!retry && side.alive) {
-          await this._fanOut(side, skipped, true);
-        } else
+        if (!retry && side.alive) await this._fanOut(side, skipped, true);
+        else
           for (const m of skipped)
             m.reject(
               new DecisionError(
@@ -828,20 +882,24 @@ export class ClaudeSubagentSessions implements PrimedSessions {
           new DecisionError(
             `Fan-out failed: ${(error as Error).message}`,
             'transport',
-            'not-dispatched',
-            true,
+            m.toolUseId ? 'attempted' : 'not-dispatched',
+            !m.toolUseId,
             m.admissionId,
           ),
         );
+      await this._kill(side, 'fan-out failed');
     } finally {
+      clearTimeout(overdue);
       clearInterval(allSettled);
       side.onResult = undefined;
       side.members = new Map();
     }
   }
 
+  /** The side session's exit: everything it held settles, and its group's waiting work moves on. */
   private _lost(side: Side): void {
-    if (!side.alive) return;
+    if (side.gone) return;
+    side.gone = true;
     side.alive = false;
     try {
       rmSync(side.dir, { recursive: true, force: true });
@@ -869,15 +927,28 @@ export class ClaudeSubagentSessions implements PrimedSessions {
     }
   }
 
+  /** Stop a side session; from the first moment it takes no new fan-out. */
   private async _kill(side: Side, reason: string): Promise<void> {
+    if (side.gone) return;
     if (side.alive && reason !== 'close')
       this._emit({ type: 'process-recycled', generation: side.generation, reason });
+    side.alive = false;
+    const group = this._groups.get(side.group);
+    const i = group ? group.sides.indexOf(side) : -1;
+    if (group && i >= 0) group.sides.splice(i, 1);
     try {
       side.proc.kill();
     } catch {
       /* exited */
     }
-    await Promise.race([side.proc.exited.catch(() => 0), Bun.sleep(2_000)]);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      side.proc.exited.catch(() => 0),
+      new Promise((resolve) => {
+        timer = setTimeout(resolve, 2_000);
+      }),
+    ]);
+    clearTimeout(timer);
     this._lost(side);
   }
 
