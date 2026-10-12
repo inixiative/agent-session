@@ -21,6 +21,8 @@ type Behavior = {
   stray?: boolean;
   /** A pre-started subagent that uses a tool before its moment. */
   standbyTool?: boolean;
+  /** A pre-started subagent calls its moment tool this late. */
+  standbyDelayMs?: number;
 };
 
 /** A Claude CLI double for the dispatcher: Agent calls through the PreToolUse hook, foreground subagents. */
@@ -206,20 +208,23 @@ function dispatcherCli(behavior: Behavior = {}) {
             const rpc = `mcp-${++seq}`;
             void new Promise<any>((resolve) => {
               hookWaiters.set(rpc, resolve);
-              io.emit({
-                type: 'control_request',
-                request_id: rpc,
-                request: {
-                  subtype: 'mcp_message',
-                  server_name: 'foundry',
-                  message: {
-                    jsonrpc: '2.0',
-                    id: seq,
-                    method: 'tools/call',
-                    params: { name: 'moment', arguments: { token: standby[1] } },
+              const call = () =>
+                io.emit({
+                  type: 'control_request',
+                  request_id: rpc,
+                  request: {
+                    subtype: 'mcp_message',
+                    server_name: 'foundry',
+                    message: {
+                      jsonrpc: '2.0',
+                      id: seq,
+                      method: 'tools/call',
+                      params: { name: 'moment', arguments: { token: standby[1] } },
+                    },
                   },
-                },
-              });
+                });
+              if (behavior.standbyDelayMs) setTimeout(call, behavior.standbyDelayMs);
+              else call();
             }).then((response) => {
               if (!waiting.has(taskId)) return;
               waiting.delete(taskId);
@@ -588,15 +593,15 @@ describe('ClaudeSubagentSessions', () => {
   });
 
   test('a reserved spare whose decision expires before its moment stays pre-started', async () => {
-    const cli = dispatcherCli();
+    const cli = dispatcherCli({ standbyDelayMs: 100 });
     const { h } = host(cli);
     h.prestart('T1', [{ spec: role('api'), standby: 'S\n' }]);
     // Reserved immediately, while the spare is still starting; it expires unsent.
     const late = await h
-      .decide(role('api'), { input: 'late', group: 'T1', standby: 'S\n', timeoutMs: 1 })
+      .decide(role('api'), { input: 'late', group: 'T1', standby: 'S\n', timeoutMs: 30 })
       .catch((e) => e);
     expect(late).toMatchObject({ reason: 'timeout', dispatch: 'not-dispatched' });
-    await tick(60);
+    await tick(150);
     const r = await h.decide(role('api'), { input: 'next', group: 'T1', standby: 'S\n' });
     expect(r.content).toBe('decided: next');
     expect(cli.momentInputs).toEqual(['next']);
@@ -619,6 +624,62 @@ describe('ClaudeSubagentSessions', () => {
     await h.releaseGroup('T1');
     expect(cli.processes.every((p) => p.killed || p.closed)).toBe(true);
     expect(h.snapshot().sessions).toBe(0);
+  });
+
+  test('a held moment is answered only after admission; a refused admission sends nothing', async () => {
+    const cli = dispatcherCli();
+    const { h } = host(cli);
+    h.prestart('T1', [{ spec: role('api'), standby: 'S\n' }]);
+    await tick(60);
+    let admitted = false;
+    const ok = h.decide(role('api'), {
+      input: 'slow admission',
+      group: 'T1',
+      standby: 'S\n',
+      onAdmission: async () => {
+        await Bun.sleep(60);
+        expect(cli.momentInputs).toEqual([]);
+        admitted = true;
+      },
+    });
+    expect((await ok).content).toBe('decided: slow admission');
+    expect(admitted).toBe(true);
+    await tick(80);
+    const refused = await h
+      .decide(role('api'), {
+        input: 'refused',
+        group: 'T1',
+        standby: 'S\n',
+        onAdmission: () => {
+          throw Error('no');
+        },
+      })
+      .catch((e) => e);
+    expect(refused).toMatchObject({ reason: 'admission', dispatch: 'not-dispatched' });
+    expect(cli.momentInputs).toEqual(['slow admission']);
+  });
+
+  test('a reserved spare that never calls in hands its decision to a fan-out, standby included', async () => {
+    const cli = dispatcherCli({ standbyDelayMs: 10_000 });
+    const { h } = host(cli, { timeoutMs: 5_000 });
+    h.prestart('T1', [{ spec: role('api'), standby: 'S\n' }]);
+    await tick(40);
+    const r = await h.decide(role('api'), { input: 'moment', group: 'T1', standby: 'S\n' });
+    expect(r.content).toBe('decided: S\nmoment');
+  });
+
+  test('decisions without a spare do not start duplicate pre-starts', async () => {
+    const cli = dispatcherCli({ standbyDelayMs: 200 });
+    const { h } = host(cli);
+    h.prestart(
+      'T1',
+      ['a', 'b'].map((d) => ({ spec: role(d), standby: 'S\n' })),
+    );
+    await Promise.all(
+      ['x', 'y', 'z'].map((d) => h.decide(role(d), { input: d, group: 'T1', standby: 'S\n' })),
+    );
+    await tick(50);
+    expect(cli.standbyPrompts).toHaveLength(2);
   });
 
   test('close refuses waiting decisions and stops the side sessions', async () => {

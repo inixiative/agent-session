@@ -52,6 +52,9 @@ import {
   type PrimeSpec,
 } from './primed';
 
+/** How long a decision reserved on a spare still starting waits for it before fanning out. */
+const RESERVE_START_MS = 2_000;
+
 /** The tool a pre-started member calls; its result is the decision input. */
 const MOMENT_TOOL = 'mcp__foundry__moment';
 const standbyPrompt = (standby: string, token: string) =>
@@ -92,7 +95,10 @@ export interface ClaudeSubagentConfig {
 
 interface Member {
   readonly spec: PrimeSpec;
-  readonly request: DecisionRequest;
+  /** Replaced (standby context in front of input) when a reserved spare cannot serve it. */
+  request: DecisionRequest;
+  /** Its admission was registered: never registered again, and only then is it sent. */
+  admitted?: boolean;
   readonly name: string;
   readonly token: string;
   readonly started: number;
@@ -170,6 +176,9 @@ interface Group {
   desired: Map<string, { standby: string; standbyHash: string }>;
   /** Last decision or pre-start: a group idle longer than `idleMs` lets its spares go. */
   lastActive: number;
+  /** Standby side sessions that failed to start; pre-starting backs off while it grows. */
+  startFailures: number;
+  retryAt: number;
 }
 
 /** Role definitions a group's side sessions launch with; the least recently used beyond it drop. */
@@ -358,6 +367,7 @@ export class ClaudeSubagentSessions implements PrimedSessions {
       new DecisionError('Decision group released', 'closed', 'not-dispatched', true);
     for (const m of g.batch.splice(0)) m.reject(closed());
     for (const m of g.waiting.splice(0).flat()) m.reject(closed());
+    for (const side of g.sides) side.retire = true;
     await Promise.all([...g.sides].map((side) => this._kill(side, 'group released')));
     this._groups.delete(group);
   }
@@ -427,6 +437,7 @@ export class ClaudeSubagentSessions implements PrimedSessions {
   /** Admit a decision onto its spare; the input goes out when the spare's moment call is held. */
   private async _reserve(spare: Spare, member: Member): Promise<void> {
     member.admissionId = crypto.randomUUID();
+    const ours = () => spare.member === member && member.spare === spare;
     try {
       await Promise.race([
         Promise.resolve(
@@ -439,7 +450,7 @@ export class ClaudeSubagentSessions implements PrimedSessions {
         member.done,
       ]);
     } catch {
-      spare.member = undefined;
+      if (spare.member === member) spare.member = undefined;
       member.reject(
         new DecisionError(
           'Decision admission refused before dispatch',
@@ -452,16 +463,58 @@ export class ClaudeSubagentSessions implements PrimedSessions {
       return;
     }
     if (member.settled) {
-      if (!member.deliveredAt) spare.member = undefined;
+      if (spare.member === member && !member.deliveredAt) spare.member = undefined;
+      return;
+    }
+    member.admitted = true;
+    if (!ours()) return; // moved to a fan-out while it was being admitted
+    if (!this._serviceable(spare)) {
+      this._fallback(member);
       return;
     }
     spare.side.members.set(member.token, member);
     if (spare.pending) this._deliver(spare);
+    // A spare still starting gets a moment to call in; otherwise the decision goes by fan-out.
+    else
+      setTimeout(() => {
+        if (ours() && !member.deliveredAt && !member.settled) this._fallback(member);
+      }, RESERVE_START_MS);
+  }
+
+  /** The spare is still held by a live standby turn and can take a decision. */
+  private _serviceable(spare: Spare): boolean {
+    return (
+      spare.side.alive &&
+      spare.side.spares.get(spare.token) === spare &&
+      !spare.done &&
+      !spare.violation
+    );
+  }
+
+  /** A reserved decision its spare cannot serve: it fans out, its standby context in front of its input. */
+  private _fallback(member: Member): void {
+    const spare = member.spare;
+    if (!spare || member.settled || member.deliveredAt) return;
+    if (spare.member === member) spare.member = undefined;
+    spare.side.members.delete(member.token);
+    member.spare = undefined;
+    const { standby, ...rest } = member.request;
+    member.request = { ...rest, input: `${standby ?? ''}${member.request.input}` };
+    const group = this._groups.get(spare.side.group);
+    if (!group) return;
+    group.batch.push(member);
+    clearTimeout(group.timer);
+    group.timer = setTimeout(() => this._flush(group), 0);
   }
 
   private _deliver(spare: Spare): void {
     const member = spare.member;
-    if (!member || member.settled || !spare.pending || member.deliveredAt) return;
+    if (!member || member.settled || !spare.pending || member.deliveredAt || !member.admitted)
+      return;
+    if (spare.violation) {
+      this._fallback(member);
+      return;
+    }
     member.deliveredAt = member.dispatchedAt = Date.now();
     member.toolUseId = spare.toolUseId;
     member.taskId = spare.taskId;
@@ -536,7 +589,8 @@ export class ClaudeSubagentSessions implements PrimedSessions {
 
   /** Pre-start every desired role that has no spare holding its current standby context. */
   private _replenish(group: Group): void {
-    if (this._closed || !group.desired.size) return;
+    if (this._closed || !group.desired.size || Date.now() < group.retryAt) return;
+    // Spares are created when their standby turn is assigned, so one still starting counts as held.
     const held = new Set<string>();
     for (const side of group.sides)
       if (side.alive && !side.retire)
@@ -557,18 +611,43 @@ export class ClaudeSubagentSessions implements PrimedSessions {
         try {
           side = this._spawn(group);
         } catch {
+          this._startFailed(group);
           return;
         }
       }
-      side.busy = true;
-      void this._standbyFanOut(side, group, chunk).finally(() => {
-        side!.busy = false;
-        side!.retire = false;
-        side!.lastUsed = Date.now();
-        this._drain(group);
-        this._replenish(group);
-      });
+      const owner = side;
+      owner.busy = true;
+      owner.spares = new Map(
+        chunk.map((name) => {
+          const desired = group.desired.get(name)!;
+          const token = `s${crypto.randomUUID().slice(0, 8)}`;
+          const spare: Spare = {
+            name,
+            standbyHash: desired.standbyHash,
+            prompt: standbyPrompt(desired.standby, token),
+            token,
+            side: owner,
+            done: false,
+          };
+          return [token, spare] as const;
+        }),
+      );
+      void this._standbyFanOut(owner, group)
+        .catch(() => undefined)
+        .finally(() => {
+          owner.busy = false;
+          owner.retire = false;
+          owner.lastUsed = Date.now();
+          this._drain(group);
+          this._replenish(group);
+        });
     }
+  }
+
+  /** A standby side session that failed to start: pre-starting backs off (5 s, doubling to 5 min). */
+  private _startFailed(group: Group): void {
+    group.startFailures++;
+    group.retryAt = Date.now() + Math.min(5 * 60_000, 5_000 * 2 ** (group.startFailures - 1));
   }
 
   /** End a side session's standby turn once no decision is using its spares. */
@@ -587,26 +666,20 @@ export class ClaudeSubagentSessions implements PrimedSessions {
   }
 
   /** One dispatcher turn holding pre-started members until each is used or the turn is ended. */
-  private async _standbyFanOut(side: Side, group: Group, names: string[]): Promise<void> {
+  private async _standbyFanOut(side: Side, group: Group): Promise<void> {
     try {
       await side.ready;
     } catch {
+      this._startFailed(group);
+      this._releaseSpares(side);
       return;
     }
-    if (!side.alive) return;
-    const spares = names.map((name): Spare => {
-      const desired = group.desired.get(name)!;
-      const token = `s${crypto.randomUUID().slice(0, 8)}`;
-      return {
-        name,
-        standbyHash: desired.standbyHash,
-        prompt: standbyPrompt(desired.standby, token),
-        token,
-        side,
-        done: false,
-      };
-    });
-    side.spares = new Map(spares.map((sp) => [sp.token, sp]));
+    group.startFailures = 0;
+    if (!side.alive) {
+      this._releaseSpares(side);
+      return;
+    }
+    const spares = [...side.spares.values()];
     const uuid = crypto.randomUUID();
     const turnEnded = new Promise<void>((resolve) => {
       side.onResult = resolve;
@@ -624,18 +697,7 @@ export class ClaudeSubagentSessions implements PrimedSessions {
       await turnEnded;
     } finally {
       side.onResult = undefined;
-      // A decision reserved on a spare that never ran goes out by fan-out instead.
-      for (const sp of side.spares.values())
-        if (sp.member && !sp.member.settled && !sp.member.deliveredAt) {
-          const member = sp.member;
-          member.spare = undefined;
-          side.members.delete(member.token);
-          group.batch.push(member);
-          clearTimeout(group.timer);
-          group.timer = setTimeout(() => this._flush(group), 0);
-        }
-      side.spares = new Map();
-      side.members = new Map();
+      this._releaseSpares(side);
     }
     const rewound = side.alive
       ? await this._control(side, { subtype: 'rewind_conversation', target_message_uuid: uuid })
@@ -643,6 +705,31 @@ export class ClaudeSubagentSessions implements PrimedSessions {
           .catch(() => false)
       : false;
     if (!rewound) await this._kill(side, 'rewind refused');
+  }
+
+  /**
+   * The standby turn is over: a decision reserved on a spare that never ran fans out instead, and
+   * one that ran but did not answer fails.
+   */
+  private _releaseSpares(side: Side): void {
+    for (const sp of side.spares.values()) {
+      sp.done = true;
+      const member = sp.member;
+      if (!member || member.settled) continue;
+      if (!member.deliveredAt) this._fallback(member);
+      else
+        member.reject(
+          new DecisionError(
+            'Subagent ended without an answer',
+            'transport',
+            'attempted',
+            true,
+            member.admissionId,
+          ),
+        );
+    }
+    side.spares = new Map();
+    side.members = new Map();
   }
 
   private _spareByToolUse(side: Side, id: unknown): Spare | undefined {
@@ -662,6 +749,8 @@ export class ClaudeSubagentSessions implements PrimedSessions {
         waiting: [],
         desired: new Map(),
         lastActive: Date.now(),
+        startFailures: 0,
+        retryAt: 0,
       };
       this._groups.set(id, group);
     }
@@ -992,6 +1081,7 @@ export class ClaudeSubagentSessions implements PrimedSessions {
         spare.done = true;
         const member = spare.member;
         if (member?.deliveredAt) this._settle(side, member, String(frame.status ?? 'unknown'));
+        else if (member) this._fallback(member);
         // Every spare used or ended: the standby turn ends too.
         if ([...side.spares.values()].every((sp) => sp.done)) this._endStandbyNow(side);
         else if (side.retire) this._endStandby(side);
@@ -1209,7 +1299,7 @@ export class ClaudeSubagentSessions implements PrimedSessions {
         if (m.settled) return;
         m.admissionId ??= crypto.randomUUID();
         try {
-          if (!retry)
+          if (!retry && !m.admitted)
             await Promise.race([
               Promise.resolve(
                 m.request.onAdmission?.({
@@ -1220,6 +1310,7 @@ export class ClaudeSubagentSessions implements PrimedSessions {
               ),
               m.done,
             ]);
+          m.admitted = true;
           if (!m.settled) admitted.push(m);
         } catch {
           m.reject(
@@ -1347,6 +1438,8 @@ export class ClaudeSubagentSessions implements PrimedSessions {
     }
     for (const pending of side.control.values()) pending.reject(Error('side session exited'));
     side.control.clear();
+    for (const sp of side.spares.values())
+      if (sp.member && !sp.member.deliveredAt) this._fallback(sp.member);
     for (const m of side.members.values())
       m.reject(
         new DecisionError(
@@ -1397,7 +1490,11 @@ export class ClaudeSubagentSessions implements PrimedSessions {
       // A thread with no decision for a while lets its spares go; they are pre-started again on demand.
       if (group.lastActive < cutoff && group.desired.size) {
         group.desired = new Map();
-        for (const side of group.sides) if (side.spares.size) this._endStandby(side);
+        for (const side of group.sides)
+          if (side.spares.size) {
+            side.retire = true;
+            this._endStandby(side);
+          }
       }
       for (const side of [...group.sides])
         if (!side.busy && side.lastUsed < cutoff) void this._kill(side, 'idle');
