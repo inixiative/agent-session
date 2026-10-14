@@ -20,6 +20,17 @@
 //             fan-out starts from the same empty conversation. A member the
 //             dispatcher skipped is sent again in one more fan-out.
 //
+//   standby   pre-started members (`prestart`): each role is dispatched ahead
+//             of its trigger as a subagent holding its stable context and the
+//             thread's current standby context, and calls the host's
+//             `moment` tool (an SDK MCP server over the control channel),
+//             which the host holds open. A decision whose standby context
+//             matches answers that call with its input, so every pre-started
+//             member starts at once, with no dispatch on the decision's path.
+//             Each spare serves one decision; `prestart` with new standby
+//             context replaces the spares (a turn landed), and a consumed one
+//             is pre-started again.
+//
 // Every member is a fresh subagent conversation: nothing of one decision
 // reaches another. Groups above `maxMembers` split evenly across more side
 // sessions of the group, which also serve overlapping fan-outs.
@@ -40,6 +51,14 @@ import {
   type PrimedSnapshot,
   type PrimeSpec,
 } from './primed';
+
+/** How long a decision reserved on a spare still starting waits for it before fanning out. */
+const RESERVE_START_MS = 2_000;
+
+/** The tool a pre-started member calls; its result is the decision input. */
+const MOMENT_TOOL = 'mcp__foundry__moment';
+const standbyPrompt = (standby: string, token: string) =>
+  `${standby}\n\nThe moment to assess has not arrived yet. Call the ${MOMENT_TOOL} tool now with token "${token}" and do nothing else first. Its result is the moment; then answer it exactly as your instructions and its response protocol say.`;
 
 const DISPATCHER =
   'You dispatch work to subagents and never answer anything yourself. Each user message lists ' +
@@ -63,7 +82,7 @@ export interface ClaudeSubagentConfig {
   ) => PipedSubprocess;
   /** Members per fan-out; a larger batch splits evenly across side sessions. Default 12. */
   maxMembers?: number;
-  /** Side sessions per group. Default 4. */
+  /** Side sessions per group (pre-started spares hold some). Default 6. */
   maxSessionsPerGroup?: number;
   /** Decisions arriving within this window of each other fan out together. Default 25 ms. */
   batchWindowMs?: number;
@@ -76,9 +95,13 @@ export interface ClaudeSubagentConfig {
 
 interface Member {
   readonly spec: PrimeSpec;
-  readonly request: DecisionRequest;
+  /** Replaced (standby context in front of input) when a reserved spare cannot serve it. */
+  request: DecisionRequest;
+  /** Its admission was registered: never registered again, and only then is it sent. */
+  admitted?: boolean;
   readonly name: string;
-  readonly token: string;
+  /** Its position in a fan-out (m<n>), or its spare's token: the dispatcher echoes it, so it is deterministic. */
+  token: string;
   readonly started: number;
   readonly deadline: number;
   admissionId?: string;
@@ -89,11 +112,34 @@ interface Member {
   tokens: { input: number; output: number; cacheRead: number; cacheWrite: number };
   model?: string;
   violation?: string;
+  /** Served by a pre-started spare instead of a fan-out. */
+  spare?: Spare;
+  deliveredAt?: number;
   settled: boolean;
   /** Resolves when the member settles either way. */
   done: Promise<void>;
   resolve(result: DecisionResult): void;
   reject(error: DecisionError): void;
+}
+
+interface Spare {
+  /** The role's definition name (`d-…`); the standby variant is `w-…`. */
+  readonly name: string;
+  readonly standbyHash: string;
+  readonly prompt: string;
+  readonly token: string;
+  readonly side: Side;
+  toolUseId?: string;
+  taskId?: string;
+  /** The held `moment` call. */
+  pending?: { requestId: string; rpcId: unknown };
+  /** The decision it serves, once reserved. */
+  member?: Member;
+  violation?: string;
+  done: boolean;
+  /** Its standby turn's usage before its moment. */
+  tokens: { input: number; output: number; cacheRead: number; cacheWrite: number };
+  reported?: boolean;
 }
 
 interface Side {
@@ -112,6 +158,10 @@ interface Side {
   sessionId?: string;
   /** Members of the fan-out in flight, by token. */
   members: Map<string, Member>;
+  /** Pre-started members this side session's standby turn holds, by token. */
+  spares: Map<string, Spare>;
+  /** Its standby context was replaced: end its standby turn once no decision uses it. */
+  retire?: boolean;
   onResult?: () => void;
   control: Map<string, { resolve(r: Record<string, unknown>): void; reject(e: Error): void }>;
 }
@@ -126,12 +176,20 @@ interface Group {
   firstAt?: number;
   /** Chunks waiting for a free side session. */
   waiting: Member[][];
+  /** Roles to keep pre-started, with the standby context to hold. */
+  desired: Map<string, { standby: string; standbyHash: string }>;
+  /** Last decision or pre-start: a group idle longer than `idleMs` lets its spares go. */
+  lastActive: number;
+  /** Standby side sessions that failed to start; pre-starting backs off while it grows. */
+  startFailures: number;
+  retryAt: number;
 }
 
 /** Role definitions a group's side sessions launch with; the least recently used beyond it drop. */
 const MAX_DEFINITIONS = 64;
 
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
+const standbyName = (name: string) => `w-${name.slice(2)}`;
 
 export class ClaudeSubagentSessions implements PrimedSessions {
   readonly runtime = 'claude' as const;
@@ -154,7 +212,7 @@ export class ClaudeSubagentSessions implements PrimedSessions {
     this._config = {
       ...config,
       maxMembers: config.maxMembers ?? 12,
-      maxSessionsPerGroup: config.maxSessionsPerGroup ?? 4,
+      maxSessionsPerGroup: config.maxSessionsPerGroup ?? 6,
       batchWindowMs: config.batchWindowMs ?? 25,
       idleMs: config.idleMs ?? 30 * 60_000,
       timeoutMs: config.timeoutMs ?? 30_000,
@@ -205,18 +263,15 @@ export class ClaudeSubagentSessions implements PrimedSessions {
       );
     this._idleTimer ??= setInterval(() => this._closeIdle(), Math.min(this._config.idleMs, 60_000));
     (this._idleTimer as { unref?: () => void }).unref?.();
-    const prompt = [this._config.baseInstructions, spec.instructions, spec.context]
-      .filter(Boolean)
-      .join('\n\n');
-    const name = `d-${hash(prompt).slice(0, 16)}`;
     const group = this._group(request.group ?? 'default');
-    group.defs.delete(name);
-    group.defs.set(name, { prompt, lastUsed: Date.now() });
-    // The least recently used definitions beyond the cap leave the next side session's agent file.
-    for (const old of group.defs.keys()) {
-      if (group.defs.size <= MAX_DEFINITIONS) break;
-      group.defs.delete(old);
-    }
+    group.lastActive = Date.now();
+    const name = this._define(group, spec);
+    // A pre-started member holding this standby context serves the decision; otherwise it fans out
+    // with the standby context in front of its input.
+    const spare =
+      request.standby === undefined ? undefined : this._spareFor(group, name, request.standby);
+    if (request.standby !== undefined && !spare)
+      request = { ...request, input: `${request.standby}${request.input}` };
     const started = Date.now();
     let settle!: () => void;
     const done = new Promise<void>((r) => {
@@ -228,7 +283,7 @@ export class ClaudeSubagentSessions implements PrimedSessions {
         spec,
         request,
         name,
-        token: `m${crypto.randomUUID().slice(0, 8)}`,
+        token: '',
         started,
         deadline: started + (request.timeoutMs ?? this._config.timeoutMs),
         texts: [],
@@ -257,6 +312,14 @@ export class ClaudeSubagentSessions implements PrimedSessions {
       request.signal?.addEventListener('abort', () => void this._withdraw(member, 'aborted'), {
         once: true,
       });
+      if (spare) {
+        member.spare = spare;
+        member.token = spare.token;
+        spare.member = member;
+        void this._reserve(spare, member);
+        return;
+      }
+      this._replenish(group);
       group.batch.push(member);
       group.firstAt ??= Date.now();
       clearTimeout(group.timer);
@@ -269,6 +332,49 @@ export class ClaudeSubagentSessions implements PrimedSessions {
       );
       group.timer = setTimeout(() => this._flush(group), wait);
     });
+  }
+
+  /**
+   * Keep these roles pre-started with this standby context (the thread's current context, which
+   * precedes each decision's input). Replaces the group's spares; spares holding other context are
+   * ended once no decision uses them.
+   */
+  prestart(group: string, entries: ReadonlyArray<{ spec: PrimeSpec; standby: string }>): void {
+    if (this._closed) return;
+    const g = this._group(group);
+    g.lastActive = Date.now();
+    g.desired = new Map(
+      entries.map((e) => [
+        this._define(g, e.spec),
+        { standby: e.standby, standbyHash: hash(e.standby) },
+      ]),
+    );
+    for (const side of g.sides)
+      if (side.spares.size) {
+        const stale = [...side.spares.values()].some(
+          (sp) => g.desired.get(sp.name)?.standbyHash !== sp.standbyHash,
+        );
+        if (stale) {
+          side.retire = true;
+          this._endStandby(side);
+        }
+      }
+    this._replenish(g);
+  }
+
+  /** A group is done (its thread closed): its spares and side sessions stop. */
+  async releaseGroup(group: string): Promise<void> {
+    const g = this._groups.get(group);
+    if (!g) return;
+    g.desired = new Map();
+    clearTimeout(g.timer);
+    const closed = () =>
+      new DecisionError('Decision group released', 'closed', 'not-dispatched', true);
+    for (const m of g.batch.splice(0)) m.reject(closed());
+    for (const m of g.waiting.splice(0).flat()) m.reject(closed());
+    for (const side of g.sides) side.retire = true;
+    await Promise.all([...g.sides].map((side) => this._kill(side, 'group released')));
+    this._groups.delete(group);
   }
 
   async readLimits(): Promise<LimitSnapshot | undefined> {
@@ -301,10 +407,365 @@ export class ClaudeSubagentSessions implements PrimedSessions {
     }
   }
 
+  /** Register a role's definition with its group; its name is the hash of its system prompt. */
+  private _define(group: Group, spec: PrimeSpec): string {
+    const prompt = [this._config.baseInstructions, spec.instructions, spec.context]
+      .filter(Boolean)
+      .join('\n\n');
+    const name = `d-${hash(prompt).slice(0, 16)}`;
+    group.defs.delete(name);
+    group.defs.set(name, { prompt, lastUsed: Date.now() });
+    // The least recently used definitions beyond the cap leave the next side session's agent file.
+    for (const old of group.defs.keys()) {
+      if (group.defs.size <= MAX_DEFINITIONS) break;
+      group.defs.delete(old);
+    }
+    return name;
+  }
+
+  private _spareFor(group: Group, name: string, standby: string): Spare | undefined {
+    const standbyHash = hash(standby);
+    for (const side of group.sides)
+      if (side.alive && !side.retire)
+        for (const spare of side.spares.values())
+          if (
+            spare.name === name &&
+            spare.standbyHash === standbyHash &&
+            !spare.member &&
+            !spare.done &&
+            !spare.violation
+          )
+            return spare;
+    return undefined;
+  }
+
+  /** Admit a decision onto its spare; the input goes out when the spare's moment call is held. */
+  private async _reserve(spare: Spare, member: Member): Promise<void> {
+    member.admissionId = crypto.randomUUID();
+    const ours = () => spare.member === member && member.spare === spare;
+    try {
+      await Promise.race([
+        Promise.resolve(
+          member.request.onAdmission?.({
+            admissionId: member.admissionId,
+            key: member.spec.key,
+            runtime: 'claude',
+          }),
+        ),
+        member.done,
+      ]);
+    } catch {
+      if (spare.member === member) spare.member = undefined;
+      member.reject(
+        new DecisionError(
+          'Decision admission refused before dispatch',
+          'admission',
+          'not-dispatched',
+          true,
+          member.admissionId,
+        ),
+      );
+      return;
+    }
+    if (member.settled) {
+      if (spare.member === member && !member.deliveredAt) spare.member = undefined;
+      return;
+    }
+    member.admitted = true;
+    if (!ours()) return; // moved to a fan-out while it was being admitted
+    if (!this._serviceable(spare)) {
+      this._fallback(member);
+      return;
+    }
+    spare.side.members.set(member.token, member);
+    if (spare.pending) this._deliver(spare);
+    // A spare still starting gets a moment to call in; otherwise the decision goes by fan-out.
+    else
+      setTimeout(() => {
+        if (ours() && !member.deliveredAt && !member.settled) this._fallback(member);
+      }, RESERVE_START_MS);
+  }
+
+  /** The spare is still held by a live standby turn and can take a decision. */
+  private _serviceable(spare: Spare): boolean {
+    return (
+      spare.side.alive &&
+      spare.side.spares.get(spare.token) === spare &&
+      !spare.done &&
+      !spare.violation
+    );
+  }
+
+  /** A reserved decision its spare cannot serve: it fans out, its standby context in front of its input. */
+  private _fallback(member: Member): void {
+    const spare = member.spare;
+    if (!spare || member.settled || member.deliveredAt) return;
+    if (spare.member === member) spare.member = undefined;
+    spare.side.members.delete(member.token);
+    member.spare = undefined;
+    const { standby, ...rest } = member.request;
+    member.request = { ...rest, input: `${standby ?? ''}${member.request.input}` };
+    const group = this._groups.get(spare.side.group);
+    if (!group) return;
+    group.batch.push(member);
+    clearTimeout(group.timer);
+    group.timer = setTimeout(() => this._flush(group), 0);
+  }
+
+  private _reportStandby(spare: Spare): void {
+    if (spare.reported) return;
+    spare.reported = true;
+    this._emit({ type: 'standby', key: spare.name, ...spare.tokens });
+  }
+
+  private _deliver(spare: Spare): void {
+    const member = spare.member;
+    if (!member || member.settled || !spare.pending || member.deliveredAt || !member.admitted)
+      return;
+    if (spare.violation) {
+      this._fallback(member);
+      return;
+    }
+    member.deliveredAt = member.dispatchedAt = Date.now();
+    member.toolUseId = spare.toolUseId;
+    member.taskId = spare.taskId;
+    this._mcpReply(spare.side, spare.pending.requestId, {
+      jsonrpc: '2.0',
+      id: spare.pending.rpcId,
+      result: { content: [{ type: 'text', text: member.request.input }] },
+    });
+  }
+
+  /** Answer an MCP request from the runtime; true once written. */
+  private _mcpReply(side: Side, requestId: string, message: unknown): boolean {
+    this._write(side, {
+      type: 'control_response',
+      response: { subtype: 'success', request_id: requestId, response: { mcp_response: message } },
+    });
+    return true;
+  }
+
+  /** The host's MCP server: one tool, `moment`, whose call a pre-started member holds open. */
+  private _answerMcp(side: Side, requestId: string, message: Record<string, unknown>): boolean {
+    const id = message.id;
+    if (message.method === 'initialize')
+      return this._mcpReply(side, requestId, {
+        jsonrpc: '2.0',
+        id,
+        result: {
+          protocolVersion: (message.params as Record<string, unknown> | undefined)?.protocolVersion,
+          capabilities: { tools: {} },
+          serverInfo: { name: 'foundry', version: '1' },
+        },
+      });
+    if (message.method === 'tools/list')
+      return this._mcpReply(side, requestId, {
+        jsonrpc: '2.0',
+        id,
+        result: {
+          tools: [
+            {
+              name: 'moment',
+              description: 'Wait for the moment to assess. Its result is your input.',
+              inputSchema: {
+                type: 'object',
+                properties: { token: { type: 'string' } },
+                required: ['token'],
+              },
+            },
+          ],
+        },
+      });
+    if (message.method === 'tools/call') {
+      const params = (message.params ?? {}) as Record<string, unknown>;
+      const token = String(((params.arguments ?? {}) as Record<string, unknown>).token ?? '');
+      const spare = params.name === 'moment' ? side.spares.get(token) : undefined;
+      if (!spare || spare.pending || spare.done)
+        return this._mcpReply(side, requestId, {
+          jsonrpc: '2.0',
+          id,
+          result: { isError: true, content: [{ type: 'text', text: 'No moment for this token.' }] },
+        });
+      spare.pending = { requestId, rpcId: id };
+      this._reportStandby(spare);
+      this._deliver(spare);
+      return true;
+    }
+    if (id === undefined) return this._mcpReply(side, requestId, null);
+    return this._mcpReply(side, requestId, {
+      jsonrpc: '2.0',
+      id,
+      error: { code: -32601, message: 'method not found' },
+    });
+  }
+
+  /** Pre-start every desired role that has no spare holding its current standby context. */
+  private _replenish(group: Group): void {
+    if (this._closed || !group.desired.size || Date.now() < group.retryAt) return;
+    // Spares are created when their standby turn is assigned, so one still starting counts as held.
+    const held = new Set<string>();
+    for (const side of group.sides)
+      if (side.alive && !side.retire)
+        for (const spare of side.spares.values())
+          if (!spare.done && !spare.member && !spare.violation)
+            if (group.desired.get(spare.name)?.standbyHash === spare.standbyHash)
+              held.add(spare.name);
+    const missing = [...group.desired.keys()].filter((name) => !held.has(name));
+    if (!missing.length) return;
+    const chunks = Math.ceil(missing.length / this._config.maxMembers);
+    const size = Math.ceil(missing.length / chunks);
+    for (let i = 0; i < missing.length; i += size) {
+      const chunk = missing.slice(i, i + size);
+      const needs = chunk.map(standbyName);
+      let side = group.sides.find((s) => s.alive && !s.busy && needs.every((n) => s.names.has(n)));
+      if (!side) {
+        if (group.sides.length >= this._config.maxSessionsPerGroup) return; // retried when one frees
+        try {
+          side = this._spawn(group);
+        } catch {
+          this._startFailed(group);
+          return;
+        }
+      }
+      const owner = side;
+      owner.busy = true;
+      owner.spares = new Map(
+        chunk.map((name, index) => {
+          const desired = group.desired.get(name)!;
+          // A position in this standby turn: deterministic, so a recorded turn replays.
+          const token = `s${index + 1}`;
+          const spare: Spare = {
+            name,
+            standbyHash: desired.standbyHash,
+            prompt: standbyPrompt(desired.standby, token),
+            token,
+            side: owner,
+            done: false,
+            tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          };
+          return [token, spare] as const;
+        }),
+      );
+      void this._standbyFanOut(owner, group)
+        .catch(() => undefined)
+        .finally(() => {
+          owner.busy = false;
+          owner.retire = false;
+          owner.lastUsed = Date.now();
+          this._drain(group);
+          this._replenish(group);
+        });
+    }
+  }
+
+  /** A standby side session that failed to start: pre-starting backs off (5 s, doubling to 5 min). */
+  private _startFailed(group: Group): void {
+    group.startFailures++;
+    group.retryAt = Date.now() + Math.min(5 * 60_000, 5_000 * 2 ** (group.startFailures - 1));
+  }
+
+  /** End a side session's standby turn once no decision is using its spares. */
+  private _endStandby(side: Side): void {
+    const inUse = [...side.spares.values()].some((sp) => sp.member && !sp.member.settled);
+    if (inUse || !side.spares.size) return;
+    void this._control(side, { subtype: 'interrupt' }, 5_000).catch(
+      () => void this._kill(side, 'standby interrupt unanswered'),
+    );
+  }
+
+  private _endStandbyNow(side: Side): void {
+    void this._control(side, { subtype: 'interrupt' }, 5_000).catch(
+      () => void this._kill(side, 'standby interrupt unanswered'),
+    );
+  }
+
+  /** One dispatcher turn holding pre-started members until each is used or the turn is ended. */
+  private async _standbyFanOut(side: Side, group: Group): Promise<void> {
+    try {
+      await side.ready;
+    } catch {
+      this._startFailed(group);
+      this._releaseSpares(side);
+      return;
+    }
+    group.startFailures = 0;
+    if (!side.alive) {
+      this._releaseSpares(side);
+      return;
+    }
+    const spares = [...side.spares.values()];
+    const uuid = crypto.randomUUID();
+    const turnEnded = new Promise<void>((resolve) => {
+      side.onResult = resolve;
+    });
+    try {
+      this._write(side, {
+        type: 'user',
+        uuid,
+        message: {
+          role: 'user',
+          content: spares.map((sp) => `${standbyName(sp.name)} ${sp.token}`).join('\n'),
+        },
+        parent_tool_use_id: null,
+      });
+      await turnEnded;
+    } finally {
+      side.onResult = undefined;
+      this._releaseSpares(side);
+    }
+    const rewound = side.alive
+      ? await this._control(side, { subtype: 'rewind_conversation', target_message_uuid: uuid })
+          .then((r) => r.rewound === true)
+          .catch(() => false)
+      : false;
+    if (!rewound) await this._kill(side, 'rewind refused');
+  }
+
+  /**
+   * The standby turn is over: a decision reserved on a spare that never ran fans out instead, and
+   * one that ran but did not answer fails.
+   */
+  private _releaseSpares(side: Side): void {
+    for (const sp of side.spares.values()) {
+      sp.done = true;
+      const member = sp.member;
+      if (!member || member.settled) continue;
+      if (!member.deliveredAt) this._fallback(member);
+      else
+        member.reject(
+          new DecisionError(
+            'Subagent ended without an answer',
+            'transport',
+            'attempted',
+            true,
+            member.admissionId,
+          ),
+        );
+    }
+    side.spares = new Map();
+    side.members = new Map();
+  }
+
+  private _spareByToolUse(side: Side, id: unknown): Spare | undefined {
+    if (typeof id !== 'string') return undefined;
+    for (const sp of side.spares.values()) if (sp.toolUseId === id) return sp;
+    return undefined;
+  }
+
   private _group(id: string): Group {
     let group = this._groups.get(id);
     if (!group) {
-      group = { id, defs: new Map(), sides: [], batch: [], waiting: [] };
+      group = {
+        id,
+        defs: new Map(),
+        sides: [],
+        batch: [],
+        waiting: [],
+        desired: new Map(),
+        lastActive: Date.now(),
+        startFailures: 0,
+        retryAt: 0,
+      };
       this._groups.set(id, group);
     }
     return group;
@@ -381,13 +842,20 @@ export class ClaudeSubagentSessions implements PrimedSessions {
   private _launch(group: Group, generation: number, dir: string): Side {
     chmodSync(dir, 0o700);
     const agents: Record<string, unknown> = {};
-    for (const [name, def] of group.defs)
+    for (const [name, def] of group.defs) {
       agents[name] = {
         description: 'decision role',
         prompt: def.prompt,
         model: this._config.model,
         tools: [],
       };
+      agents[standbyName(name)] = {
+        description: 'decision role, pre-started',
+        prompt: def.prompt,
+        model: this._config.model,
+        tools: [MOMENT_TOOL],
+      };
+    }
     const file = join(dir, 'agents.json');
     writeFileSync(file, JSON.stringify(agents), { mode: 0o600 });
     const argv = [
@@ -409,7 +877,7 @@ export class ClaudeSubagentSessions implements PrimedSessions {
       file,
       '--strict-mcp-config',
       '--mcp-config',
-      '{"mcpServers":{}}',
+      JSON.stringify({ mcpServers: { foundry: { type: 'sdk', name: 'foundry' } } }),
       '--disable-slash-commands',
       '--no-chrome',
       '--no-session-persistence',
@@ -423,6 +891,8 @@ export class ClaudeSubagentSessions implements PrimedSessions {
       ...process.env,
       ...this._config.env,
       DISABLE_AUTOUPDATER: '1',
+      // A pre-started member holds its moment call until the thread's next trigger.
+      MCP_TOOL_TIMEOUT: String(24 * 60 * 60_000),
     };
     delete env.ANTHROPIC_API_KEY;
     delete env.ANTHROPIC_AUTH_TOKEN;
@@ -449,6 +919,7 @@ export class ClaudeSubagentSessions implements PrimedSessions {
       busy: false,
       lastUsed: Date.now(),
       members: new Map(),
+      spares: new Map(),
       control: new Map(),
     };
     group.sides.push(side);
@@ -459,6 +930,7 @@ export class ClaudeSubagentSessions implements PrimedSessions {
     );
     side.ready = this._control(side, {
       subtype: 'initialize',
+      sdkMcpServers: ['foundry'],
       hooks: { PreToolUse: [{ matcher: 'Agent', hookCallbackIds: ['members'] }] },
     }).then(() => {
       this._emit({ type: 'process-started', generation, ms: Math.round(performance.now() - t0) });
@@ -547,6 +1019,10 @@ export class ClaudeSubagentSessions implements PrimedSessions {
     if (type === 'control_request') {
       const request = frame.request as Record<string, unknown> | undefined;
       const requestId = frame.request_id as string;
+      if (request?.subtype === 'mcp_message' && request.server_name === 'foundry') {
+        this._answerMcp(side, requestId, (request.message ?? {}) as Record<string, unknown>);
+        return;
+      }
       if (request?.subtype === 'hook_callback' && request.callback_id === 'members') {
         this._answerHook(side, requestId, request.input as Record<string, unknown> | undefined);
         return;
@@ -571,6 +1047,13 @@ export class ClaudeSubagentSessions implements PrimedSessions {
       return;
     }
     if (type === 'system' && frame.subtype === 'task_started') {
+      const spare = this._spareByToolUse(side, frame.tool_use_id);
+      if (spare) {
+        spare.taskId = frame.task_id as string;
+        if (frame.prompt !== spare.prompt)
+          spare.violation = 'standby input was not the composed input';
+        return;
+      }
       const member = this._byToolUse(side, frame.tool_use_id);
       if (!member) return;
       member.taskId = frame.task_id as string;
@@ -580,7 +1063,23 @@ export class ClaudeSubagentSessions implements PrimedSessions {
       return;
     }
     if (type === 'assistant' && frame.parent_tool_use_id) {
-      const member = this._byToolUse(side, frame.parent_tool_use_id);
+      const spare = this._spareByToolUse(side, frame.parent_tool_use_id);
+      if (spare && !spare.member?.deliveredAt) {
+        // Before its moment a pre-started member may only call the moment tool.
+        const message = frame.message as Record<string, unknown> | undefined;
+        for (const block of (message?.content as Array<Record<string, unknown>>) ?? [])
+          if (block.type === 'tool_use' && block.name !== MOMENT_TOOL)
+            spare.violation = 'tool activity before its moment';
+        const usage = message?.usage as Record<string, number> | undefined;
+        if (usage) {
+          spare.tokens.input += usage.input_tokens ?? 0;
+          spare.tokens.output += usage.output_tokens ?? 0;
+          spare.tokens.cacheRead += usage.cache_read_input_tokens ?? 0;
+          spare.tokens.cacheWrite += usage.cache_creation_input_tokens ?? 0;
+        }
+        return;
+      }
+      const member = spare?.member ?? this._byToolUse(side, frame.parent_tool_use_id);
       if (!member) return;
       const message = frame.message as Record<string, unknown> | undefined;
       for (const block of (message?.content as Array<Record<string, unknown>>) ?? []) {
@@ -598,6 +1097,20 @@ export class ClaudeSubagentSessions implements PrimedSessions {
       return;
     }
     if (type === 'system' && frame.subtype === 'task_notification') {
+      const spare = this._spareByToolUse(side, frame.tool_use_id);
+      if (spare) {
+        spare.done = true;
+        this._reportStandby(spare);
+        const member = spare.member;
+        if (member?.deliveredAt) this._settle(side, member, String(frame.status ?? 'unknown'));
+        else if (member) this._fallback(member);
+        // Every spare used or ended: the standby turn ends too.
+        if ([...side.spares.values()].every((sp) => sp.done)) this._endStandbyNow(side);
+        else if (side.retire) this._endStandby(side);
+        const group = this._groups.get(side.group);
+        if (group) this._replenish(group);
+        return;
+      }
       const member = this._byToolUse(side, frame.tool_use_id);
       if (member) this._settle(side, member, String(frame.status ?? 'unknown'));
       return;
@@ -611,6 +1124,37 @@ export class ClaudeSubagentSessions implements PrimedSessions {
     input: Record<string, unknown> | undefined,
   ): void {
     const toolInput = (input?.tool_input ?? {}) as Record<string, unknown>;
+    const spare = side.spares.get(String(toolInput.description ?? ''));
+    if (spare) {
+      const usable = !spare.toolUseId && standbyName(spare.name) === toolInput.subagent_type;
+      if (usable) spare.toolUseId = input?.tool_use_id as string;
+      this._write(side, {
+        type: 'control_response',
+        response: {
+          subtype: 'success',
+          request_id: requestId,
+          response: {
+            hookSpecificOutput: usable
+              ? {
+                  hookEventName: 'PreToolUse',
+                  permissionDecision: 'allow',
+                  updatedInput: {
+                    subagent_type: toolInput.subagent_type,
+                    description: spare.token,
+                    prompt: spare.prompt,
+                    run_in_background: false,
+                  },
+                }
+              : {
+                  hookEventName: 'PreToolUse',
+                  permissionDecision: 'deny',
+                  permissionDecisionReason: 'not a member of this fan-out',
+                },
+          },
+        },
+      });
+      return;
+    }
     const member = side.members.get(String(toolInput.description ?? ''));
     const usable =
       member &&
@@ -710,7 +1254,12 @@ export class ClaudeSubagentSessions implements PrimedSessions {
   private async _withdraw(member: Member, reason: 'timeout' | 'aborted'): Promise<void> {
     if (member.settled) return;
     const message = reason === 'timeout' ? 'Decision deadline passed' : 'Decision aborted';
-    if (!member.toolUseId) {
+    if (member.spare && !member.deliveredAt) {
+      // Never sent: the spare stays pre-started for the next decision.
+      member.spare.member = undefined;
+      member.spare.side.members.delete(member.token);
+    }
+    if (!member.deliveredAt && (member.spare || !member.toolUseId)) {
       member.reject(
         new DecisionError(
           `${message} before dispatch`,
@@ -733,9 +1282,11 @@ export class ClaudeSubagentSessions implements PrimedSessions {
         member.admissionId,
       ),
     );
-    const side = [...this._groups.values()]
-      .flatMap((g) => g.sides)
-      .find((s) => [...s.members.values()].includes(member));
+    const side =
+      member.spare?.side ??
+      [...this._groups.values()]
+        .flatMap((g) => g.sides)
+        .find((s) => [...s.members.values()].includes(member));
     if (!side) return;
     const stopped =
       side.alive && member.taskId
@@ -770,7 +1321,7 @@ export class ClaudeSubagentSessions implements PrimedSessions {
         if (m.settled) return;
         m.admissionId ??= crypto.randomUUID();
         try {
-          if (!retry)
+          if (!retry && !m.admitted)
             await Promise.race([
               Promise.resolve(
                 m.request.onAdmission?.({
@@ -781,6 +1332,7 @@ export class ClaudeSubagentSessions implements PrimedSessions {
               ),
               m.done,
             ]);
+          m.admitted = true;
           if (!m.settled) admitted.push(m);
         } catch {
           m.reject(
@@ -808,6 +1360,10 @@ export class ClaudeSubagentSessions implements PrimedSessions {
         );
       return;
     }
+    // Tokens are positions in this fan-out, so a recorded dispatcher turn replays with the same ones.
+    admitted.forEach((m, i) => {
+      m.token = `m${i + 1}`;
+    });
     side.members = new Map(admitted.map((m) => [m.token, m]));
     const uuid = crypto.randomUUID();
     const turnEnded = new Promise<void>((resolve) => {
@@ -908,6 +1464,8 @@ export class ClaudeSubagentSessions implements PrimedSessions {
     }
     for (const pending of side.control.values()) pending.reject(Error('side session exited'));
     side.control.clear();
+    for (const sp of side.spares.values())
+      if (sp.member && !sp.member.deliveredAt) this._fallback(sp.member);
     for (const m of side.members.values())
       m.reject(
         new DecisionError(
@@ -955,6 +1513,15 @@ export class ClaudeSubagentSessions implements PrimedSessions {
   private _closeIdle(): void {
     const cutoff = Date.now() - this._config.idleMs;
     for (const group of this._groups.values()) {
+      // A thread with no decision for a while lets its spares go; they are pre-started again on demand.
+      if (group.lastActive < cutoff && group.desired.size) {
+        group.desired = new Map();
+        for (const side of group.sides)
+          if (side.spares.size) {
+            side.retire = true;
+            this._endStandby(side);
+          }
+      }
       for (const side of [...group.sides])
         if (!side.busy && side.lastUsed < cutoff) void this._kill(side, 'idle');
       for (const [name, def] of group.defs) if (def.lastUsed < cutoff) group.defs.delete(name);
