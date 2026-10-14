@@ -537,14 +537,16 @@ describe('ClaudeSubagentSessions', () => {
 
   test('pre-started members answer at once: the decision only answers their held moment call', async () => {
     const cli = dispatcherCli();
-    const { h } = host(cli);
+    const { h, events } = host(cli);
     const roles = ['api', 'docs', 'tests'].map(role);
     h.prestart(
       'T1',
       roles.map((spec) => ({ spec, standby: 'THREAD v1\n' })),
     );
     await tick(60);
-    expect(cli.userMessages).toHaveLength(1); // the standby fan-out, off any decision's path
+    // One standby turn per copy of the roles, each in its own side session, off any decision's path.
+    expect(cli.userMessages).toHaveLength(2);
+    expect(cli.processes).toHaveLength(2);
     expect(cli.standbyPrompts.every((p) => p.startsWith('THREAD v1\n'))).toBe(true);
     // Every role is a standby variant whose only tool is the moment.
     const defs = cli.agents[0]! as Record<string, any>;
@@ -563,10 +565,14 @@ describe('ClaudeSubagentSessions', () => {
     ]);
     expect(cli.momentInputs.sort()).toEqual(['moment 0', 'moment 1', 'moment 2']);
     expect(cli.subagentInputs.filter((p) => p.startsWith('moment'))).toEqual([]); // no fan-out for them
-    // Used spares end the standby turn, which is rewound; they are pre-started again.
+    // The decisions emptied one side session's standby turn, which is rewound and pre-started again;
+    // the other copy kept holding.
     await tick(80);
     expect(cli.controls.some((c) => c.subtype === 'rewind_conversation')).toBe(true);
-    expect(cli.standbyPrompts).toHaveLength(6);
+    expect(cli.standbyPrompts).toHaveLength(9);
+    // The emptied side session is reused for its refill: no process is started for it.
+    expect(cli.processes).toHaveLength(2);
+    expect(events.filter((e) => e.type === 'process-started')).toHaveLength(2);
   });
 
   test('a decision whose standby context differs fans out with the standby in front of its input', async () => {
@@ -679,7 +685,55 @@ describe('ClaudeSubagentSessions', () => {
       ['x', 'y', 'z'].map((d) => h.decide(role(d), { input: d, group: 'T1', standby: 'S\n' })),
     );
     await tick(50);
-    expect(cli.standbyPrompts).toHaveLength(2);
+    expect(cli.standbyPrompts).toHaveLength(4); // two copies of each pre-started role, no more
+  });
+
+  test('copies of a role sit in different side sessions; a trigger empties one copy, the other serves while it refills', async () => {
+    const cli = dispatcherCli();
+    const { h } = host(cli);
+    const roles = ['api', 'docs', 'tests'].map(role);
+    h.prestart(
+      'T1',
+      roles.map((spec) => ({ spec, standby: 'S\n' })),
+    );
+    await tick(60);
+    expect(cli.processes).toHaveLength(2);
+    // Each standby turn lists every role once: copies never share a side session.
+    for (const m of cli.userMessages) expect(m.text.split('\n')).toHaveLength(3);
+    // A guard on one role takes one spare; its side session is released and pre-started again.
+    expect((await h.decide(roles[0]!, { input: 'g1', group: 'T1', standby: 'S\n' })).content).toBe(
+      'decided: g1',
+    );
+    // The next guard right away is served by the other copy, not a fan-out.
+    expect((await h.decide(roles[0]!, { input: 'g2', group: 'T1', standby: 'S\n' })).content).toBe(
+      'decided: g2',
+    );
+    expect(cli.momentInputs.sort()).toEqual(['g1', 'g2']);
+    expect(cli.subagentInputs.filter((p) => p.startsWith('g'))).toEqual([]);
+    await tick(150);
+    // Used copies refill in a side session of their own while the partly used ones keep serving,
+    // within the cap: both copy sets plus two refill side sessions.
+    expect(cli.processes.length).toBeLessThanOrEqual(4);
+    // Staggered: api is held again, so a third guard is served at once too.
+    expect((await h.decide(roles[0]!, { input: 'g3', group: 'T1', standby: 'S\n' })).content).toBe(
+      'decided: g3',
+    );
+    expect(cli.momentInputs.sort()).toEqual(['g1', 'g2', 'g3']);
+  });
+
+  test('fan-outs run in their own side sessions and never take a standby one', async () => {
+    const cli = dispatcherCli();
+    const { h } = host(cli);
+    h.prestart('T1', [{ spec: role('api'), standby: 'S\n' }]);
+    await tick(60);
+    expect(cli.processes).toHaveLength(2);
+    // A role with no spare fans out: a third process, while both standby turns keep holding.
+    const r = await h.decide(role('review'), { input: 'after the turn', group: 'T1' });
+    expect(r.content).toBe('decided: after the turn');
+    expect(cli.processes).toHaveLength(3);
+    const held = await h.decide(role('api'), { input: 'moment', group: 'T1', standby: 'S\n' });
+    expect(held.content).toBe('decided: moment');
+    expect(cli.momentInputs).toEqual(['moment']);
   });
 
   test('close refuses waiting decisions and stops the side sessions', async () => {
