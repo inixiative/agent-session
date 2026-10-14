@@ -1,6 +1,6 @@
 // Live check of ClaudeSubagentSessions on this machine's Claude login (makes real, small calls).
 //
-//   bun scripts/measure-subagents.ts [--roles 3] [--hold-ms 180000] [--bin <claude>]
+//   bun scripts/measure-subagents.ts [--roles 3] [--hold-ms 180000] [--bin <claude>] [--max-members 12] [--spares 2]
 //
 // For N synthetic roles on one group it measures:
 //   - a fan-out (no spare): wall time to every answer, inputs byte-identical, outputs verbatim;
@@ -22,6 +22,8 @@ const arg = (name: string, fallback: string) => {
 const roles = Number(arg('roles', '3'));
 const holdMs = Number(arg('hold-ms', '180000'));
 const bin = arg('bin', 'claude');
+const maxMembers = Number(arg('max-members', '12'));
+const sparesPerRole = Number(arg('spares', '2'));
 const cwd = mkdtempSync(join(tmpdir(), 'measure-subagents-'));
 
 const events: PrimedEvent[] = [];
@@ -34,6 +36,8 @@ const host = new ClaudeSubagentSessions({
   baseInstructions:
     'You assess one moment for one narrow domain and answer NO_COMMENT unless the moment breaks a rule below.',
   timeoutMs: 30_000,
+  maxMembers,
+  sparesPerRole,
   spawn: (argv, options) => {
     const child = Bun.spawn([...argv, '--setting-sources', ''], {
       ...options,

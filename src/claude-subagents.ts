@@ -30,6 +30,15 @@
 //             Each spare serves one decision; `prestart` with new standby
 //             context replaces the spares (a turn landed), and a consumed one
 //             is pre-started again.
+//   pairs     each role keeps `sparesPerRole` spares (default 2), each copy in
+//             a different standby side session. A decision takes the spare
+//             whose side session is already most used, so a trigger empties
+//             whole side sessions; a side session whose spares were partly
+//             used ends its standby turn once nothing it serves is in flight,
+//             and is pre-started again while the other copy serves.
+//   sides     standby side sessions hold spares only; fan-outs (decisions with
+//             no spare) run in their own side sessions, so they never take a
+//             spare's place.
 //
 // Every member is a fresh subagent conversation: nothing of one decision
 // reaches another. Groups above `maxMembers` split evenly across more side
@@ -80,10 +89,12 @@ export interface ClaudeSubagentConfig {
     argv: string[],
     options: { cwd: string; env: Record<string, string | undefined> },
   ) => PipedSubprocess;
-  /** Members per fan-out; a larger batch splits evenly across side sessions. Default 12. */
+  /** Members per fan-out or standby turn; a larger set splits evenly across side sessions. Default 12. */
   maxMembers?: number;
-  /** Side sessions per group (pre-started spares hold some). Default 6. */
+  /** Fan-out side sessions per group. Standby side sessions are sized by the spares they hold. Default 6. */
   maxSessionsPerGroup?: number;
+  /** Pre-started spares kept per role, each copy in its own standby side session. Default 2. */
+  sparesPerRole?: number;
   /** Decisions arriving within this window of each other fan out together. Default 25 ms. */
   batchWindowMs?: number;
   /** Close a side session idle this long. Default 30 min. */
@@ -144,6 +155,8 @@ interface Spare {
 
 interface Side {
   readonly group: string;
+  /** Holds pre-started spares; never takes a fan-out. */
+  readonly standby: boolean;
   readonly names: ReadonlySet<string>;
   readonly proc: PipedSubprocess;
   readonly dir: string;
@@ -162,6 +175,8 @@ interface Side {
   spares: Map<string, Spare>;
   /** Its standby context was replaced: end its standby turn once no decision uses it. */
   retire?: boolean;
+  /** Its standby turn is being ended; it is pre-started again once rewound. */
+  ending?: boolean;
   onResult?: () => void;
   control: Map<string, { resolve(r: Record<string, unknown>): void; reject(e: Error): void }>;
 }
@@ -197,7 +212,12 @@ export class ClaudeSubagentSessions implements PrimedSessions {
     Required<
       Pick<
         ClaudeSubagentConfig,
-        'maxMembers' | 'maxSessionsPerGroup' | 'batchWindowMs' | 'idleMs' | 'timeoutMs'
+        | 'maxMembers'
+        | 'maxSessionsPerGroup'
+        | 'sparesPerRole'
+        | 'batchWindowMs'
+        | 'idleMs'
+        | 'timeoutMs'
       >
     >;
   private _groups = new Map<string, Group>();
@@ -213,11 +233,16 @@ export class ClaudeSubagentSessions implements PrimedSessions {
       ...config,
       maxMembers: config.maxMembers ?? 12,
       maxSessionsPerGroup: config.maxSessionsPerGroup ?? 6,
+      sparesPerRole: config.sparesPerRole ?? 2,
       batchWindowMs: config.batchWindowMs ?? 25,
       idleMs: config.idleMs ?? 30 * 60_000,
       timeoutMs: config.timeoutMs ?? 30_000,
     };
-    if (this._config.maxMembers < 1 || this._config.maxSessionsPerGroup < 1)
+    if (
+      this._config.maxMembers < 1 ||
+      this._config.maxSessionsPerGroup < 1 ||
+      this._config.sparesPerRole < 1
+    )
       throw Error('Invalid subagent session bounds');
   }
 
@@ -423,20 +448,26 @@ export class ClaudeSubagentSessions implements PrimedSessions {
     return name;
   }
 
+  /**
+   * A free spare for this role and standby context. A held one beats one still starting; among
+   * those, the one whose side session has the fewest free spares left, so a trigger empties whole
+   * side sessions and the other copies stay held.
+   */
   private _spareFor(group: Group, name: string, standby: string): Spare | undefined {
     const standbyHash = hash(standby);
-    for (const side of group.sides)
-      if (side.alive && !side.retire)
-        for (const spare of side.spares.values())
-          if (
-            spare.name === name &&
-            spare.standbyHash === standbyHash &&
-            !spare.member &&
-            !spare.done &&
-            !spare.violation
-          )
-            return spare;
-    return undefined;
+    const free = (sp: Spare) => !sp.member && !sp.done && !sp.violation;
+    let best: { spare: Spare; held: boolean; left: number } | undefined;
+    for (const side of group.sides) {
+      if (!side.alive || side.retire) continue;
+      const left = [...side.spares.values()].filter(free).length;
+      for (const spare of side.spares.values()) {
+        if (spare.name !== name || spare.standbyHash !== standbyHash || !free(spare)) continue;
+        const held = !!spare.pending;
+        if (!best || (held && !best.held) || (held === best.held && left < best.left))
+          best = { spare, held, left };
+      }
+    }
+    return best?.spare;
   }
 
   /** Admit a decision onto its spare; the input goes out when the spare's moment call is held. */
@@ -599,62 +630,85 @@ export class ClaudeSubagentSessions implements PrimedSessions {
     });
   }
 
-  /** Pre-start every desired role that has no spare holding its current standby context. */
+  /**
+   * Keep `sparesPerRole` spares of every desired role holding its current standby context. Copies
+   * of one role always go to different standby side sessions: each round of missing copies is its
+   * own set of standby turns.
+   */
   private _replenish(group: Group): void {
     if (this._closed || !group.desired.size || Date.now() < group.retryAt) return;
     // Spares are created when their standby turn is assigned, so one still starting counts as held.
-    const held = new Set<string>();
+    const held = new Map<string, number>();
     for (const side of group.sides)
       if (side.alive && !side.retire)
         for (const spare of side.spares.values())
           if (!spare.done && !spare.member && !spare.violation)
             if (group.desired.get(spare.name)?.standbyHash === spare.standbyHash)
-              held.add(spare.name);
-    const missing = [...group.desired.keys()].filter((name) => !held.has(name));
-    if (!missing.length) return;
-    const chunks = Math.ceil(missing.length / this._config.maxMembers);
-    const size = Math.ceil(missing.length / chunks);
-    for (let i = 0; i < missing.length; i += size) {
-      const chunk = missing.slice(i, i + size);
-      const needs = chunk.map(standbyName);
-      let side = group.sides.find((s) => s.alive && !s.busy && needs.every((n) => s.names.has(n)));
-      if (!side) {
-        if (group.sides.length >= this._config.maxSessionsPerGroup) return; // retried when one frees
-        try {
-          side = this._spawn(group);
-        } catch {
-          this._startFailed(group);
-          return;
+              held.set(spare.name, (held.get(spare.name) ?? 0) + 1);
+    const copies = this._config.sparesPerRole;
+    // Standby sessions this group may hold: every copy of every role, plus one set retiring.
+    const cap = (copies + 1) * Math.ceil(group.desired.size / this._config.maxMembers);
+    for (let round = 0; round < copies; round++) {
+      const missing = [...group.desired.keys()].filter((name) => (held.get(name) ?? 0) <= round);
+      if (!missing.length) continue;
+      const chunks = Math.ceil(missing.length / this._config.maxMembers);
+      const size = Math.ceil(missing.length / chunks);
+      for (let i = 0; i < missing.length; i += size) {
+        const chunk = missing.slice(i, i + size);
+        // A side session launched with these roles' definitions (each has its standby variant).
+        let side = group.sides.find(
+          (s) => s.standby && s.alive && !s.busy && chunk.every((n) => s.names.has(n)),
+        );
+        if (!side) {
+          // A standby turn with a used spare ends once its decisions settle and frees its side
+          // session for these copies: no new process meanwhile.
+          if (
+            group.sides.some(
+              (s) =>
+                s.standby &&
+                s.alive &&
+                (s.ending || [...s.spares.values()].some((sp) => sp.done || sp.member)),
+            )
+          )
+            return;
+          if (group.sides.filter((s) => s.standby).length >= cap) return; // retried when one frees
+          try {
+            side = this._spawn(group, true);
+          } catch {
+            this._startFailed(group);
+            return;
+          }
         }
+        const owner = side;
+        owner.busy = true;
+        owner.spares = new Map(
+          chunk.map((name, index) => {
+            const desired = group.desired.get(name)!;
+            // A position in this standby turn: deterministic, so a recorded turn replays.
+            const token = `s${index + 1}`;
+            const spare: Spare = {
+              name,
+              standbyHash: desired.standbyHash,
+              prompt: standbyPrompt(desired.standby, token),
+              token,
+              side: owner,
+              done: false,
+              tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            };
+            return [token, spare] as const;
+          }),
+        );
+        for (const name of chunk) held.set(name, (held.get(name) ?? 0) + 1);
+        void this._standbyFanOut(owner, group)
+          .catch(() => undefined)
+          .finally(() => {
+            owner.busy = false;
+            owner.retire = false;
+            owner.ending = false;
+            owner.lastUsed = Date.now();
+            this._replenish(group);
+          });
       }
-      const owner = side;
-      owner.busy = true;
-      owner.spares = new Map(
-        chunk.map((name, index) => {
-          const desired = group.desired.get(name)!;
-          // A position in this standby turn: deterministic, so a recorded turn replays.
-          const token = `s${index + 1}`;
-          const spare: Spare = {
-            name,
-            standbyHash: desired.standbyHash,
-            prompt: standbyPrompt(desired.standby, token),
-            token,
-            side: owner,
-            done: false,
-            tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-          };
-          return [token, spare] as const;
-        }),
-      );
-      void this._standbyFanOut(owner, group)
-        .catch(() => undefined)
-        .finally(() => {
-          owner.busy = false;
-          owner.retire = false;
-          owner.lastUsed = Date.now();
-          this._drain(group);
-          this._replenish(group);
-        });
     }
   }
 
@@ -668,12 +722,14 @@ export class ClaudeSubagentSessions implements PrimedSessions {
   private _endStandby(side: Side): void {
     const inUse = [...side.spares.values()].some((sp) => sp.member && !sp.member.settled);
     if (inUse || !side.spares.size) return;
+    side.ending = true;
     void this._control(side, { subtype: 'interrupt' }, 5_000).catch(
       () => void this._kill(side, 'standby interrupt unanswered'),
     );
   }
 
   private _endStandbyNow(side: Side): void {
+    side.ending = true;
     void this._control(side, { subtype: 'interrupt' }, 5_000).catch(
       () => void this._kill(side, 'standby interrupt unanswered'),
     );
@@ -791,19 +847,18 @@ export class ClaudeSubagentSessions implements PrimedSessions {
         continue;
       }
       const needs = new Set(chunk.map((m) => m.name));
-      let side = group.sides.find(
-        (s) => s.alive && !s.busy && [...needs].every((n) => s.names.has(n)),
-      );
+      const fanOuts = group.sides.filter((s) => !s.standby);
+      let side = fanOuts.find((s) => s.alive && !s.busy && [...needs].every((n) => s.names.has(n)));
       if (!side) {
-        const idleLacking = group.sides.find((s) => !s.busy);
-        if (group.sides.length >= this._config.maxSessionsPerGroup) {
+        const idleLacking = fanOuts.find((s) => !s.busy);
+        if (fanOuts.length >= this._config.maxSessionsPerGroup) {
           if (!idleLacking) return; // every side session is busy: the chunk waits
           // A side session without these definitions is replaced by one that has them all.
           group.sides.splice(group.sides.indexOf(idleLacking), 1);
           void this._kill(idleLacking, 'definitions changed');
         }
         try {
-          side = this._spawn(group);
+          side = this._spawn(group, false);
         } catch (error) {
           group.waiting.shift();
           for (const m of chunk)
@@ -828,18 +883,18 @@ export class ClaudeSubagentSessions implements PrimedSessions {
     }
   }
 
-  private _spawn(group: Group): Side {
+  private _spawn(group: Group, standby: boolean): Side {
     const generation = ++this._generation;
     const dir = mkdtempSync(join(tmpdir(), 'agent-session-agents-'));
     try {
-      return this._launch(group, generation, dir);
+      return this._launch(group, generation, dir, standby);
     } catch (error) {
       rmSync(dir, { recursive: true, force: true });
       throw error;
     }
   }
 
-  private _launch(group: Group, generation: number, dir: string): Side {
+  private _launch(group: Group, generation: number, dir: string, standby: boolean): Side {
     chmodSync(dir, 0o700);
     const agents: Record<string, unknown> = {};
     for (const [name, def] of group.defs) {
@@ -909,6 +964,7 @@ export class ClaudeSubagentSessions implements PrimedSessions {
         }) as unknown as PipedSubprocess);
     const side: Side = {
       group: group.id,
+      standby,
       names: new Set(group.defs.keys()),
       proc,
       dir,
@@ -1104,8 +1160,15 @@ export class ClaudeSubagentSessions implements PrimedSessions {
         const member = spare.member;
         if (member?.deliveredAt) this._settle(side, member, String(frame.status ?? 'unknown'));
         else if (member) this._fallback(member);
-        // Every spare used or ended: the standby turn ends too.
-        if ([...side.spares.values()].every((sp) => sp.done)) this._endStandbyNow(side);
+        const spares = [...side.spares.values()];
+        // Every spare used or ended: the standby turn ends too. Partly used, with nothing in flight
+        // and another copy of each role elsewhere: it ends now and is pre-started again.
+        if (spares.every((sp) => sp.done)) this._endStandbyNow(side);
+        else if (
+          this._config.sparesPerRole > 1 &&
+          !spares.some((sp) => sp.member && !sp.member.settled)
+        )
+          this._endStandbyNow(side);
         else if (side.retire) this._endStandby(side);
         const group = this._groups.get(side.group);
         if (group) this._replenish(group);
