@@ -620,6 +620,9 @@ export class ClaudeSubagentSessions implements PrimedSessions {
       spare.pending = { requestId, rpcId: id };
       this._reportStandby(spare);
       this._deliver(spare);
+      // A copy now holds: a partly used side session elsewhere may be free to refill.
+      const held = this._groups.get(side.group);
+      if (held && !spare.member) this._releaseSpent(held);
       return true;
     }
     if (id === undefined) return this._mcpReply(side, requestId, null);
@@ -646,8 +649,9 @@ export class ClaudeSubagentSessions implements PrimedSessions {
             if (group.desired.get(spare.name)?.standbyHash === spare.standbyHash)
               held.set(spare.name, (held.get(spare.name) ?? 0) + 1);
     const copies = this._config.sparesPerRole;
-    // Standby sessions this group may hold: every copy of every role, plus one set retiring.
-    const cap = (copies + 1) * Math.ceil(group.desired.size / this._config.maxMembers);
+    // Standby sessions this group may hold: every copy of every role, plus two for refills while
+    // partly used side sessions keep serving their unused spares.
+    const cap = copies * Math.ceil(group.desired.size / this._config.maxMembers) + 2;
     for (let round = 0; round < copies; round++) {
       const missing = [...group.desired.keys()].filter((name) => (held.get(name) ?? 0) <= round);
       if (!missing.length) continue;
@@ -660,14 +664,16 @@ export class ClaudeSubagentSessions implements PrimedSessions {
           (s) => s.standby && s.alive && !s.busy && chunk.every((n) => s.names.has(n)),
         );
         if (!side) {
-          // A standby turn with a used spare ends once its decisions settle and frees its side
-          // session for these copies: no new process meanwhile.
+          // A standby turn being ended, or with every spare used or taken, frees its side session in
+          // a moment: no new process meanwhile.
           if (
             group.sides.some(
               (s) =>
                 s.standby &&
                 s.alive &&
-                (s.ending || [...s.spares.values()].some((sp) => sp.done || sp.member)),
+                (s.ending ||
+                  (s.spares.size > 0 &&
+                    [...s.spares.values()].every((sp) => sp.done || sp.member))),
             )
           )
             return;
@@ -709,6 +715,39 @@ export class ClaudeSubagentSessions implements PrimedSessions {
             this._replenish(group);
           });
       }
+    }
+  }
+
+  /**
+   * Refills are staggered so one copy of every role is always serving. A partly used standby turn
+   * keeps serving its unused spares (the used copies refill elsewhere) and ends only once nothing it
+   * serves is in flight and every role it still holds has another held copy: ending it then frees
+   * its process without leaving any role uncovered.
+   */
+  private _releaseSpent(group: Group): void {
+    if (this._config.sparesPerRole < 2) return;
+    const free = (sp: Spare) => !sp.member && !sp.done && !sp.violation;
+    for (const side of group.sides) {
+      if (!side.standby || !side.alive || side.ending || side.retire || !side.busy) continue;
+      const spares = [...side.spares.values()];
+      if (!spares.some((sp) => sp.done || sp.member)) continue; // untouched
+      if (spares.some((sp) => sp.member && !sp.member.settled)) continue; // still serving
+      const covered = spares
+        .filter(free)
+        .every((sp) =>
+          group.sides.some(
+            (other) =>
+              other !== side &&
+              other.alive &&
+              !other.ending &&
+              !other.retire &&
+              [...other.spares.values()].some(
+                (o) =>
+                  o.name === sp.name && o.standbyHash === sp.standbyHash && free(o) && !!o.pending,
+              ),
+          ),
+        );
+      if (covered) this._endStandbyNow(side);
     }
   }
 
@@ -1160,18 +1199,14 @@ export class ClaudeSubagentSessions implements PrimedSessions {
         const member = spare.member;
         if (member?.deliveredAt) this._settle(side, member, String(frame.status ?? 'unknown'));
         else if (member) this._fallback(member);
-        const spares = [...side.spares.values()];
-        // Every spare used or ended: the standby turn ends too. Partly used, with nothing in flight
-        // and another copy of each role elsewhere: it ends now and is pre-started again.
-        if (spares.every((sp) => sp.done)) this._endStandbyNow(side);
-        else if (
-          this._config.sparesPerRole > 1 &&
-          !spares.some((sp) => sp.member && !sp.member.settled)
-        )
-          this._endStandbyNow(side);
+        // Every spare used or ended: the standby turn ends too.
+        if ([...side.spares.values()].every((sp) => sp.done)) this._endStandbyNow(side);
         else if (side.retire) this._endStandby(side);
         const group = this._groups.get(side.group);
-        if (group) this._replenish(group);
+        if (group) {
+          this._releaseSpent(group);
+          this._replenish(group);
+        }
         return;
       }
       const member = this._byToolUse(side, frame.tool_use_id);

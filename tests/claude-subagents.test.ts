@@ -710,10 +710,15 @@ describe('ClaudeSubagentSessions', () => {
     );
     expect(cli.momentInputs.sort()).toEqual(['g1', 'g2']);
     expect(cli.subagentInputs.filter((p) => p.startsWith('g'))).toEqual([]);
-    await tick(120);
-    // Both partly used side sessions refilled; no extra process was started for it.
-    expect(cli.processes).toHaveLength(2);
-    expect(cli.standbyPrompts.length).toBeGreaterThanOrEqual(12);
+    await tick(150);
+    // Used copies refill in a side session of their own while the partly used ones keep serving,
+    // within the cap: both copy sets plus two refill side sessions.
+    expect(cli.processes.length).toBeLessThanOrEqual(4);
+    // Staggered: api is held again, so a third guard is served at once too.
+    expect((await h.decide(roles[0]!, { input: 'g3', group: 'T1', standby: 'S\n' })).content).toBe(
+      'decided: g3',
+    );
+    expect(cli.momentInputs.sort()).toEqual(['g1', 'g2', 'g3']);
   });
 
   test('fan-outs run in their own side sessions and never take a standby one', async () => {
