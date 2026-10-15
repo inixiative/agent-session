@@ -579,4 +579,127 @@ describe('Claude usage telemetry', () => {
     ).toEqual(usage);
     expect(session.totalTokens).toEqual({ input: 0, output: 0 });
   });
+
+  test('subagent frames are tagged with the spawning call and never become the parent content', async () => {
+    const fake = makeFakeProc({ autoReplyOnSend: false });
+    const session = makeSession(fake);
+    await session.start();
+    const sendPromise = session.send('delegate');
+    fake.emit({ type: 'system', subtype: 'init', session_id: 'sub-session' });
+    fake.emit({
+      type: 'assistant',
+      message: {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 'spawn-1', name: 'Agent', input: { prompt: 'look' } }],
+      },
+    });
+    fake.emit({
+      type: 'system',
+      subtype: 'task_started',
+      task_id: 'task-a',
+      tool_use_id: 'spawn-1',
+      description: 'look around',
+      subagent_type: 'explorer',
+      spawn_depth: 1,
+      is_backgrounded: false,
+      prompt: 'look',
+    });
+    fake.emit({
+      type: 'assistant',
+      parent_tool_use_id: 'spawn-1',
+      message: { role: 'assistant', content: [{ type: 'text', text: 'CHILD TEXT' }] },
+    });
+    fake.emit({
+      type: 'system',
+      subtype: 'task_notification',
+      task_id: 'task-a',
+      tool_use_id: 'spawn-1',
+      status: 'completed',
+      summary: 'found it',
+    });
+    fake.emit({
+      type: 'assistant',
+      message: { role: 'assistant', content: [{ type: 'text', text: 'PARENT TEXT' }] },
+    });
+    fake.emit({
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      result: 'PARENT TEXT',
+      session_id: 'sub-session',
+    });
+    const result = await sendPromise;
+    expect(result.content).toBe('PARENT TEXT');
+    const child = result.events.find((e) => e.text === 'CHILD TEXT')!;
+    expect(child).toMatchObject({ kind: 'text', parentToolUseId: 'spawn-1' });
+    const lifecycle = result.events.filter((e) => e.kind === 'subagent').map((e) => e.subagent);
+    expect(lifecycle).toEqual([
+      {
+        phase: 'started',
+        taskId: 'task-a',
+        toolUseId: 'spawn-1',
+        agentType: 'explorer',
+        description: 'look around',
+        depth: 1,
+        backgrounded: false,
+        prompt: 'look',
+      },
+      {
+        phase: 'ended',
+        taskId: 'task-a',
+        toolUseId: 'spawn-1',
+        status: 'completed',
+        summary: 'found it',
+      },
+    ]);
+    // A text that arrives before the parent's own is still not the parent's content.
+    const early = result.events.findIndex((e) => e.text === 'CHILD TEXT');
+    expect(early).toBeGreaterThan(-1);
+  });
+
+  test('a background subagent working between turns still reaches handlers, tagged and unattributed', async () => {
+    const fake = makeFakeProc();
+    const session = makeSession(fake);
+    await session.start();
+    await session.send('start a background agent');
+    const captured: SessionEvent[] = [];
+    session.onEvent((e) => {
+      captured.push(e);
+    });
+    fake.emit({
+      type: 'assistant',
+      session_id: 'test-session-1',
+      parent_tool_use_id: 'spawn-bg',
+      message: { role: 'assistant', content: [{ type: 'text', text: 'BACKGROUND' }] },
+    });
+    fake.emit({
+      type: 'system',
+      session_id: 'test-session-1',
+      subtype: 'task_notification',
+      task_id: 'task-bg',
+      tool_use_id: 'spawn-bg',
+      status: 'completed',
+    });
+    await new Promise((r) => setTimeout(r, 5));
+    expect(captured.map((e) => [e.kind, e.unattributedReason, e.parentToolUseId])).toEqual([
+      ['text', 'no-admission', 'spawn-bg'],
+      ['subagent', 'no-admission', undefined],
+    ]);
+    expect(captured[1]!.subagent).toMatchObject({
+      phase: 'ended',
+      taskId: 'task-bg',
+      status: 'completed',
+    });
+    // Unrelated frames between turns stay plain diagnostics.
+    fake.emit({
+      type: 'assistant',
+      session_id: 'test-session-1',
+      message: { role: 'assistant', content: [{ type: 'text', text: 'STRAY' }] },
+    });
+    await new Promise((r) => setTimeout(r, 5));
+    expect(captured.at(-1)).toMatchObject({
+      kind: 'native_status',
+      unattributedReason: 'no-admission',
+    });
+  });
 });

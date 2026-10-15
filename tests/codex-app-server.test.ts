@@ -563,3 +563,60 @@ test('app-server owned shell items stream once with IDs; repeated usage snapshot
   expect(result.tokens).toEqual({ input: 10, output: 2 });
   expect(f.session.totalTokens).toEqual({ input: 10, output: 2 });
 });
+
+test('app-server sub-agents: a spawn is a subagent event and the child thread is tagged with it, never the parent content', async () => {
+  const f = fixture();
+  await f.session.start();
+  const pending = f.session.send('delegate');
+  await tick();
+  f.rpc();
+  f.begin();
+  f.notify('item/completed', {
+    turnId: 'turn-one',
+    item: {
+      id: 'spawn-call',
+      type: 'collabAgentToolCall',
+      tool: 'spawnAgent',
+      status: 'completed',
+      senderThreadId: 'thread-owned',
+      receiverThreadIds: ['child-thread'],
+      prompt: 'You are Warden 0.',
+    },
+  });
+  f.emit({
+    method: 'item/completed',
+    params: {
+      threadId: 'child-thread',
+      turnId: 'child-turn',
+      item: { id: 'child-message', type: 'agentMessage', text: 'CHILD ANSWER' },
+    },
+  });
+  f.emit({
+    method: 'turn/completed',
+    params: {
+      threadId: 'child-thread',
+      turn: { id: 'child-turn', status: 'completed', items: [], error: null },
+    },
+  });
+  f.text('PARENT ANSWER');
+  f.terminal();
+  const result = await pending;
+  expect(result.content).toBe('PARENT ANSWER');
+  const spawn = result.events.find((e) => e.kind === 'subagent');
+  expect(spawn?.subagent).toEqual({
+    phase: 'started',
+    taskId: 'child-thread',
+    toolUseId: 'spawn-call',
+    agentType: 'spawnAgent',
+    depth: 1,
+    backgrounded: true,
+    prompt: 'You are Warden 0.',
+  });
+  const child = f.session.events.filter((e) => e.parentToolUseId === 'spawn-call');
+  expect(child.map((e) => [e.kind, e.unattributedReason, e.threadId])).toEqual([
+    ['text', 'subagent', 'child-thread'],
+    ['subagent', 'subagent', 'child-thread'],
+  ]);
+  expect(child[0]!.text).toBe('CHILD ANSWER');
+  expect(child[1]!.subagent).toMatchObject({ phase: 'updated', status: 'completed' });
+});

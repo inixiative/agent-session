@@ -63,8 +63,11 @@ export class TurnState {
   record(event: SessionEvent): SessionEvent {
     const e = retainEvidence({ ...this.identity, ...event, admissionId: this.admissionId });
     this.events.push(e);
-    if ((e.kind === 'text' || e.kind === 'result') && e.text) this.content = e.text;
-    if (e.kind === 'text_delta' && e.text) this.content += e.text;
+    // A subagent's text is its own; the parent turn's content is only the parent's.
+    if (!e.parentToolUseId) {
+      if ((e.kind === 'text' || e.kind === 'result') && e.text) this.content = e.text;
+      if (e.kind === 'text_delta' && e.text) this.content += e.text;
+    }
     // Usage events are per-request snapshots; the terminal result carries the turn total.
     if (e.tokens && e.kind !== 'usage') this.tokens = e.tokens;
     return e;

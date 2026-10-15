@@ -57,6 +57,7 @@ import type {
   SessionResult,
   SessionSendOptions,
   SessionTokens,
+  SubagentLifecycle,
   ToolDecision,
   ToolGate,
   ToolRequest,
@@ -1107,7 +1108,25 @@ export class ClaudeCodeSession implements HarnessSession {
     const turn = this._inflight;
     if (!turn) {
       if (terminalKey) this._seenTerminals.add(terminalKey);
-      this._unattributed(raw, 'no-admission');
+      // A background subagent keeps working between turns: its frames and lifecycle still reach
+      // handlers, tagged, with no admission.
+      const subagent =
+        typeof raw.parent_tool_use_id === 'string' || isClaudeTaskFrame(raw)
+          ? this._classify(raw)
+          : [];
+      if (!subagent.length) {
+        this._unattributed(raw, 'no-admission');
+        return;
+      }
+      const message = raw.message as Record<string, unknown> | undefined;
+      for (const event of subagent)
+        this._emit({
+          ...event,
+          correlation: 'unknown',
+          unattributedReason: 'no-admission',
+          nativeSessionId: typeof raw.session_id === 'string' ? raw.session_id : undefined,
+          messageId: typeof message?.id === 'string' ? message.id : undefined,
+        });
       return;
     }
     const a = turn.evidence;
@@ -1378,6 +1397,19 @@ export class ClaudeCodeSession implements HarnessSession {
     const ts = Date.now();
 
     const type = msg.type as string | undefined;
+    const parentToolUseId =
+      typeof msg.parent_tool_use_id === 'string' && msg.parent_tool_use_id
+        ? msg.parent_tool_use_id
+        : undefined;
+    if (parentToolUseId)
+      return this._classify({ ...msg, parent_tool_use_id: null }).map((event) => ({
+        ...event,
+        parentToolUseId,
+      }));
+    if (isClaudeTaskFrame(msg)) {
+      const subagent = claudeSubagentLifecycle(msg);
+      return subagent ? [{ kind: 'subagent', timestamp: ts, subagent, raw: msg }] : [];
+    }
 
     if (type === 'assistant') {
       const message = msg.message as Record<string, unknown> | undefined;
@@ -1557,4 +1589,40 @@ function processAlive(pid: number): boolean {
     // EPERM: it exists under another user.
     return (error as NodeJS.ErrnoException).code === 'EPERM';
   }
+}
+
+const CLAUDE_TASK_PHASES: Readonly<Record<string, SubagentLifecycle['phase']>> = {
+  task_started: 'started',
+  task_progress: 'progress',
+  task_updated: 'updated',
+  task_notification: 'ended',
+};
+
+/** A Claude Code `system` task frame: a subagent started, progressed, changed or ended. */
+function isClaudeTaskFrame(msg: Record<string, unknown>): boolean {
+  return (
+    msg.type === 'system' && typeof msg.subtype === 'string' && msg.subtype in CLAUDE_TASK_PHASES
+  );
+}
+
+function claudeSubagentLifecycle(msg: Record<string, unknown>): SubagentLifecycle | undefined {
+  const text = (value: unknown) => (typeof value === 'string' && value ? value : undefined);
+  const taskId = text(msg.task_id);
+  const phase = CLAUDE_TASK_PHASES[String(msg.subtype)];
+  if (!taskId || !phase) return undefined;
+  const patch =
+    msg.patch && typeof msg.patch === 'object' ? (msg.patch as Record<string, unknown>) : undefined;
+  const status = text(msg.status) ?? text(patch?.status);
+  return {
+    phase,
+    taskId,
+    ...(text(msg.tool_use_id) ? { toolUseId: text(msg.tool_use_id) } : {}),
+    ...(text(msg.subagent_type) ? { agentType: text(msg.subagent_type) } : {}),
+    ...(text(msg.description) ? { description: text(msg.description) } : {}),
+    ...(typeof msg.spawn_depth === 'number' ? { depth: msg.spawn_depth } : {}),
+    ...(typeof msg.is_backgrounded === 'boolean' ? { backgrounded: msg.is_backgrounded } : {}),
+    ...(status ? { status } : {}),
+    ...(text(msg.summary) ? { summary: text(msg.summary) } : {}),
+    ...(text(msg.prompt) ? { prompt: text(msg.prompt) } : {}),
+  };
 }

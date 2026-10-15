@@ -92,7 +92,30 @@ export type SessionEventKind =
   | 'usage'
   | 'rate_limit'
   | 'result'
-  | 'error';
+  | 'error'
+  | 'subagent';
+
+/**
+ * A subagent's lifecycle as the native runtime reports it (kind `subagent`). Claude Code: its
+ * `system` task frames for an Agent/Task call. Codex: a collab `spawnAgent` item and its child thread.
+ */
+export interface SubagentLifecycle {
+  readonly phase: 'started' | 'progress' | 'updated' | 'ended';
+  /** The native id of the subagent run (Claude task id, Codex child thread id). */
+  readonly taskId: string;
+  /** The tool call that spawned it, in its parent's stream. */
+  readonly toolUseId?: string;
+  readonly agentType?: string;
+  readonly description?: string;
+  /** 1 for a child of the main thread. */
+  readonly depth?: number;
+  readonly backgrounded?: boolean;
+  /** The native status at the end (completed, stopped, failed, killed). */
+  readonly status?: string;
+  readonly summary?: string;
+  /** The task the subagent was given. */
+  readonly prompt?: string;
+}
 
 /** Input excludes cache reads/writes when those disjoint counters are supplied.
  * Thinking is a subset of output; TTL counters are subsets of cacheWrite.
@@ -130,7 +153,8 @@ export interface SessionEvent extends SessionIdentity {
     | 'duplicate-tool'
     | 'unmatched-tool'
     | 'malformed-tool'
-    | 'account-status';
+    | 'account-status'
+    | 'subagent';
   /** Local transport observation, not a native terminal acknowledgment. */
   readonly transportOutcome?: SessionAttempt['transportOutcome'];
   readonly nativeOutcome?: NativeOutcome;
@@ -174,6 +198,13 @@ export interface SessionEvent extends SessionIdentity {
   readonly limits?: LimitSnapshot;
   /** Owned, deeply frozen native JSON data (for Oracle introspection). */
   readonly raw?: unknown;
+  /**
+   * The tool call (in its parent's stream) that spawned the subagent this event came from; absent
+   * for the main thread's own events. A subagent's text never becomes its parent turn's content.
+   */
+  readonly parentToolUseId?: string;
+  /** A subagent's lifecycle (kind `subagent`). */
+  readonly subagent?: SubagentLifecycle;
 }
 
 /** Result of a single send() — the turn's content plus all classified events. */

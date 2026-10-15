@@ -114,6 +114,22 @@ session.onToolRequest(async (call) => {
   A turn timeout does not withdraw a pending Claude ask; `interruptNative()` does.
 - A fork starts with a snapshot of the parent's gates.
 
+## Subagents
+
+A subagent's activity reaches `onEvent` tagged, never mixed into its parent's turn:
+
+- `parentToolUseId` names the parent's tool call that spawned it (Claude: the
+  frame's `parent_tool_use_id`; Codex: the collab `spawnAgent` item). A
+  subagent's text never becomes the parent turn's `content`.
+- `kind: "subagent"` carries its lifecycle (`subagent.phase`: started,
+  progress, updated, ended; `taskId`, `toolUseId`, `agentType`, `depth`,
+  `backgrounded`, `status`, `summary`, `prompt`). Claude: its `system` task
+  frames. Codex: the spawn, then each child turn's end.
+- A background subagent working between turns has no admission: its events
+  arrive with `unattributedReason: "no-admission"` (Claude) or `"subagent"`
+  (a Codex child thread). Codex child threads carry their final messages as
+  text; their other items stay diagnostics.
+
 ## Primed decision sessions
 
 One live, warm session per middleware role, primed once with its role
