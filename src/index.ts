@@ -13,9 +13,19 @@ export {
 // Claude Code adapter (persistent stream-json session, subscription auth).
 export {
   CLAUDE_TEXT_ONLY_ARGS,
+  type ClaudeAgentDefinition,
   ClaudeCodeSession,
   type ClaudeCodeSessionConfig,
+  type ClaudeSessionExtension,
+  type ClaudeSessionHost,
 } from './claude-code-session';
+export {
+  type ClaudeInSessionConfig,
+  ClaudeInSessionDecisions,
+  IN_SESSION_AGENTS,
+  IN_SESSION_SERVER,
+  type InSessionSetup,
+} from './claude-in-session';
 export { type ClaudePrimedConfig, ClaudePrimedSessions } from './claude-primed';
 export { type ClaudeSubagentConfig, ClaudeSubagentSessions } from './claude-subagents';
 export { parseClaudeUsage } from './claude-usage';

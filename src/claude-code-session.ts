@@ -144,6 +144,66 @@ export interface ClaudeCodeSessionConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Extension: work a host runs inside this session's own process (ClaudeInSessionDecisions)
+// ---------------------------------------------------------------------------
+
+/** A custom agent definition (`--agents`), as Claude Code reads it. */
+export interface ClaudeAgentDefinition {
+  readonly description: string;
+  readonly prompt: string;
+  readonly tools: readonly string[];
+  readonly model?: string;
+  readonly effort?: string;
+  readonly permissionMode?: string;
+  readonly omitClaudeMd?: boolean;
+  readonly background?: boolean;
+}
+
+/** What the session offers an extension once its process is up. */
+export interface ClaudeSessionHost {
+  /** A control request to the CLI (e.g. `stop_task`). */
+  control(request: Record<string, unknown>, timeoutMs: number): Promise<Record<string, unknown>>;
+  /** Answer an MCP message the extension was handed. */
+  mcpReply(requestId: string, message: unknown): void;
+  /**
+   * A turn of the extension's own, never a caller's: queued like any send, and nothing of it is
+   * attributed to a caller's admission. No deadline: its native outcome must settle.
+   */
+  sendInternal(message: string): Promise<SessionResult>;
+  alive(): boolean;
+}
+
+/**
+ * Work that runs inside this session's process (agents, an SDK MCP server, a PreToolUse claim on
+ * its own tool calls), never through vendor hook files. Attached before `start()`.
+ */
+export interface ClaudeSessionExtension {
+  /** Agent definitions added to the launch. */
+  readonly agents: Readonly<Record<string, ClaudeAgentDefinition>>;
+  /** SDK MCP servers it answers (declared in `initialize`). */
+  readonly mcpServers: readonly string[];
+  /** Environment its agents need on the launch (merged over the session's own). */
+  readonly env?: Readonly<Record<string, string>>;
+  /** The process runs (before `initialize`): it may answer MCP messages from now on. */
+  attach(host: ClaudeSessionHost): void;
+  /** `initialize` was answered: it may write turns and control requests. */
+  started(): void;
+  /** An MCP message for one of its servers; answered through `host.mcpReply`. */
+  mcp(server: string, requestId: string, message: Record<string, unknown>): void;
+  /**
+   * A PreToolUse callback: the hook output when the call is its own (its agents' calls, a spawn of
+   * one of its agent types), else undefined and the tool gate decides.
+   */
+  preToolUse(input: Record<string, unknown>): Record<string, unknown> | undefined;
+  /** A permission ask (`can_use_tool`): its answer when the asking agent is its own, else undefined. */
+  permission(request: Record<string, unknown>): Record<string, unknown> | undefined;
+  /** A native frame: true when it is its own (never emitted, never part of an admission). */
+  frame(raw: Record<string, unknown>): boolean;
+  /** The process ended or was killed. */
+  detach(reason: string): void;
+}
+
+// ---------------------------------------------------------------------------
 // Internal turn queue entry
 // ---------------------------------------------------------------------------
 
@@ -273,6 +333,9 @@ export class ClaudeCodeSession implements HarnessSession {
   private _persistSession: boolean;
   private _toolGate: boolean;
   private _gates = new ToolGates();
+  private _extension?: ClaudeSessionExtension;
+  /** The private directory holding the extension's agent definitions while a process runs. */
+  private _agentsDir?: string;
   /** Inbound control requests awaiting a gate decision, by request id. */
   private _inbound = new Map<string, AbortController>();
   private readonly _hookCallbackId = `agent-session-pre-tool-${crypto.randomUUID()}`;
@@ -410,6 +473,17 @@ export class ClaudeCodeSession implements HarnessSession {
     return this._gates.add(gate);
   }
 
+  /**
+   * Run an extension inside this session's process (ClaudeInSessionDecisions). Before `start()`
+   * only, once, and never on a text-only session (it needs tools and an MCP server).
+   */
+  extend(extension: ClaudeSessionExtension): void {
+    if (this._proc) throw new Error('Extensions attach before start()');
+    if (this._extension) throw new Error('Session already has an extension');
+    if (this._textOnly) throw new Error('A text-only session cannot host an extension');
+    this._extension = extension;
+  }
+
   onBeforeSend(hook: BeforeSendHook): () => void {
     this._beforeSendHooks.push(hook);
     return () => {
@@ -451,6 +525,7 @@ export class ClaudeCodeSession implements HarnessSession {
     const env: Record<string, string | undefined> = {
       ...process.env,
       ...this._env,
+      ...this._extension?.env,
       DISABLE_AUTOUPDATER: '1',
     };
     delete env.ANTHROPIC_API_KEY;
@@ -471,6 +546,7 @@ export class ClaudeCodeSession implements HarnessSession {
       }
     } catch (error) {
       this._removeBaseContext();
+      this._removeAgents();
       throw error;
     }
 
@@ -486,9 +562,13 @@ export class ClaudeCodeSession implements HarnessSession {
     // Monitor process exit for cleanup
     // The process read its base context file at startup; it goes when the process does.
     const baseDir = this._baseContextDir;
+    const agentsDir = this._agentsDir;
     proc.exited.then(async (code) => {
       this._removeBaseContext(baseDir);
-      if (this._proc !== proc || !this._alive) return;
+      this._removeAgents(agentsDir);
+      if (this._proc !== proc) return;
+      this._detachExtension('process exited');
+      if (!this._alive) return;
       this._alive = false;
       await stdoutDone; // Drain buffered terminal evidence before interpreting process exit.
       const errMsg = this._stderr.trim()
@@ -501,19 +581,57 @@ export class ClaudeCodeSession implements HarnessSession {
     });
 
     // The PreToolUse callback is registered before any turn is written, so it covers the first call.
-    if (this._toolGate) {
+    // An extension's agents run their own tools: it claims them through the same callback.
+    const extension = this._extension;
+    // The extension can answer from the moment the process runs: the CLI connects its SDK MCP
+    // server while `initialize` is still in flight, and an unanswered connect costs a 30 s retry.
+    if (extension)
+      extension.attach({
+        control: (request, timeoutMs) => this._controlRequest(request, timeoutMs),
+        mcpReply: (requestId, message) => {
+          if (this._proc === proc && this._alive)
+            this._writeControlResponse(proc, requestId, { mcp_response: message });
+        },
+        sendInternal: (message) => this.send(message, { timeout: 0 }),
+        alive: () => this._proc === proc && this._alive,
+      });
+    if (this._toolGate || extension) {
       try {
         await this._controlRequest(
           {
             subtype: 'initialize',
             hooks: { PreToolUse: [{ matcher: '.*', hookCallbackIds: [this._hookCallbackId] }] },
+            ...(extension
+              ? {
+                  sdkMcpServers: [...extension.mcpServers],
+                  // The user's Stop aborts the turn only; background agents (the extension's) survive.
+                  perTaskStopAffordance: true,
+                }
+              : {}),
           },
           30_000,
         );
       } catch (error) {
         this.kill();
-        throw new Error(`Tool gate registration failed: ${(error as Error).message}`);
+        throw new Error(
+          `${this._toolGate ? 'Tool gate' : 'Extension'} registration failed: ${(error as Error).message}`,
+        );
       }
+    }
+    if (extension && this._proc === proc && this._alive) {
+      try {
+        extension.started();
+      } catch {
+        /* an extension's failure never touches the session */
+      }
+    }
+  }
+
+  private _detachExtension(reason: string): void {
+    try {
+      this._extension?.detach(reason);
+    } catch {
+      /* an extension's failure never touches the session */
     }
   }
 
@@ -752,6 +870,8 @@ export class ClaudeCodeSession implements HarnessSession {
     }
     this._proc = null;
     this._removeBaseContext();
+    this._removeAgents();
+    this._detachExtension('killed');
 
     this._emit({ kind: 'session_end', timestamp: Date.now() });
   }
@@ -1007,6 +1127,8 @@ export class ClaudeCodeSession implements HarnessSession {
     if (raw.type === 'control_request') {
       const id = typeof raw.request_id === 'string' ? raw.request_id : undefined;
       const request = raw.request as Record<string, unknown> | undefined;
+      if (id && this._proc && this._extension && this._extensionRequest(this._proc, id, request))
+        return;
       const toolRequest =
         id && this._toolGate && this._proc ? this._toolRequestFrom(request) : undefined;
       if (id && toolRequest) {
@@ -1105,6 +1227,17 @@ export class ClaudeCodeSession implements HarnessSession {
       if (snapshot) this._observeLimits(snapshot);
       else this._unattributed(raw, 'account-status');
       return;
+    }
+
+    // An extension's own agents (their frames and task lifecycle) are its alone.
+    if (this._extension) {
+      let own = false;
+      try {
+        own = this._extension.frame(raw);
+      } catch {
+        /* an extension's failure never touches the session */
+      }
+      if (own) return;
     }
 
     // A subagent's frames and lifecycle are never part of an admission, whichever turn is in flight
@@ -1258,6 +1391,52 @@ export class ClaudeCodeSession implements HarnessSession {
     };
   }
 
+  /**
+   * A control request the extension answers: an MCP message for its servers, or a PreToolUse
+   * callback / permission ask that belongs to its agents or spawns one of its agent types. With no
+   * tool gate, our callback's other calls get no opinion (the session's permission mode decides).
+   */
+  private _extensionRequest(
+    proc: PipedSubprocess,
+    id: string,
+    request: Record<string, unknown> | undefined,
+  ): boolean {
+    const extension = this._extension!;
+    try {
+      if (
+        request?.subtype === 'mcp_message' &&
+        typeof request.server_name === 'string' &&
+        extension.mcpServers.includes(request.server_name)
+      ) {
+        extension.mcp(request.server_name, id, (request.message ?? {}) as Record<string, unknown>);
+        return true;
+      }
+      if (this._ownHookCallback(request)) {
+        const input = request!.input as Record<string, unknown> | undefined;
+        const output = input ? extension.preToolUse(input) : undefined;
+        if (output) {
+          this._writeControlResponse(proc, id, { hookSpecificOutput: output });
+          return true;
+        }
+        if (!this._toolGate) {
+          this._writeControlResponse(proc, id, {});
+          return true;
+        }
+        return false;
+      }
+      if (request?.subtype === 'can_use_tool') {
+        const answer = extension.permission(request);
+        if (answer) {
+          this._writeControlResponse(proc, id, answer);
+          return true;
+        }
+      }
+    } catch {
+      /* an extension's failure falls through to the session's own handling */
+    }
+    return false;
+  }
+
   private _ownHookCallback(request: Record<string, unknown> | undefined): boolean {
     return request?.subtype === 'hook_callback' && request.callback_id === this._hookCallbackId;
   }
@@ -1376,8 +1555,24 @@ export class ClaudeCodeSession implements HarnessSession {
     if (this._baseContext) {
       args.push('--append-system-prompt-file', this._writeBaseContext(this._baseContext));
     }
+    // An extension's agents, from a private file; its MCP servers are declared in `initialize`.
+    if (this._extension) args.push('--agents', this._writeAgents(this._extension.agents));
 
     return args;
+  }
+
+  private _writeAgents(agents: ClaudeSessionExtension['agents']): string {
+    this._removeAgents();
+    this._agentsDir = mkdtempSync(join(tmpdir(), `${BASE_CONTEXT_PREFIX}${process.pid}-agents-`));
+    const file = join(this._agentsDir, 'agents.json');
+    writeFileSync(file, JSON.stringify(agents), { mode: 0o600 });
+    return file;
+  }
+
+  private _removeAgents(dir = this._agentsDir): void {
+    if (!dir) return;
+    rmSync(dir, { recursive: true, force: true });
+    if (dir === this._agentsDir) this._agentsDir = undefined;
   }
 
   /** The base context as a private file: argv carries its path, never its text. */
