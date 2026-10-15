@@ -164,6 +164,47 @@ a pre-spawned spare. Measured on a ChatGPT login: warm Codex decisions 2.45 s
 median vs 3.9 s for `codex exec` per decision, with 34% fewer input tokens; warm
 Claude (haiku) decisions 1.95 s with the whole primed prefix read from cache.
 
+### In the main session's own process (Claude)
+
+`ClaudeInSessionDecisions` holds decision roles as subagents of a main
+`ClaudeCodeSession`, so a thread and all its decision roles are one process:
+
+```ts
+const decisions = new ClaudeInSessionDecisions({ model: "claude-haiku-5-5", effort: "low" });
+const session = new ClaudeCodeSession({ model: "claude-opus-5-5", cwd, toolGate: true });
+session.extend(decisions); // before start(): agents, an SDK MCP server, a PreToolUse claim
+await session.start();     // one internal setup turn starts the root agent
+decisions.prestart(threadId, roles.map((spec) => ({ spec, standby })));
+await decisions.ready();
+const result = await decisions.decide(spec, { input, standby });
+```
+
+- **Shape.** The setup turn asks the main model to start `foundry-root` in the
+  background. The root never ends: it starts dispatcher generations
+  (`foundry-dispatch`), which start members (`foundry-warden`), all in the
+  background, through a `next` tool the host holds open. A member holds the
+  host's `moment` tool until a decision answers it, and answers through
+  `answer`. After setup, no member activity needs a main-model turn.
+- **Pinned input.** Every spawn passes the session's PreToolUse callback,
+  which replaces its prompt with the composed text, so agent definitions are
+  generic and an edited role reaches the next spare without a relaunch.
+  Spawns of these agent types from anywhere else are denied; the main agent's
+  own subagents go to the tool gate untouched.
+- **Fresh per call.** Each member serves one decision. A used one is replaced
+  at once; a role with no held spare starts a member with its input inline.
+- **Recycle.** A dispatcher's context grows ~700 tokens per member started;
+  past `recycleTokens` (100k) a new generation takes over and the old one
+  ends into the root once empty.
+- **Orphans.** A nested agent whose parent ended reports its own end to the
+  main thread, which wakes the main model (Claude Code 2.1.300). Members of a
+  dispatcher that ended unasked are therefore never retired or stopped, and an
+  orphan's `answer` call is held for the session's life. Past `maxOrphans`
+  (40) the host stops serving and its caller falls back.
+- **Limits.** Claude Code runs 20 subagents at once by default; the launch
+  raises `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS` (`maxSubagents`, 96). The
+  session declares `perTaskStopAffordance`, so the user's Stop spares
+  background agents.
+
 ## Pools, routing and continuity
 
 ```ts
