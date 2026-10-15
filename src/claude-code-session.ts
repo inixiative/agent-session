@@ -57,6 +57,7 @@ import type {
   SessionResult,
   SessionSendOptions,
   SessionTokens,
+  SubagentLifecycle,
   ToolDecision,
   ToolGate,
   ToolRequest,
@@ -314,6 +315,8 @@ export class ClaudeCodeSession implements HarnessSession {
    * are distinct compactions.
    */
   private _seenBoundaries = new Set<string>();
+  /** Task ids whose task_started was a subagent (local_agent); later task frames carry no type. */
+  private _agentTasks = new Set<string>();
 
   // -- Turn queue --
   private _queue: QueuedTurn[] = [];
@@ -1104,6 +1107,34 @@ export class ClaudeCodeSession implements HarnessSession {
       return;
     }
 
+    // A subagent's frames and lifecycle are never part of an admission, whichever turn is in flight
+    // (a background subagent outlives the turn that started it): they reach handlers tagged
+    // `subagent`, with the spawning call in `parentToolUseId`.
+    const parentToolUseId =
+      typeof raw.parent_tool_use_id === 'string' && raw.parent_tool_use_id
+        ? raw.parent_tool_use_id
+        : undefined;
+    const lifecycle = this._subagentLifecycle(raw);
+    if (parentToolUseId || lifecycle) {
+      const message = raw.message as Record<string, unknown> | undefined;
+      const events: SessionEvent[] = lifecycle
+        ? [{ kind: 'subagent', timestamp: Date.now(), subagent: lifecycle, raw }]
+        : this._classify(raw, parentToolUseId);
+      if (!events.length) {
+        this._unattributed(raw, 'subagent');
+        return;
+      }
+      for (const event of events)
+        this._emit({
+          ...event,
+          correlation: 'unknown',
+          unattributedReason: 'subagent',
+          nativeSessionId: typeof raw.session_id === 'string' ? raw.session_id : undefined,
+          messageId: typeof message?.id === 'string' ? message.id : undefined,
+        });
+      return;
+    }
+
     const turn = this._inflight;
     if (!turn) {
       if (terminalKey) this._seenTerminals.add(terminalKey);
@@ -1373,7 +1404,34 @@ export class ClaudeCodeSession implements HarnessSession {
   // Private — event classification
   // ---------------------------------------------------------------------------
 
-  private _classify(msg: Record<string, unknown>): SessionEvent[] {
+  /**
+   * A Claude Code `system` task frame for a subagent (`task_type: local_agent`), as lifecycle. Other
+   * task types (a background shell, a monitor, a workflow) are not subagents and return nothing.
+   * Later phases carry no task type, so the session remembers which task ids are subagents.
+   */
+  private _subagentLifecycle(msg: Record<string, unknown>): SubagentLifecycle | undefined {
+    if (msg.type !== 'system' || typeof msg.subtype !== 'string') return undefined;
+    const phase = CLAUDE_TASK_PHASES[msg.subtype];
+    const taskId = typeof msg.task_id === 'string' && msg.task_id ? msg.task_id : undefined;
+    if (!phase || !taskId) return undefined;
+    if (phase === 'started') {
+      const agent =
+        msg.task_type === 'local_agent' ||
+        (msg.task_type === undefined && typeof msg.subagent_type === 'string');
+      if (!agent) return undefined;
+      this._agentTasks.add(taskId);
+    } else if (!this._agentTasks.has(taskId)) return undefined;
+    if (phase === 'ended') this._agentTasks.delete(taskId);
+    return claudeSubagentLifecycle(msg, phase, taskId);
+  }
+
+  private _classify(msg: Record<string, unknown>, parentToolUseId?: string): SessionEvent[] {
+    return this._classifyFrame(msg).map((event) =>
+      parentToolUseId ? { ...event, parentToolUseId } : event,
+    );
+  }
+
+  private _classifyFrame(msg: Record<string, unknown>): SessionEvent[] {
     const events: SessionEvent[] = [];
     const ts = Date.now();
 
@@ -1557,4 +1615,52 @@ function processAlive(pid: number): boolean {
     // EPERM: it exists under another user.
     return (error as NodeJS.ErrnoException).code === 'EPERM';
   }
+}
+
+const CLAUDE_TASK_PHASES: Readonly<Record<string, SubagentLifecycle['phase']>> = {
+  task_started: 'started',
+  task_progress: 'progress',
+  task_updated: 'updated',
+  task_notification: 'ended',
+};
+
+function claudeSubagentLifecycle(
+  msg: Record<string, unknown>,
+  phase: SubagentLifecycle['phase'],
+  taskId: string,
+): SubagentLifecycle {
+  const text = (value: unknown) => (typeof value === 'string' && value ? value : undefined);
+  const record = (value: unknown) =>
+    value && typeof value === 'object' && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : undefined;
+  const patch = record(msg.patch);
+  const usage = record(msg.usage);
+  const status = text(msg.status) ?? text(patch?.status);
+  const count = (value: unknown) =>
+    typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+  return {
+    phase,
+    taskId,
+    ...(text(msg.tool_use_id) ? { toolUseId: text(msg.tool_use_id) } : {}),
+    ...(text(msg.parent_task_id) ? { parentTaskId: text(msg.parent_task_id) } : {}),
+    ...(text(msg.subagent_type) ? { agentType: text(msg.subagent_type) } : {}),
+    ...(text(msg.description) ? { description: text(msg.description) } : {}),
+    ...(typeof msg.spawn_depth === 'number' ? { depth: msg.spawn_depth } : {}),
+    ...(typeof msg.is_backgrounded === 'boolean' ? { backgrounded: msg.is_backgrounded } : {}),
+    ...(status ? { status } : {}),
+    ...(text(msg.summary) ? { summary: text(msg.summary) } : {}),
+    ...(text(msg.prompt) ? { prompt: text(msg.prompt) } : {}),
+    ...(usage && count(usage.total_tokens) !== undefined
+      ? {
+          usage: {
+            totalTokens: count(usage.total_tokens)!,
+            ...(count(usage.tool_uses) !== undefined ? { toolUses: count(usage.tool_uses) } : {}),
+            ...(count(usage.duration_ms) !== undefined
+              ? { durationMs: count(usage.duration_ms) }
+              : {}),
+          },
+        }
+      : {}),
+  };
 }

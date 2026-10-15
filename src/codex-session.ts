@@ -944,6 +944,8 @@ export class CodexAppServerSession implements HarnessSession {
   private _approvals = new Map<string, AbortController>();
   /** The owned turn's in-progress fileChange items' changes, by item id, for their approvals. */
   private _fileChanges = new Map<string, readonly CodexFileChange[]>();
+  /** Child threads this session's turns spawned (collab `spawnAgent`), to the spawning item's id. */
+  private _children = new Map<string, string>();
   private _items = new Map<
     string,
     {
@@ -1266,6 +1268,8 @@ export class CodexAppServerSession implements HarnessSession {
           thread.turns.some((value) => !this._turn(value)))
       )
         this._refuse('configuration-missing-or-incompatible');
+      // Sub-agents belong to the thread that spawned them.
+      if (this._externalSessionId !== id) this._children.clear();
       this._externalSessionId = id;
       this._nativeSessionId =
         typeof thread?.sessionId === 'string' && thread.sessionId ? thread.sessionId : undefined;
@@ -1430,6 +1434,9 @@ export class CodexAppServerSession implements HarnessSession {
       },
     ];
     const a = this._inflight?.evidence;
+    const spawnedBy = threadId ? this._children.get(threadId) : undefined;
+    if (threadId && spawnedBy)
+      return this._childEvents(method, threadId, spawnedBy, turn, item, unowned);
     if (!threadId || threadId !== this._externalSessionId) return unowned('foreign-session');
     if (!a || this._appAdmission !== a.admissionId) return unowned('no-admission');
     if (turnId && this._seenTerminals.has(turnId))
@@ -1518,6 +1525,50 @@ export class CodexAppServerSession implements HarnessSession {
         if (method === 'item/started') this._fileChanges.set(itemId, fileChanges(item.changes));
         else this._fileChanges.delete(itemId);
         return unowned('unrecognized-event');
+      }
+      if (item.type === 'collabAgentToolCall') {
+        // A sub-agent this turn spawned (its thread is named once known, on start or completion),
+        // or closed. Other collab calls (send input, wait) are diagnostics.
+        const receivers = Array.isArray(item.receiverThreadIds)
+          ? item.receiverThreadIds.filter((id): id is string => typeof id === 'string' && !!id)
+          : [];
+        const prompt = typeof item.prompt === 'string' && item.prompt ? item.prompt : undefined;
+        if (item.tool === 'spawnAgent') {
+          const fresh = receivers.filter((child) => !this._children.has(child));
+          if (!fresh.length) return status();
+          return fresh.map((child): SessionEvent => {
+            this._children.set(child, itemId);
+            return {
+              ...identity,
+              kind: 'subagent',
+              timestamp: Date.now(),
+              subagent: {
+                phase: 'started',
+                taskId: child,
+                toolUseId: itemId,
+                agentType: 'spawnAgent',
+                depth: 1,
+                backgrounded: true,
+                ...(prompt ? { prompt } : {}),
+              },
+            };
+          });
+        }
+        if (item.tool === 'closeAgent' && method === 'item/completed') {
+          const closed = receivers.filter((child) => this._children.has(child));
+          if (!closed.length) return status();
+          return closed.map((child): SessionEvent => {
+            const toolUseId = this._children.get(child)!;
+            this._children.delete(child);
+            return {
+              ...identity,
+              kind: 'subagent',
+              timestamp: Date.now(),
+              subagent: { phase: 'ended', taskId: child, toolUseId, status: 'closed' },
+            };
+          });
+        }
+        return status();
       }
       if (item.type === 'agentMessage') {
         if (method !== 'item/completed') return status();
@@ -1637,6 +1688,43 @@ export class CodexAppServerSession implements HarnessSession {
       return unowned('unrecognized-event');
     }
     return method === 'turn/started' ? status() : unowned('unrecognized-event');
+  }
+
+  /**
+   * A spawned sub-agent's thread, outside any admission of this session: its final messages as
+   * text and its turns' ends as lifecycle, tagged with the spawning item. Anything else stays a
+   * diagnostic, tagged the same way.
+   */
+  private _childEvents(
+    method: string,
+    threadId: string,
+    spawnedBy: string,
+    turn: { id: string; status: string; error?: unknown } | undefined,
+    item: Record<string, unknown> | undefined,
+    unowned: (reason: NonNullable<SessionEvent['unattributedReason']>) => SessionEvent[],
+  ): SessionEvent[] {
+    const tag = { parentToolUseId: spawnedBy, unattributedReason: 'subagent' as const };
+    const base = { threadId, correlation: 'unknown' as const, timestamp: Date.now(), ...tag };
+    if (
+      method === 'item/completed' &&
+      item?.type === 'agentMessage' &&
+      typeof item.text === 'string'
+    )
+      return [{ ...base, kind: 'text', text: item.text }];
+    if (method === 'turn/completed' && turn && turn.status !== 'inProgress')
+      return [
+        {
+          ...base,
+          kind: 'subagent',
+          subagent: {
+            phase: 'updated',
+            taskId: threadId,
+            toolUseId: spawnedBy,
+            status: turn.status,
+          },
+        },
+      ];
+    return unowned('subagent').map((event) => ({ ...event, ...tag }));
   }
 }
 
