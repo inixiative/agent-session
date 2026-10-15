@@ -105,6 +105,8 @@ export interface SubagentLifecycle {
   readonly taskId: string;
   /** The tool call that spawned it, in its parent's stream. */
   readonly toolUseId?: string;
+  /** The task that spawned it, when a subagent spawned it (Claude). */
+  readonly parentTaskId?: string;
   readonly agentType?: string;
   readonly description?: string;
   /** 1 for a child of the main thread. */
@@ -115,6 +117,12 @@ export interface SubagentLifecycle {
   readonly summary?: string;
   /** The task the subagent was given. */
   readonly prompt?: string;
+  /** Its own running totals, when the runtime reports them (Claude progress and end frames). */
+  readonly usage?: {
+    readonly totalTokens: number;
+    readonly toolUses?: number;
+    readonly durationMs?: number;
+  };
 }
 
 /** Input excludes cache reads/writes when those disjoint counters are supplied.
@@ -200,7 +208,8 @@ export interface SessionEvent extends SessionIdentity {
   readonly raw?: unknown;
   /**
    * The tool call (in its parent's stream) that spawned the subagent this event came from; absent
-   * for the main thread's own events. A subagent's text never becomes its parent turn's content.
+   * for the main thread's own events. Every subagent event, its lifecycle included, is outside any
+   * admission (`unattributedReason: "subagent"`), so it never touches a turn's content or results.
    */
   readonly parentToolUseId?: string;
   /** A subagent's lifecycle (kind `subagent`). */

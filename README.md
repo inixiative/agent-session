@@ -116,19 +116,27 @@ session.onToolRequest(async (call) => {
 
 ## Subagents
 
-A subagent's activity reaches `onEvent` tagged, never mixed into its parent's turn:
+A subagent's activity reaches `onEvent`, but never becomes part of a turn:
 
-- `parentToolUseId` names the parent's tool call that spawned it (Claude: the
-  frame's `parent_tool_use_id`; Codex: the collab `spawnAgent` item). A
-  subagent's text never becomes the parent turn's `content`.
-- `kind: "subagent"` carries its lifecycle (`subagent.phase`: started,
-  progress, updated, ended; `taskId`, `toolUseId`, `agentType`, `depth`,
-  `backgrounded`, `status`, `summary`, `prompt`). Claude: its `system` task
-  frames. Codex: the spawn, then each child turn's end.
-- A background subagent working between turns has no admission: its events
-  arrive with `unattributedReason: "no-admission"` (Claude) or `"subagent"`
-  (a Codex child thread). Codex child threads carry their final messages as
-  text; their other items stay diagnostics.
+- **Outside every admission.** Every subagent event, lifecycle included,
+  carries `unattributedReason: "subagent"`. It is never in a turn's
+  `result.events` and never its `content`. This holds whichever turn is in
+  flight, because a background subagent outlives the turn that started it.
+- **`parentToolUseId`** names the parent's tool call that spawned it. On
+  Claude this is the frame's `parent_tool_use_id`, with the native envelope
+  kept in `raw`. On Codex it is the collab `spawnAgent` item.
+- **`kind: "subagent"`** carries its lifecycle in `subagent`:
+  - `phase`: started, progress, updated or ended;
+  - identity and shape: `taskId`, `toolUseId`, `parentTaskId`, `agentType`,
+    `depth`, `backgrounded`;
+  - outcome: `status`, `summary`, `prompt`, and running `usage`.
+- **Claude** builds the lifecycle from its `system` task frames for
+  `task_type: "local_agent"`. Background shells, monitors and workflows are
+  tasks too, and they are not reported as subagents.
+- **Codex** reports `started` on the spawn and `ended` on `closeAgent`, plus
+  `updated` (with the turn's status) as each child turn ends. Child threads
+  carry their final messages as text; their other items stay diagnostics.
+  Approval requests from child threads are not routed to gates yet.
 
 ## Primed decision sessions
 

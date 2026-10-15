@@ -1268,6 +1268,8 @@ export class CodexAppServerSession implements HarnessSession {
           thread.turns.some((value) => !this._turn(value)))
       )
         this._refuse('configuration-missing-or-incompatible');
+      // Sub-agents belong to the thread that spawned them.
+      if (this._externalSessionId !== id) this._children.clear();
       this._externalSessionId = id;
       this._nativeSessionId =
         typeof thread?.sessionId === 'string' && thread.sessionId ? thread.sessionId : undefined;
@@ -1525,29 +1527,48 @@ export class CodexAppServerSession implements HarnessSession {
         return unowned('unrecognized-event');
       }
       if (item.type === 'collabAgentToolCall') {
-        // A sub-agent spawned by this turn: its thread is known once the call completes.
-        if (method !== 'item/completed' || item.tool !== 'spawnAgent') return status();
+        // A sub-agent this turn spawned (its thread is named once known, on start or completion),
+        // or closed. Other collab calls (send input, wait) are diagnostics.
         const receivers = Array.isArray(item.receiverThreadIds)
           ? item.receiverThreadIds.filter((id): id is string => typeof id === 'string' && !!id)
           : [];
-        if (!receivers.length) return status();
-        return receivers.map((child): SessionEvent => {
-          this._children.set(child, itemId);
-          return {
-            ...identity,
-            kind: 'subagent',
-            timestamp: Date.now(),
-            subagent: {
-              phase: 'started',
-              taskId: child,
-              toolUseId: itemId,
-              agentType: 'spawnAgent',
-              depth: 1,
-              backgrounded: true,
-              ...(typeof item.prompt === 'string' && item.prompt ? { prompt: item.prompt } : {}),
-            },
-          };
-        });
+        const prompt = typeof item.prompt === 'string' && item.prompt ? item.prompt : undefined;
+        if (item.tool === 'spawnAgent') {
+          const fresh = receivers.filter((child) => !this._children.has(child));
+          if (!fresh.length) return status();
+          return fresh.map((child): SessionEvent => {
+            this._children.set(child, itemId);
+            return {
+              ...identity,
+              kind: 'subagent',
+              timestamp: Date.now(),
+              subagent: {
+                phase: 'started',
+                taskId: child,
+                toolUseId: itemId,
+                agentType: 'spawnAgent',
+                depth: 1,
+                backgrounded: true,
+                ...(prompt ? { prompt } : {}),
+              },
+            };
+          });
+        }
+        if (item.tool === 'closeAgent' && method === 'item/completed') {
+          const closed = receivers.filter((child) => this._children.has(child));
+          if (!closed.length) return status();
+          return closed.map((child): SessionEvent => {
+            const toolUseId = this._children.get(child)!;
+            this._children.delete(child);
+            return {
+              ...identity,
+              kind: 'subagent',
+              timestamp: Date.now(),
+              subagent: { phase: 'ended', taskId: child, toolUseId, status: 'closed' },
+            };
+          });
+        }
+        return status();
       }
       if (item.type === 'agentMessage') {
         if (method !== 'item/completed') return status();

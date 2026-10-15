@@ -48,6 +48,20 @@ const containers = new Set(
   ),
 );
 strings.add('unattributedReason');
+// Subagent frames: their ids, lifecycle and the event kind that carries them.
+for (const key of [
+  'parentToolUseId',
+  'task_id',
+  'taskId',
+  'toolUseId',
+  'parent_task_id',
+  'parentTaskId',
+])
+  idKeys.add(key);
+for (const key of ['task_type', 'subagent_type', 'agentType']) strings.add(key);
+containers.add('subagent');
+for (const tag of ['subagent', 'task_progress', 'task_updated', 'task_notification', 'local_agent'])
+  tags.add(tag);
 for (const label of [
   'no-admission',
   'foreign-session',
@@ -56,6 +70,7 @@ for (const label of [
   'after-terminal',
   'unrecognized-event',
   'unrecognized-terminal',
+  'subagent',
 ])
   labels.add(label);
 for (const key of ['diagnostics', 'observerFailures']) containers.add(key);

@@ -564,25 +564,23 @@ test('app-server owned shell items stream once with IDs; repeated usage snapshot
   expect(f.session.totalTokens).toEqual({ input: 10, output: 2 });
 });
 
-test('app-server sub-agents: a spawn is a subagent event and the child thread is tagged with it, never the parent content', async () => {
+test('app-server sub-agents: a spawn is a subagent event, the child thread is tagged with it, a close ends it', async () => {
   const f = fixture();
   await f.session.start();
   const pending = f.session.send('delegate');
   await tick();
   f.rpc();
   f.begin();
-  f.notify('item/completed', {
-    turnId: 'turn-one',
-    item: {
-      id: 'spawn-call',
-      type: 'collabAgentToolCall',
-      tool: 'spawnAgent',
-      status: 'completed',
-      senderThreadId: 'thread-owned',
-      receiverThreadIds: ['child-thread'],
-      prompt: 'You are Warden 0.',
-    },
-  });
+  const spawn = {
+    id: 'spawn-call',
+    type: 'collabAgentToolCall',
+    tool: 'spawnAgent',
+    senderThreadId: 'thread-owned',
+    receiverThreadIds: ['child-thread'],
+    prompt: 'You are Warden 0.',
+  };
+  // The child thread is named when the call starts: its first frames are already tagged.
+  f.notify('item/started', { turnId: 'turn-one', item: { ...spawn, status: 'inProgress' } });
   f.emit({
     method: 'item/completed',
     params: {
@@ -591,6 +589,7 @@ test('app-server sub-agents: a spawn is a subagent event and the child thread is
       item: { id: 'child-message', type: 'agentMessage', text: 'CHILD ANSWER' },
     },
   });
+  f.notify('item/completed', { turnId: 'turn-one', item: { ...spawn, status: 'completed' } });
   f.emit({
     method: 'turn/completed',
     params: {
@@ -598,20 +597,33 @@ test('app-server sub-agents: a spawn is a subagent event and the child thread is
       turn: { id: 'child-turn', status: 'completed', items: [], error: null },
     },
   });
+  f.notify('item/completed', {
+    turnId: 'turn-one',
+    item: {
+      id: 'close-call',
+      type: 'collabAgentToolCall',
+      tool: 'closeAgent',
+      status: 'completed',
+      receiverThreadIds: ['child-thread'],
+    },
+  });
   f.text('PARENT ANSWER');
   f.terminal();
   const result = await pending;
   expect(result.content).toBe('PARENT ANSWER');
-  const spawn = result.events.find((e) => e.kind === 'subagent');
-  expect(spawn?.subagent).toEqual({
-    phase: 'started',
-    taskId: 'child-thread',
-    toolUseId: 'spawn-call',
-    agentType: 'spawnAgent',
-    depth: 1,
-    backgrounded: true,
-    prompt: 'You are Warden 0.',
-  });
+  const lifecycle = result.events.filter((e) => e.kind === 'subagent').map((e) => e.subagent);
+  expect(lifecycle).toEqual([
+    {
+      phase: 'started',
+      taskId: 'child-thread',
+      toolUseId: 'spawn-call',
+      agentType: 'spawnAgent',
+      depth: 1,
+      backgrounded: true,
+      prompt: 'You are Warden 0.',
+    },
+    { phase: 'ended', taskId: 'child-thread', toolUseId: 'spawn-call', status: 'closed' },
+  ]);
   const child = f.session.events.filter((e) => e.parentToolUseId === 'spawn-call');
   expect(child.map((e) => [e.kind, e.unattributedReason, e.threadId])).toEqual([
     ['text', 'subagent', 'child-thread'],
@@ -619,4 +631,11 @@ test('app-server sub-agents: a spawn is a subagent event and the child thread is
   ]);
   expect(child[0]!.text).toBe('CHILD ANSWER');
   expect(child[1]!.subagent).toMatchObject({ phase: 'updated', status: 'completed' });
+  // A closed child is no longer this session's.
+  f.emit({
+    method: 'item/completed',
+    params: { threadId: 'child-thread', item: { id: 'late', type: 'agentMessage', text: 'LATE' } },
+  });
+  await tick();
+  expect(f.session.events.at(-1)).toMatchObject({ unattributedReason: 'foreign-session' });
 });

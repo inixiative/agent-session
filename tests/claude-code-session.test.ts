@@ -580,10 +580,14 @@ describe('Claude usage telemetry', () => {
     expect(session.totalTokens).toEqual({ input: 0, output: 0 });
   });
 
-  test('subagent frames are tagged with the spawning call and never become the parent content', async () => {
+  test('subagent frames are tagged with the spawning call and never enter the parent turn', async () => {
     const fake = makeFakeProc({ autoReplyOnSend: false });
     const session = makeSession(fake);
     await session.start();
+    const captured: SessionEvent[] = [];
+    session.onEvent((e) => {
+      captured.push(e);
+    });
     const sendPromise = session.send('delegate');
     fake.emit({ type: 'system', subtype: 'init', session_id: 'sub-session' });
     fake.emit({
@@ -597,6 +601,7 @@ describe('Claude usage telemetry', () => {
       type: 'system',
       subtype: 'task_started',
       task_id: 'task-a',
+      task_type: 'local_agent',
       tool_use_id: 'spawn-1',
       description: 'look around',
       subagent_type: 'explorer',
@@ -604,10 +609,32 @@ describe('Claude usage telemetry', () => {
       is_backgrounded: false,
       prompt: 'look',
     });
+    // A background shell is a task too, but not a subagent.
+    fake.emit({
+      type: 'system',
+      subtype: 'task_started',
+      task_id: 'shell-1',
+      task_type: 'local_bash',
+    });
+    fake.emit({
+      type: 'system',
+      subtype: 'task_notification',
+      task_id: 'shell-1',
+      status: 'completed',
+    });
+    fake.emit({
+      type: 'assistant',
+      message: { role: 'assistant', content: [{ type: 'text', text: 'PARENT TEXT' }] },
+    });
+    // The child speaks after the parent's last text, with its own usage.
     fake.emit({
       type: 'assistant',
       parent_tool_use_id: 'spawn-1',
-      message: { role: 'assistant', content: [{ type: 'text', text: 'CHILD TEXT' }] },
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'CHILD TEXT' }],
+        usage: { input_tokens: 3, output_tokens: 1 },
+      },
     });
     fake.emit({
       type: 'system',
@@ -616,48 +643,50 @@ describe('Claude usage telemetry', () => {
       tool_use_id: 'spawn-1',
       status: 'completed',
       summary: 'found it',
-    });
-    fake.emit({
-      type: 'assistant',
-      message: { role: 'assistant', content: [{ type: 'text', text: 'PARENT TEXT' }] },
+      usage: { total_tokens: 1711, tool_uses: 1, duration_ms: 900 },
     });
     fake.emit({
       type: 'result',
       subtype: 'success',
       is_error: false,
-      result: 'PARENT TEXT',
+      result: '',
       session_id: 'sub-session',
     });
     const result = await sendPromise;
     expect(result.content).toBe('PARENT TEXT');
-    const child = result.events.find((e) => e.text === 'CHILD TEXT')!;
-    expect(child).toMatchObject({ kind: 'text', parentToolUseId: 'spawn-1' });
-    const lifecycle = result.events.filter((e) => e.kind === 'subagent').map((e) => e.subagent);
-    expect(lifecycle).toEqual([
-      {
-        phase: 'started',
-        taskId: 'task-a',
-        toolUseId: 'spawn-1',
-        agentType: 'explorer',
-        description: 'look around',
-        depth: 1,
-        backgrounded: false,
-        prompt: 'look',
-      },
-      {
-        phase: 'ended',
-        taskId: 'task-a',
-        toolUseId: 'spawn-1',
-        status: 'completed',
-        summary: 'found it',
-      },
+    // Nothing of the child is part of the turn's evidence.
+    expect(result.events.some((e) => e.parentToolUseId || e.kind === 'subagent')).toBe(false);
+    const child = captured.filter((e) => e.unattributedReason === 'subagent');
+    expect(child.map((e) => [e.kind, e.parentToolUseId])).toEqual([
+      ['subagent', undefined],
+      ['usage', 'spawn-1'],
+      ['text', 'spawn-1'],
+      ['subagent', undefined],
     ]);
-    // A text that arrives before the parent's own is still not the parent's content.
-    const early = result.events.findIndex((e) => e.text === 'CHILD TEXT');
-    expect(early).toBeGreaterThan(-1);
+    // The child's envelope is kept as it arrived.
+    expect((child[1]!.raw as { parent_tool_use_id?: string }).parent_tool_use_id).toBe('spawn-1');
+    expect(child[0]!.subagent).toEqual({
+      phase: 'started',
+      taskId: 'task-a',
+      toolUseId: 'spawn-1',
+      agentType: 'explorer',
+      description: 'look around',
+      depth: 1,
+      backgrounded: false,
+      prompt: 'look',
+    });
+    expect(child[3]!.subagent).toEqual({
+      phase: 'ended',
+      taskId: 'task-a',
+      toolUseId: 'spawn-1',
+      status: 'completed',
+      summary: 'found it',
+      usage: { totalTokens: 1711, toolUses: 1, durationMs: 900 },
+    });
+    expect(captured.some((e) => e.subagent?.taskId === 'shell-1')).toBe(false);
   });
 
-  test('a background subagent working between turns still reaches handlers, tagged and unattributed', async () => {
+  test('a background subagent working between turns still reaches handlers, tagged', async () => {
     const fake = makeFakeProc();
     const session = makeSession(fake);
     await session.start();
@@ -665,6 +694,14 @@ describe('Claude usage telemetry', () => {
     const captured: SessionEvent[] = [];
     session.onEvent((e) => {
       captured.push(e);
+    });
+    fake.emit({
+      type: 'system',
+      session_id: 'test-session-1',
+      subtype: 'task_started',
+      task_id: 'task-bg',
+      task_type: 'local_agent',
+      tool_use_id: 'spawn-bg',
     });
     fake.emit({
       type: 'assistant',
@@ -682,18 +719,20 @@ describe('Claude usage telemetry', () => {
     });
     await new Promise((r) => setTimeout(r, 5));
     expect(captured.map((e) => [e.kind, e.unattributedReason, e.parentToolUseId])).toEqual([
-      ['text', 'no-admission', 'spawn-bg'],
-      ['subagent', 'no-admission', undefined],
+      ['subagent', 'subagent', undefined],
+      ['text', 'subagent', 'spawn-bg'],
+      ['subagent', 'subagent', undefined],
     ]);
-    expect(captured[1]!.subagent).toMatchObject({
+    expect(captured[2]!.subagent).toMatchObject({
       phase: 'ended',
       taskId: 'task-bg',
       status: 'completed',
     });
-    // Unrelated frames between turns stay plain diagnostics.
+    // Unrelated frames between turns stay plain diagnostics; an empty parent id is not a subagent.
     fake.emit({
       type: 'assistant',
       session_id: 'test-session-1',
+      parent_tool_use_id: '',
       message: { role: 'assistant', content: [{ type: 'text', text: 'STRAY' }] },
     });
     await new Promise((r) => setTimeout(r, 5));
