@@ -54,6 +54,7 @@ import type {
   SessionArtifact,
   SessionEvent,
   SessionEventHandler,
+  SessionImage,
   SessionResult,
   SessionSendOptions,
   SessionTokens,
@@ -62,6 +63,7 @@ import type {
   ToolGate,
   ToolRequest,
 } from './harness-session';
+import { sendableImages } from './harness-session';
 
 // Re-export types so existing import paths keep working
 export type {
@@ -211,6 +213,7 @@ interface QueuedTurn {
   onAdmission?: SessionSendOptions['onAdmission'];
   evidence: TurnState;
   message: string;
+  images: readonly SessionImage[];
   timeout: number;
   resolve: (result: SessionResult) => void;
   reject: (error: Error) => void;
@@ -671,6 +674,7 @@ export class ClaudeCodeSession implements HarnessSession {
     if (!this._alive) throw new Error('Session ended');
 
     const timeout = opts?.timeout ?? this._defaultTimeout;
+    const images = sendableImages(this.transport, opts?.images);
 
     // Compose pre-send hooks in registration order. Each sees the previous
     // hook's output. Errors in a hook reject the send() — callers should
@@ -686,6 +690,7 @@ export class ClaudeCodeSession implements HarnessSession {
       const turn: QueuedTurn = {
         evidence,
         message: transformed,
+        images,
         timeout,
         resolve,
         reject,
@@ -937,11 +942,18 @@ export class ClaudeCodeSession implements HarnessSession {
     // Wire format validated empirically against claude 2.1.114:
     // {type:"user", message:{role,content:[{type:"text",text}]}}
     // Alternative shapes ({type:"user_message"}, {role,content}) are silently dropped.
+    // Images are Messages API base64 image blocks, ahead of the text they accompany.
     const payload = `${JSON.stringify({
       type: 'user',
       message: {
         role: 'user',
-        content: [{ type: 'text', text: turn.message }],
+        content: [
+          ...turn.images.map((image) => ({
+            type: 'image',
+            source: { type: 'base64', media_type: image.mediaType, data: image.data },
+          })),
+          { type: 'text', text: turn.message },
+        ],
       },
     })}\n`;
     try {

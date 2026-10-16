@@ -36,6 +36,8 @@ export interface TransportCapabilities {
   readonly limits: { readonly stream: boolean; readonly poll: boolean };
   /** A tool-free, text-only session can be enforced (decisions). */
   readonly textOnly: boolean;
+  /** send() takes images beside the text (`SessionSendOptions.images`): png, jpeg, gif, webp. */
+  readonly images: boolean;
   /** Primed decision host on this transport and how it returns to its primed state each cycle (see primed.ts). */
   readonly primed: 'fork' | 'none';
   readonly billing: 'subscription' | 'api';
@@ -70,6 +72,7 @@ export const TRANSPORTS: Readonly<Record<TransportKind, TransportDescriptor>> = 
       usage: true,
       limits: { stream: true, poll: true },
       textOnly: true,
+      images: true,
       primed: 'fork',
       billing: 'subscription',
     },
@@ -80,6 +83,7 @@ export const TRANSPORTS: Readonly<Record<TransportKind, TransportDescriptor>> = 
       "interruptNative() and readLimits() use the CLI's stdio control protocol (`interrupt`, `get_usage`).",
       'toolGate: true launches with `--permission-prompt-tool stdio` and registers a PreToolUse callback over the control protocol: onToolRequest() gates see every call (`pre-use`, any mode, bypass included; only a deny counts) and the asks the permission mode raises (`permission`, final).',
       'Rollback (`--resume-session-at`) exists natively but is not wired here.',
+      'Images ride in the same stream-json user message as base64 `image` content blocks, before the text.',
     ],
   },
   'codex-app-server': {
@@ -97,6 +101,7 @@ export const TRANSPORTS: Readonly<Record<TransportKind, TransportDescriptor>> = 
       usage: true,
       limits: { stream: true, poll: true },
       textOnly: false,
+      images: true,
       primed: 'fork',
       billing: 'subscription',
     },
@@ -107,6 +112,7 @@ export const TRANSPORTS: Readonly<Record<TransportKind, TransportDescriptor>> = 
       'appServer.approvalPolicy/sandbox (default never / danger-full-access; `codexPermissions(mode)`) set the thread policy; command and file-change approvals for the owned turn go to onToolRequest() gates (`permission`) and are answered accept/decline. Other server requests are refused (-32601).',
       'Primed decisions (CodexPrimedSessions) host every key as a thread of one process per account and fork the primed thread per cycle.',
       'thread/rollback is refused by codex-cli 0.155 for both ephemeral and paginated threads; session fork() is not wired.',
+      'Images go to turn/start as `image` inputs with a `data:` URL, after the text.',
     ],
   },
   'claude-agent-sdk': {
@@ -124,6 +130,7 @@ export const TRANSPORTS: Readonly<Record<TransportKind, TransportDescriptor>> = 
       usage: true,
       limits: { stream: true, poll: false },
       textOnly: true,
+      images: true,
       primed: 'none',
       billing: 'subscription',
     },
@@ -147,6 +154,7 @@ export const TRANSPORTS: Readonly<Record<TransportKind, TransportDescriptor>> = 
       usage: false,
       limits: none,
       textOnly: false,
+      images: false,
       primed: 'none',
       billing: 'subscription',
     },
@@ -169,6 +177,7 @@ export const TRANSPORTS: Readonly<Record<TransportKind, TransportDescriptor>> = 
       usage: false,
       limits: none,
       textOnly: false,
+      images: false,
       primed: 'none',
       billing: 'api',
     },

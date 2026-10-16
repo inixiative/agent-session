@@ -164,6 +164,38 @@ describe('ClaudeCodeSession', () => {
     expect(kinds).toContain('result');
   });
 
+  test('images ride in the same user message as base64 image blocks before the text', async () => {
+    const fake = makeFakeProc();
+    const session = makeSession(fake);
+    await session.start();
+    await session.send('what is this?', {
+      images: [
+        { mediaType: 'image/png', data: 'iVBORw0KGgo=' },
+        { mediaType: 'image/webp', data: 'UklGRg==' },
+      ],
+    });
+
+    expect(JSON.parse(fake.stdinLines[0]).message.content).toEqual([
+      { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgo=' } },
+      { type: 'image', source: { type: 'base64', media_type: 'image/webp', data: 'UklGRg==' } },
+      { type: 'text', text: 'what is this?' },
+    ]);
+  });
+
+  test('an unsupported image is refused before anything is written', async () => {
+    const fake = makeFakeProc();
+    const session = makeSession(fake);
+    await session.start();
+    await expect(
+      session.send('x', { images: [{ mediaType: 'image/bmp' as never, data: 'Qk0=' }] }),
+    ).rejects.toThrow('Image 1: unsupported media type image/bmp');
+    await expect(
+      session.send('x', { images: [{ mediaType: 'image/png', data: 'not base64!' }] }),
+    ).rejects.toThrow('Image 1: data must be non-empty base64');
+    expect(fake.stdinLines).toEqual([]);
+    expect(session.attempts).toEqual([]);
+  });
+
   test('stdin payload uses the validated wire format', async () => {
     const fake = makeFakeProc();
     const session = makeSession(fake);

@@ -44,6 +44,10 @@ session.kill();
   `ANTHROPIC_API_KEY` and authenticates via the CLI's subscription / an
   `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token` — works headless and in
   containers.
+- **Images with a turn.** `send(text, { images: [{ mediaType, data }] })` (png, jpeg, gif or
+  webp, base64) where the transport declares `capabilities.images`: Claude gets base64 `image`
+  blocks in the same user message, Codex `image` inputs with a `data:` URL. Anything else is
+  refused before a byte is written.
 - **fork / resume / interrupt** and pre-send hooks (rewrite the outgoing
   message — e.g. inject just-in-time context per turn).
 - **Transports with declared capabilities.** How a model is reached is a

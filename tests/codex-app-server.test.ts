@@ -206,6 +206,25 @@ test('app-server uses stdio, prewrite registration, typed input, supported effor
   expect(f.session.externalSessionId).toBe('retained-thread');
 });
 
+test('app-server sends images as data-URL image inputs after the text in turn/start', async () => {
+  const f = fixture();
+  await f.session.start();
+  const pending = f.session.send('describe', {
+    images: [{ mediaType: 'image/jpeg', data: '/9j/4AAQ' }],
+  });
+  await tick();
+  await tick();
+  expect(f.calls()[0].params.input).toEqual([
+    { type: 'text', text: 'describe' },
+    { type: 'image', url: 'data:image/jpeg;base64,/9j/4AAQ' },
+  ]);
+  f.rpc();
+  f.begin();
+  f.text();
+  f.terminal();
+  expect((await pending).nativeOutcome).toBe('completed');
+});
+
 for (const mode of ['error', 'foreign', 'timeout'] as const)
   test(`app-server ${mode} during cold resume preserves binding and never sends a turn`, async () => {
     const f = fixture({

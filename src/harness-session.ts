@@ -266,10 +266,47 @@ export type SessionEventHandler = (event: SessionEvent) => void;
  */
 export type BeforeSendHook = (message: string) => string | Promise<string>;
 
+export const SESSION_IMAGE_MEDIA_TYPES = [
+  'image/png',
+  'image/jpeg',
+  'image/gif',
+  'image/webp',
+] as const;
+export type SessionImageMediaType = (typeof SESSION_IMAGE_MEDIA_TYPES)[number];
+
+/** An image sent with a turn's text, where the transport declares `capabilities.images`. */
+export interface SessionImage {
+  readonly mediaType: SessionImageMediaType;
+  /** The image bytes, base64 (no `data:` prefix). */
+  readonly data: string;
+}
+
 export interface SessionSendOptions {
   timeout?: number;
   /** Required ownership registration, not an observer. Rejection prevents the native write. */
   onAdmission?: (attempt: SessionAttempt) => void | Promise<void>;
+  /**
+   * Images sent with the message, in order, as part of the same user turn. Refused (before
+   * anything is written) by a transport without `capabilities.images` and for any other media type.
+   */
+  images?: readonly SessionImage[];
+}
+
+/** Images a send may write: a copy of each, or a refusal naming the first one that is not. */
+export function sendableImages(
+  transport: TransportDescriptor | undefined,
+  images: readonly SessionImage[] | undefined,
+): SessionImage[] {
+  if (!images?.length) return [];
+  if (!transport?.capabilities.images)
+    throw new Error(`Transport "${transport?.kind ?? 'unknown'}" does not accept image input`);
+  return images.map((image, index) => {
+    if (!SESSION_IMAGE_MEDIA_TYPES.includes(image?.mediaType))
+      throw new Error(`Image ${index + 1}: unsupported media type ${String(image?.mediaType)}`);
+    if (typeof image.data !== 'string' || !image.data || /[^A-Za-z0-9+/=]/.test(image.data))
+      throw new Error(`Image ${index + 1}: data must be non-empty base64`);
+    return { mediaType: image.mediaType, data: image.data };
+  });
 }
 
 // ---------------------------------------------------------------------------

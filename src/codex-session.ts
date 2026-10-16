@@ -23,9 +23,11 @@ import type {
   SessionArtifact,
   SessionEvent,
   SessionEventHandler,
+  SessionImage,
   SessionResult,
   ToolGate,
 } from './harness-session';
+import { sendableImages } from './harness-session';
 
 // Re-export types so importers can stay on one path (mirrors claude-code-session).
 export type {
@@ -153,6 +155,7 @@ interface QueuedTurn {
   onAdmission?: import('./harness-session').SessionSendOptions['onAdmission'];
   evidence: TurnState;
   message: string;
+  images: readonly SessionImage[];
   timeout: number;
   resolve: (result: SessionResult) => void;
   reject: (error: Error) => void;
@@ -455,6 +458,7 @@ export class CodexAppServerSession implements HarnessSession {
     if (!this._alive) throw new Error('Session ended');
 
     const timeout = opts?.timeout ?? this._defaultTimeout;
+    const images = sendableImages(this.transport, opts?.images);
 
     let transformed = message;
     for (const hook of this._beforeSendHooks) {
@@ -473,6 +477,7 @@ export class CodexAppServerSession implements HarnessSession {
       const turn: QueuedTurn = {
         evidence,
         message: transformed,
+        images,
         timeout,
         resolve,
         reject,
@@ -539,7 +544,7 @@ export class CodexAppServerSession implements HarnessSession {
     this._resultText = '';
 
     // Resolves once the native terminal and the turn/start RPC have both settled.
-    this._sendTurn(turn.message)
+    this._sendTurn(turn.message, turn.images)
       .then((tokens) => {
         if (this._inflight !== turn) return;
         turn.evidence.rpcSettled = true;
@@ -1209,7 +1214,10 @@ export class CodexAppServerSession implements HarnessSession {
     this._rpcNotify('initialized');
   }
 
-  private async _sendTurn(message: string): Promise<{ input: number; output: number } | undefined> {
+  private async _sendTurn(
+    message: string,
+    images: readonly SessionImage[],
+  ): Promise<{ input: number; output: number } | undefined> {
     const a = this._inflight!.evidence;
     if (!this._threadReady) {
       const binding = this._externalSessionId;
@@ -1344,7 +1352,13 @@ export class CodexAppServerSession implements HarnessSession {
     });
     await this._rpcRequest('turn/start', {
       threadId: this._externalSessionId,
-      input: [{ type: 'text', text: message }],
+      input: [
+        { type: 'text', text: message },
+        ...images.map((image) => ({
+          type: 'image',
+          url: `data:${image.mediaType};base64,${image.data}`,
+        })),
+      ],
       ...(this._effort ? { effort: this._effort } : {}),
     });
     await completed; // Native terminal and RPC acknowledgment are both required.
