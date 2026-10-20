@@ -50,6 +50,11 @@ session.kill();
   refused before a byte is written.
 - **fork / resume / interrupt** and pre-send hooks (rewrite the outgoing
   message — e.g. inject just-in-time context per turn).
+- **A resume whose native conversation is gone is typed.** Claude's cleanup of its transcripts
+  ("No conversation found with session ID") and a Codex thread with no rollout ("no rollout found
+  for thread id") both raise `NativeBindingMissingError` (`nativeBindingMissing(error)` finds it
+  behind a turn error) with nothing sent, so the caller can start fresh from its own record. For
+  Codex the attempt settles as a no-send instead of uncertain native work.
 - **Transports with declared capabilities.** How a model is reached is a
   pluggable transport; switching it is a routing change, not a rewrite.
 - **Zero dependencies.** Just Bun + the agent CLI you're driving. The Agent SDK

@@ -63,7 +63,7 @@ import type {
   ToolGate,
   ToolRequest,
 } from './harness-session';
-import { sendableImages } from './harness-session';
+import { NativeBindingMissingError, sendableImages } from './harness-session';
 
 // Re-export types so existing import paths keep working
 export type {
@@ -577,7 +577,7 @@ export class ClaudeCodeSession implements HarnessSession {
       const errMsg = this._stderr.trim()
         ? `Process exited (code ${code}): ${this._stderr.trim().slice(0, 500)}`
         : `Process exited with code ${code}`;
-      this._rejectInflight(new Error(errMsg));
+      this._rejectInflight(this._missingBinding(errMsg) ?? new Error(errMsg));
       this._rejectQueue(new Error('Session ended'));
       this._rejectControl(new Error('Session ended'));
       this._emit({ kind: 'session_end', timestamp: Date.now(), transportOutcome: 'failed' });
@@ -616,6 +616,8 @@ export class ClaudeCodeSession implements HarnessSession {
         );
       } catch (error) {
         this.kill();
+        const missing = this._missingBinding((error as Error).message);
+        if (missing) throw missing;
         throw new Error(
           `${this._toolGate ? 'Tool gate' : 'Extension'} registration failed: ${(error as Error).message}`,
         );
@@ -628,6 +630,19 @@ export class ClaudeCodeSession implements HarnessSession {
         /* an extension's failure never touches the session */
       }
     }
+  }
+
+  /**
+   * The CLI refused to resume because the transcript is gone (Claude Code's cleanup of
+   * `~/.claude/projects`, or a deleted file): it says so and exits before reading a turn.
+   */
+  private _missingBinding(detail: string): NativeBindingMissingError | undefined {
+    const binding = this._externalSessionId;
+    if (!binding) return undefined;
+    const marker = `No conversation found with session ID: ${binding}`;
+    return this._stderr.includes(marker) || detail.includes(marker)
+      ? new NativeBindingMissingError('claude-code', binding, marker)
+      : undefined;
   }
 
   private _detachExtension(reason: string): void {
@@ -1065,14 +1080,12 @@ export class ClaudeCodeSession implements HarnessSession {
       if (buffer.trim() && (this._proc === proc || !this._proc)) {
         this._processLine(buffer);
       }
-      if (this._proc === proc && this._alive)
-        this._transportFailure(
-          new Error(
-            this._stderr.trim()
-              ? `Native stdout closed: ${this._stderr.trim().slice(0, 500)}`
-              : 'Native stdout closed',
-          ),
-        );
+      if (this._proc === proc && this._alive) {
+        const detail = this._stderr.trim()
+          ? `Native stdout closed: ${this._stderr.trim().slice(0, 500)}`
+          : 'Native stdout closed';
+        this._transportFailure(this._missingBinding(detail) ?? new Error(detail));
+      }
     } catch (err) {
       if (this._proc === proc) this._transportFailure(err as Error);
     }

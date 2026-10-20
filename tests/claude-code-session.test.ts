@@ -15,7 +15,11 @@ import {
   type PipedSubprocess,
   sweepOrphanedBaseContexts,
 } from '../src/claude-code-session';
-import type { SessionEvent } from '../src/harness-session';
+import {
+  NativeBindingMissingError,
+  nativeBindingMissing,
+  type SessionEvent,
+} from '../src/harness-session';
 
 // ---------------------------------------------------------------------------
 // Fake subprocess — drives a ClaudeCodeSession without spawning the real CLI.
@@ -772,5 +776,62 @@ describe('Claude usage telemetry', () => {
       kind: 'native_status',
       unattributedReason: 'no-admission',
     });
+  });
+});
+
+describe('resume of a transcript that is gone', () => {
+  const marker = 'No conversation found with session ID: gone-session';
+  test('start() with a tool gate refuses with a typed missing-binding error; nothing was sent', async () => {
+    const fake = makeFakeProc({ autoReplyOnSend: false, stderrText: `${marker}\n` });
+    const session = makeSession(fake, {
+      bin: 'claude',
+      cwd: '/tmp',
+      model: 'haiku',
+      externalSessionId: 'gone-session',
+      toolGate: true,
+    });
+    // The CLI says so and exits before reading anything.
+    fake.onStdin(() => setTimeout(() => fake.exit(1), 5));
+    const error = await session.start().catch((e) => e);
+    expect(error).toBeInstanceOf(NativeBindingMissingError);
+    expect(nativeBindingMissing(error)).toMatchObject({
+      runtime: 'claude-code',
+      binding: 'gone-session',
+    });
+    expect(fake.stdinLines.some((line) => JSON.parse(line).type === 'user')).toBe(false);
+  });
+
+  test('without a tool gate the turn is refused with the same typed error', async () => {
+    const fake = makeFakeProc({ autoReplyOnSend: false, stderrText: `${marker}\n` });
+    const session = makeSession(fake, {
+      bin: 'claude',
+      cwd: '/tmp',
+      model: 'haiku',
+      externalSessionId: 'gone-session',
+    });
+    await session.start();
+    const pending = session.send('hello');
+    await new Promise((r) => setTimeout(r, 5));
+    fake.exit(1);
+    const error = await pending.catch((e) => e);
+    expect(nativeBindingMissing(error)?.binding).toBe('gone-session');
+  });
+
+  test('an unrelated exit is not a missing binding', async () => {
+    const fake = makeFakeProc({
+      autoReplyOnSend: false,
+      stderrText: 'fatal: credit balance too low\n',
+    });
+    const session = makeSession(fake, {
+      bin: 'claude',
+      cwd: '/tmp',
+      model: 'haiku',
+      externalSessionId: 'kept',
+    });
+    await session.start();
+    const pending = session.send('hello');
+    await new Promise((r) => setTimeout(r, 5));
+    fake.exit(1);
+    expect(nativeBindingMissing(await pending.catch((e) => e))).toBeUndefined();
   });
 });
