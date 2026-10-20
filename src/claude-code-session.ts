@@ -354,6 +354,8 @@ export class ClaudeCodeSession implements HarnessSession {
   // so we know the concrete types at runtime.
   private _proc: PipedSubprocess | null = null;
   private _stderr = '';
+  /** The stderr reader of the running process; awaited (capped) before stderr is interpreted. */
+  private _stderrDone: Promise<void> = Promise.resolve();
 
   // -- Session state --
   /**
@@ -560,7 +562,7 @@ export class ClaudeCodeSession implements HarnessSession {
     // Background readers — run for session lifetime (don't await)
     const proc = this._proc;
     const stdoutDone = this._readStdout(proc);
-    this._readStderr();
+    this._stderrDone = this._readStderr();
 
     // Monitor process exit for cleanup
     // The process read its base context file at startup; it goes when the process does.
@@ -577,7 +579,7 @@ export class ClaudeCodeSession implements HarnessSession {
       const errMsg = this._stderr.trim()
         ? `Process exited (code ${code}): ${this._stderr.trim().slice(0, 500)}`
         : `Process exited with code ${code}`;
-      this._rejectInflight(this._missingBinding(errMsg) ?? new Error(errMsg));
+      this._rejectInflight((await this._settleMissing(errMsg)) ?? new Error(errMsg));
       this._rejectQueue(new Error('Session ended'));
       this._rejectControl(new Error('Session ended'));
       this._emit({ kind: 'session_end', timestamp: Date.now(), transportOutcome: 'failed' });
@@ -641,8 +643,30 @@ export class ClaudeCodeSession implements HarnessSession {
     if (!binding) return undefined;
     const marker = `No conversation found with session ID: ${binding}`;
     return this._stderr.includes(marker) || detail.includes(marker)
-      ? new NativeBindingMissingError('claude-code', binding, marker)
+      ? new NativeBindingMissingError('claude-code', binding, marker, this._cwd)
       : undefined;
+  }
+
+  /**
+   * After the process ended: was the binding missing? stderr is read first (capped), since the
+   * marker is there. A turn written to a CLI that never loaded the conversation (no `system/init`,
+   * no terminal) could not run: it settles as a no-send rather than uncertain native work.
+   */
+  private async _settleMissing(detail: string): Promise<NativeBindingMissingError | undefined> {
+    await Promise.race([this._stderrDone, Bun.sleep(250)]);
+    const missing = this._missingBinding(detail);
+    const a = this._inflight?.evidence;
+    if (
+      missing &&
+      a &&
+      a.nativeOutcome === 'unknown' &&
+      !a.events.some((event) => {
+        const raw = event.raw as { type?: unknown; subtype?: unknown } | undefined;
+        return raw?.type === 'system' && raw.subtype === 'init';
+      })
+    )
+      a.dispatch = 'not-dispatched';
+    return missing;
   }
 
   private _detachExtension(reason: string): void {
@@ -1084,7 +1108,7 @@ export class ClaudeCodeSession implements HarnessSession {
         const detail = this._stderr.trim()
           ? `Native stdout closed: ${this._stderr.trim().slice(0, 500)}`
           : 'Native stdout closed';
-        this._transportFailure(this._missingBinding(detail) ?? new Error(detail));
+        this._transportFailure((await this._settleMissing(detail)) ?? new Error(detail));
       }
     } catch (err) {
       if (this._proc === proc) this._transportFailure(err as Error);

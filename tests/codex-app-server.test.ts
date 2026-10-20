@@ -687,3 +687,22 @@ test('any other resume failure keeps its outcome unknown and blocks a retry', as
   expect(error.attempt.dispatch).toBe('attempted');
   await expect(f.session.send('two')).rejects.toThrow(/unresolved/);
 });
+
+test('a resume that times out and is then answered "no rollout" still settles as a no-send', async () => {
+  const f = fixture({
+    binding: 'gone-thread',
+    threadError: 'no rollout found for thread id gone-thread',
+    holdThread: true,
+  });
+  await f.session.start();
+  const error = await f.session.send('slow').catch((e) => e);
+  expect(error.message).toMatch(/timed out/);
+  f.replyThread();
+  await Bun.sleep(5);
+  const attempt = f.session.attempts.at(-1)!;
+  expect(attempt.dispatch).toBe('not-dispatched');
+  expect(f.calls()).toHaveLength(0);
+  // Released: a later send asks Codex again instead of refusing on an unresolved outcome.
+  const again = await f.session.send('again').catch((e) => e);
+  expect(again.message).not.toMatch(/unresolved/);
+});

@@ -815,6 +815,56 @@ describe('resume of a transcript that is gone', () => {
     fake.exit(1);
     const error = await pending.catch((e) => e);
     expect(nativeBindingMissing(error)?.binding).toBe('gone-session');
+    // The CLI never loaded the conversation, so the written turn could not run: a no-send that
+    // doesn't wedge the session behind an unknown outcome.
+    expect(error.attempt.dispatch).toBe('not-dispatched');
+    expect(error.attempt.localOutcome).toBe('rejected');
+    expect(session.attempts.every((a) => a.dispatch === 'not-dispatched')).toBe(true);
+  });
+
+  test('a marker for another session id is not this binding', async () => {
+    const fake = makeFakeProc({
+      autoReplyOnSend: false,
+      stderrText: 'No conversation found with session ID: someone-else\n',
+    });
+    const session = makeSession(fake, {
+      bin: 'claude',
+      cwd: '/tmp',
+      model: 'haiku',
+      externalSessionId: 'mine',
+    });
+    await session.start();
+    const pending = session.send('hello');
+    await new Promise((r) => setTimeout(r, 5));
+    fake.exit(1);
+    const error = await pending.catch((e) => e);
+    expect(nativeBindingMissing(error)).toBeUndefined();
+    expect(error.attempt.dispatch).toBe('attempted');
+  });
+
+  test('stderr that arrives after stdout closed is still read before the exit is interpreted', async () => {
+    let late!: ReadableStreamDefaultController<Uint8Array>;
+    const fake = makeFakeProc({ autoReplyOnSend: false });
+    (fake.proc as { stderr: ReadableStream<Uint8Array> }).stderr = new ReadableStream({
+      start(c) {
+        late = c;
+      },
+    });
+    const session = makeSession(fake, {
+      bin: 'claude',
+      cwd: '/tmp',
+      model: 'haiku',
+      externalSessionId: 'gone-session',
+    });
+    await session.start();
+    const pending = session.send('hello');
+    await new Promise((r) => setTimeout(r, 5));
+    fake.exit(1);
+    setTimeout(() => {
+      late.enqueue(new TextEncoder().encode(`${marker}\n`));
+      late.close();
+    }, 20);
+    expect(nativeBindingMissing(await pending.catch((e) => e))?.binding).toBe('gone-session');
   });
 
   test('an unrelated exit is not a missing binding', async () => {
