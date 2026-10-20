@@ -79,6 +79,35 @@ export class SessionTurnError extends Error {
   }
 }
 
+/**
+ * The native binding a session was told to resume was not found by the runtime, from this
+ * session's cwd and config home: Claude found no transcript ("No conversation found with session
+ * ID": cleaned up, deleted, or kept under another project directory or `CLAUDE_CONFIG_DIR`), or
+ * Codex found no rollout ("no rollout found for thread id": deleted, or under another
+ * `CODEX_HOME`). No turn ran. The caller decides what comes next, typically a fresh session seeded
+ * from its own record of the conversation; `cwd` says where the lookup was made.
+ */
+export class NativeBindingMissingError extends Error {
+  constructor(
+    readonly runtime: 'claude-code' | 'codex-app-server',
+    readonly binding: string,
+    message: string,
+    readonly cwd?: string,
+  ) {
+    super(message);
+    this.name = 'NativeBindingMissingError';
+  }
+}
+
+/** The missing-binding error behind a session error, if any (it may ride as a turn error's cause). */
+export function nativeBindingMissing(error: unknown): NativeBindingMissingError | undefined {
+  for (let current = error, depth = 0; current && depth < 5; depth++) {
+    if (current instanceof NativeBindingMissingError) return current;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return undefined;
+}
+
 export type SessionEventKind =
   | 'text_delta'
   | 'native_status'

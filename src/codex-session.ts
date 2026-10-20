@@ -27,7 +27,7 @@ import type {
   SessionResult,
   ToolGate,
 } from './harness-session';
-import { sendableImages } from './harness-session';
+import { NativeBindingMissingError, sendableImages } from './harness-session';
 
 // Re-export types so importers can stay on one path (mirrors claude-code-session).
 export type {
@@ -592,8 +592,11 @@ export class CodexAppServerSession implements HarnessSession {
 
   private _releaseKnownTurn(): void {
     const a = this._inflight?.evidence;
-    if (!a || !this._canReleaseAttempt(a) || a.nativeOutcome === 'unknown') return;
-    this._turns++;
+    if (!a) return;
+    // Refused before `turn/start` was written: nothing native is outstanding.
+    const noSend = a.dispatch === 'not-dispatched' && a.localOutcome === 'rejected';
+    if (!noSend && (!this._canReleaseAttempt(a) || a.nativeOutcome === 'unknown')) return;
+    if (!noSend) this._turns++;
     this._inflight = null;
     this._processNextTurn();
   }
@@ -1222,8 +1225,9 @@ export class CodexAppServerSession implements HarnessSession {
     if (!this._threadReady) {
       const binding = this._externalSessionId;
       const method = binding ? 'thread/resume' : 'thread/start';
-      const response = object(
-        await this._rpcRequest(method, {
+      let resumed: unknown;
+      try {
+        resumed = await this._rpcRequest(method, {
           ...(binding ? { threadId: binding } : {}),
           model: this._model,
           cwd: this._cwd,
@@ -1232,8 +1236,22 @@ export class CodexAppServerSession implements HarnessSession {
           ...(this._gated ? { approvalsReviewer: 'user' } : {}),
           sandbox: this._sandbox,
           ...(this._options.config ? { config: this._options.config } : {}),
-        }),
-      );
+        });
+      } catch (error) {
+        // The rollout is gone (Codex's own cleanup, or deleted). Codex answered that no thread
+        // exists, so no turn could run and none was written: a settled no-send, not uncertain
+        // native work. Any other failure here keeps its outcome unknown.
+        if (binding && /^no rollout found for thread id\b/i.test((error as Error).message ?? '')) {
+          a.dispatch = 'not-dispatched';
+          throw new NativeBindingMissingError(
+            'codex-app-server',
+            binding,
+            (error as Error).message,
+          );
+        }
+        throw error;
+      }
+      const response = object(resumed);
       const thread = object(response?.thread),
         id = thread?.id;
       if (typeof id !== 'string' || !id || (binding && id !== binding))

@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test';
-import { CodexAppServerSession } from '../src';
+import { CodexAppServerSession, NativeBindingMissingError, nativeBindingMissing } from '../src';
 
 // Synthetic installed-0.153.4 schema cases, never a recorded native success.
 const closes: Array<() => void> = [];
@@ -657,4 +657,52 @@ test('app-server sub-agents: a spawn is a subagent event, the child thread is ta
   });
   await tick();
   expect(f.session.events.at(-1)).toMatchObject({ unattributedReason: 'foreign-session' });
+});
+
+test('app-server resume of a thread whose rollout is gone is a typed, settled no-send', async () => {
+  const f = fixture({
+    binding: 'gone-thread',
+    threadError: 'no rollout found for thread id gone-thread',
+  });
+  await f.session.start();
+  const error = await f.session.send('revive me').catch((e) => e);
+  const missing = nativeBindingMissing(error);
+  expect(missing).toBeInstanceOf(NativeBindingMissingError);
+  expect(missing).toMatchObject({ runtime: 'codex-app-server', binding: 'gone-thread' });
+  expect(f.calls()).toHaveLength(0);
+  // Codex said no thread exists, so nothing ran: the attempt is a no-send, not uncertain work.
+  expect(error.attempt.dispatch).toBe('not-dispatched');
+  expect(error.attempt.localOutcome).toBe('rejected');
+  // The session is not wedged behind an unknown outcome: the next send asks Codex again.
+  const again = await f.session.send('still gone').catch((e) => e);
+  expect(again.message).not.toMatch(/unresolved/);
+  expect(f.requests.filter((r) => r.method === 'thread/resume')).toHaveLength(2);
+});
+
+test('any other resume failure keeps its outcome unknown and blocks a retry', async () => {
+  const f = fixture({ binding: 'original', threadError: 'RESUME_FAILURE' });
+  await f.session.start();
+  const error = await f.session.send('one').catch((e) => e);
+  expect(nativeBindingMissing(error)).toBeUndefined();
+  expect(error.attempt.dispatch).toBe('attempted');
+  await expect(f.session.send('two')).rejects.toThrow(/unresolved/);
+});
+
+test('a resume that times out and is then answered "no rollout" still settles as a no-send', async () => {
+  const f = fixture({
+    binding: 'gone-thread',
+    threadError: 'no rollout found for thread id gone-thread',
+    holdThread: true,
+  });
+  await f.session.start();
+  const error = await f.session.send('slow').catch((e) => e);
+  expect(error.message).toMatch(/timed out/);
+  f.replyThread();
+  await Bun.sleep(5);
+  const attempt = f.session.attempts.at(-1)!;
+  expect(attempt.dispatch).toBe('not-dispatched');
+  expect(f.calls()).toHaveLength(0);
+  // Released: a later send asks Codex again instead of refusing on an unresolved outcome.
+  const again = await f.session.send('again').catch((e) => e);
+  expect(again.message).not.toMatch(/unresolved/);
 });
