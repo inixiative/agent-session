@@ -15,6 +15,7 @@ The goal is to spread session workloads over available subscriptions and preserv
 | [AS-003](AS-003-session-continuity.md) | Continue the same work when its supplying subscription changes | Implemented for shared native history (0.2.0) |
 | [AS-004](AS-004-provider-capabilities.md) | Establish pooling and continuation support for each harness | Implemented (0.2.0) |
 | [AS-005](AS-005-policy-and-attribution.md) | Make pooled execution controllable and attributable | Implemented (0.2.0) |
+| [AS-006](AS-006-session-proxy-terminals.md) | Serve many callers from a single-session login through a proxy terminal | Not started |
 
 ## Responsibilities
 
