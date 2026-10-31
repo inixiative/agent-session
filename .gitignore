@@ -9,3 +9,4 @@ dist/
 
 # Worktree slots (per-machine)
 .worktrees/
+/tmp/*
