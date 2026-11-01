@@ -17,6 +17,15 @@ The goal is to spread session workloads over available subscriptions and preserv
 | [AS-005](AS-005-policy-and-attribution.md) | Make pooled execution controllable and attributable | Implemented (0.2.0) |
 | [AS-006](AS-006-session-proxy-terminals.md) | Serve many callers from a single-session login through a proxy terminal | Not started |
 
+## Runner parity (2026-10-31)
+
+Proposed after the T3 Code / Paseo refresh (Oracle `docs/foundry/reference/COMPARISON.md` §0).
+
+| Ticket | Goal | Status |
+| --- | --- | --- |
+| [AS-007](AS-007-codex-plans-and-subagent-items.md) | Codex plans and collab sub-agent items reach the session stream | Proposed |
+| [AS-008](AS-008-claude-mid-turn-steer.md) | Claude mid-turn steer (`priority`) on both Claude transports | Proposed |
+
 ## Responsibilities
 
 - **agent-session:** manage sessions, allocate execution from configured pools, and continue work within caller-supplied policies.
