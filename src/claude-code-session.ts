@@ -59,6 +59,7 @@ import type {
   SessionSendOptions,
   SessionTokens,
   SubagentLifecycle,
+  TaskLifecycle,
   ToolDecision,
   ToolGate,
   ToolRequest,
@@ -385,6 +386,8 @@ export class ClaudeCodeSession implements HarnessSession {
   private _seenBoundaries = new Set<string>();
   /** Task ids whose task_started was a subagent (local_agent); later task frames carry no type. */
   private _agentTasks = new Set<string>();
+  /** Task ids whose task_started was another task type (a background shell, a monitor): id → type. */
+  private _otherTasks = new Map<string, string>();
 
   // -- Turn queue --
   private _queue: QueuedTurn[] = [];
@@ -827,6 +830,11 @@ export class ClaudeCodeSession implements HarnessSession {
     while (turn.evidence.nativeOutcome === 'unknown' && this._alive && Date.now() < deadline)
       await Bun.sleep(10);
     return turn.evidence.nativeOutcome === 'unknown' ? 'unacknowledged' : 'acknowledged';
+  }
+
+  /** Stop a background task via the CLI control protocol (`stop_task`); its end comes as lifecycle. */
+  async stopTask(taskId: string, opts?: { timeoutMs?: number }): Promise<void> {
+    await this._controlRequest({ subtype: 'stop_task', task_id: taskId }, opts?.timeoutMs ?? 5_000);
   }
 
   /** Account limits via the CLI control protocol (`get_usage`); no model turn. Requires a started session. */
@@ -1297,6 +1305,20 @@ export class ClaudeCodeSession implements HarnessSession {
         ? raw.parent_tool_use_id
         : undefined;
     const lifecycle = this._subagentLifecycle(raw);
+    // A background task (a shell, a monitor) outlives its turn like a subagent: never an admission's.
+    const task = lifecycle || parentToolUseId ? undefined : this._taskLifecycle(raw);
+    if (task) {
+      this._emit({
+        kind: 'task',
+        timestamp: Date.now(),
+        task,
+        raw,
+        correlation: 'unknown',
+        unattributedReason: 'task',
+        nativeSessionId: typeof raw.session_id === 'string' ? raw.session_id : undefined,
+      });
+      return;
+    }
     if (parentToolUseId || lifecycle) {
       const message = raw.message as Record<string, unknown> | undefined;
       const events: SessionEvent[] = lifecycle
@@ -1667,6 +1689,40 @@ export class ClaudeCodeSession implements HarnessSession {
     } else if (!this._agentTasks.has(taskId)) return undefined;
     if (phase === 'ended') this._agentTasks.delete(taskId);
     return claudeSubagentLifecycle(msg, phase, taskId);
+  }
+
+  /**
+   * A Claude Code `system` task frame for a task that is not a subagent (`task_type` other than
+   * `local_agent`), as lifecycle. Later phases carry no task type: the session remembers it.
+   */
+  private _taskLifecycle(msg: Record<string, unknown>): TaskLifecycle | undefined {
+    if (msg.type !== 'system' || typeof msg.subtype !== 'string') return undefined;
+    const phase = CLAUDE_TASK_PHASES[msg.subtype];
+    const taskId = typeof msg.task_id === 'string' && msg.task_id ? msg.task_id : undefined;
+    if (!phase || !taskId) return undefined;
+    if (phase === 'started') {
+      if (typeof msg.task_type !== 'string' || msg.task_type === 'local_agent') return undefined;
+      this._otherTasks.set(taskId, msg.task_type);
+    }
+    const taskType = this._otherTasks.get(taskId);
+    if (!taskType) return undefined;
+    if (phase === 'ended') this._otherTasks.delete(taskId);
+    const text = (value: unknown) => (typeof value === 'string' && value ? value : undefined);
+    const patch =
+      msg.patch && typeof msg.patch === 'object' && !Array.isArray(msg.patch)
+        ? (msg.patch as Record<string, unknown>)
+        : undefined;
+    const status = text(msg.status) ?? text(patch?.status);
+    return {
+      phase,
+      taskId,
+      taskType,
+      ...(text(msg.tool_use_id) ? { toolUseId: text(msg.tool_use_id) } : {}),
+      ...(text(msg.description) ? { description: text(msg.description) } : {}),
+      ...(status ? { status } : {}),
+      ...(text(msg.reason) ? { reason: text(msg.reason) } : {}),
+      ...(text(msg.summary) ? { summary: text(msg.summary) } : {}),
+    };
   }
 
   private _classify(msg: Record<string, unknown>, parentToolUseId?: string): SessionEvent[] {
