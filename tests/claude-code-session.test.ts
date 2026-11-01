@@ -720,6 +720,30 @@ describe('Claude usage telemetry', () => {
       usage: { totalTokens: 1711, toolUses: 1, durationMs: 900 },
     });
     expect(captured.some((e) => e.subagent?.taskId === 'shell-1')).toBe(false);
+    // The background shell is a task: its lifecycle reaches handlers outside any admission.
+    expect(
+      captured.filter((e) => e.kind === 'task').map((e) => [e.unattributedReason, e.task]),
+    ).toEqual([
+      ['task', { phase: 'started', taskId: 'shell-1', taskType: 'local_bash' }],
+      ['task', { phase: 'ended', taskId: 'shell-1', taskType: 'local_bash', status: 'completed' }],
+    ]);
+    expect(result.events.some((e) => e.kind === 'task')).toBe(false);
+  });
+
+  test('a background task is stopped through the stop_task control request', async () => {
+    const fake = makeFakeProc();
+    const session = makeSession(fake);
+    await session.start();
+    const stopped = session.stopTask('shell-7', { timeoutMs: 1_000 });
+    const line = fake.stdinLines
+      .map((l) => JSON.parse(l))
+      .find((m) => m.type === 'control_request');
+    expect(line.request).toEqual({ subtype: 'stop_task', task_id: 'shell-7' });
+    fake.emit({
+      type: 'control_response',
+      response: { subtype: 'success', request_id: line.request_id, response: {} },
+    });
+    await stopped;
   });
 
   test('a background subagent working between turns still reaches handlers, tagged', async () => {

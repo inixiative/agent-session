@@ -122,7 +122,8 @@ export type SessionEventKind =
   | 'rate_limit'
   | 'result'
   | 'error'
-  | 'subagent';
+  | 'subagent'
+  | 'task';
 
 /**
  * A subagent's lifecycle as the native runtime reports it (kind `subagent`). Claude Code: its
@@ -152,6 +153,26 @@ export interface SubagentLifecycle {
     readonly toolUses?: number;
     readonly durationMs?: number;
   };
+}
+
+/**
+ * A background task that is not a subagent (kind `task`): Claude Code's `system` task frames for a
+ * background shell (`local_bash`), a monitor or a workflow. Like a subagent it can outlive the turn
+ * that started it, so its events belong to no admission (`unattributedReason: "task"`).
+ */
+export interface TaskLifecycle {
+  readonly phase: 'started' | 'progress' | 'updated' | 'ended';
+  /** The native task id (the id the agent's own task tools name). */
+  readonly taskId: string;
+  /** The runtime's task type, e.g. `local_bash`. */
+  readonly taskType: string;
+  /** The tool call that started it, in the session's stream (its command is that call's input). */
+  readonly toolUseId?: string;
+  readonly description?: string;
+  /** The native status at the end (completed, failed, stopped, killed). */
+  readonly status?: string;
+  readonly reason?: string;
+  readonly summary?: string;
 }
 
 /** Input excludes cache reads/writes when those disjoint counters are supplied.
@@ -191,7 +212,8 @@ export interface SessionEvent extends SessionIdentity {
     | 'unmatched-tool'
     | 'malformed-tool'
     | 'account-status'
-    | 'subagent';
+    | 'subagent'
+    | 'task';
   /** Local transport observation, not a native terminal acknowledgment. */
   readonly transportOutcome?: SessionAttempt['transportOutcome'];
   readonly nativeOutcome?: NativeOutcome;
@@ -243,6 +265,8 @@ export interface SessionEvent extends SessionIdentity {
   readonly parentToolUseId?: string;
   /** A subagent's lifecycle (kind `subagent`). */
   readonly subagent?: SubagentLifecycle;
+  /** A background task's lifecycle (kind `task`). */
+  readonly task?: TaskLifecycle;
 }
 
 /** Result of a single send() — the turn's content plus all classified events. */
@@ -398,6 +422,11 @@ export interface HarnessSession {
   interruptNative?(opts?: { timeoutMs?: number }): Promise<NativeInterruptOutcome>;
   /** Poll account usage limits without a model turn. Present where the transport declares `limits.poll`. */
   readLimits?(opts?: { timeoutMs?: number }): Promise<LimitSnapshot | undefined>;
+  /**
+   * Stop one background task (a `task` lifecycle's `taskId`) through the runtime's own control
+   * channel. Its end arrives as the task's `ended` lifecycle. Claude Code: the `stop_task` request.
+   */
+  stopTask?(taskId: string, opts?: { timeoutMs?: number }): Promise<void>;
   /** One immutable admission snapshot, without copying unrelated session history. */
   inspectAttempt?(admissionId: string): SessionAttempt | undefined;
   readonly admissionProtocol?: 'prewrite-v1';
