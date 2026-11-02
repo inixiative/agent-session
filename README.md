@@ -1,5 +1,7 @@
 # @inixiative/agent-session
 
+> Part of [inixiative](https://www.inixiative.com), technology for cooperation. See [all the projects](https://github.com/inixiative).
+
 Drive coding-agent CLIs as **persistent, streaming, event-captured sessions** —
 one interface, any agent, over interchangeable **transports**. Claude Code
 (CLI or Agent SDK) and Codex (app-server) today; Gemini and Grok planned.
