@@ -141,6 +141,24 @@ export {
   type SubscriptionCandidate,
   type UnknownUtilizationPolicy,
 } from './routing';
+// The secret scratch pad (AS-009): `$$word` secrets used by reference, never read.
+export {
+  formatScratchRef,
+  isPrivatePath,
+  type PrivatePathOptions,
+  parseScratchRef,
+  privatePathDenial,
+  privatePathGate,
+  type ScratchDagger,
+  type ScratchPadSummary,
+  type ScratchRef,
+  type ScratchSource,
+  type ScratchUse,
+  SECRET_MARKER,
+  SECRET_SCRATCH_GUIDANCE,
+  SecretScratchError,
+  SecretScratchPad,
+} from './secret-scratch';
 // Transports: how a session reaches its model, with declared capabilities.
 export {
   TRANSPORTS,
