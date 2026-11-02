@@ -148,7 +148,7 @@ export const TRANSPORTS: Readonly<Record<TransportKind, TransportDescriptor>> = 
       "Work Muse starts itself (cron firings, monitor and background-terminal wakes, goals, reminder agents, workflows, another client's messages) is folded like a turn's and emitted with `unattributedReason: 'task'`, plus a `task` lifecycle typed `muse-cron`, `muse-monitor`, `muse-goal`, `muse-reminder`, `muse-workflow` or `muse-turn`; it is seen only while this host has the session loaded.",
       "interruptNative() sends turn/interrupt; push() sends turn/steer; fork() runs session/fork on the new session's own host; readLimits() sends usage/read.",
       'userInput/request questions go to onUserInput(); without an answer they are cancelled with a reason, so a turn never waits on them.',
-      'Live-verified (muse 1.4.14): start, profile read-back, multi-stage shell and network approvals, text and tool events, token usage, usage/changed and usage/read (recorded in fixtures/muse); fork, resume with setApprovalMode and sessionNotFound were checked live without a model turn (not recorded). Images, steer, interrupt, questions and Muse-initiated turns follow the SDK wire types without a live run.',
+      'Live-verified (muse 1.4.14): start, profile read-back, multi-stage shell and network approvals, text and tool events, token usage, usage/changed and usage/read (recorded in fixtures/muse); fork, resume with setApprovalMode and sessionNotFound were checked live without a model turn (not recorded). A steer (`turn/steer` into a running shell turn, answered in that turn) was checked live 2026-11-02 (not recorded). Images, interrupt, questions and Muse-initiated turns follow the SDK wire types without a live run.',
     ],
   },
   'claude-agent-sdk': {
