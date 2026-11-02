@@ -94,11 +94,13 @@ Codex CLI 0.155 has no `mcp-server` subcommand.
 
 Muse Code runs over `muse serve` through Meta's `@muse-code/sdk` (`MuseSession`), pinned to
 the CLI's version (1.4.14): a host serving another version is refused at start. It bills the
-saved Muse login; `META_*`, `LLM_*` and `MODEL_*` variables never reach it. Per-login isolation
-is `env: { XDG_CONFIG_HOME, XDG_DATA_HOME }` (login and sessions). `musePermissions(mode)` maps
-the host modes to an explicit permission profile, because the host default lets Muse's AI
-reviewer answer approvals instead of the gates. Questions arrive through `onUserInput()`;
-unanswered ones are cancelled with a reason.
+saved Muse login: metered keys and endpoints never reach it, and a resumed session must be on
+provider `meta`. Per-login isolation is `env: { XDG_CONFIG_HOME, XDG_DATA_HOME }` (login and
+sessions). `musePermissions(mode)` maps the host modes to an explicit permission profile, because
+the host default lets Muse's AI reviewer answer approvals instead of the gates. Questions arrive
+through `onUserInput()`; unanswered ones are cancelled with a reason. Work Muse starts itself
+(cron firings, monitors, goals, reminder agents) is emitted too, marked
+`unattributedReason: "task"` with a `task` lifecycle typed `muse-cron`, `muse-monitor`, ….
 
 Full matrix, notes and what is stubbed: [docs/transports-pools-routing.md](docs/transports-pools-routing.md).
 

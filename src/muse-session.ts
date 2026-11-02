@@ -7,6 +7,7 @@ import {
   MuseClient,
   MuseSessionDiscardedError,
   type Session as NativeSession,
+  PermissionProfileNotApplied,
   readSessionDurability,
   type SessionDurabilityProfile,
   spawnMspConnection,
@@ -26,6 +27,7 @@ import {
   type SessionSendOptions,
   type SessionTokens,
   sendableImages,
+  type TaskLifecycle,
   type ToolGate,
 } from './harness-session';
 import { type LimitSnapshot, mergeLimits, museLimitSnapshot } from './limits';
@@ -221,8 +223,15 @@ type EventBase = Omit<SessionEvent, 'kind' | 'timestamp'>;
 const STARTUP_TIMEOUT_MS = 30_000;
 const CLIENT_INFO = { name: 'agent_session', title: 'agent-session', version: '1' } as const;
 
-/** Inherited variables that would bill or route Muse away from its saved subscription login. */
-const COMPETING_ENV = /^(META_|LLM_|MODEL_|MUSE_PERMISSION_PROFILE_FAIL_OPEN$)/;
+/**
+ * Inherited variables that would bill, route or loosen Muse away from its saved subscription login
+ * and the gates, by the names the 1.4.14 binary reads: metered keys and endpoints (META_, LLM_,
+ * MODEL_, LLAMA_, OPENROUTER_, ANTHROPIC_, OPENAI_), Meta's auth and key-mint endpoints (TBH_), and
+ * MUSE_ switches for the model, experiments, contributor mode, the approval judge and a fail-open
+ * profile.
+ */
+const COMPETING_ENV =
+  /^(META_|LLM_|MODEL_|LLAMA_|OPENROUTER_|ANTHROPIC_|OPENAI_|TBH_|MUSE_EXPERIMENTAL_|MUSE_(MODEL|CONTRIBUTOR_MODE|DISABLE_APPROVAL_JUDGE|PERMISSION_PROFILE_FAIL_OPEN)$)/;
 
 export class MuseSession implements HarnessSession {
   get transport() {
@@ -274,6 +283,15 @@ export class MuseSession implements HarnessSession {
   private _turnDone?: () => void;
   private _seenTerminals = new Set<string>();
   private _items = new Map<string, TrackedItem>();
+  /** Frames for turns not yet known while our turn/start answer is due: the answer names our turn. */
+  private _held: Array<{ method: string; params: unknown }> = [];
+  /** Settles when the in-flight turn/start answer arrives (or fails). */
+  private _ackDue?: Promise<void>;
+  private _ackDone?: () => void;
+  /** Turns Muse started without a send from this session (cron, monitor, goal, another client). */
+  private _museTurns = new Map<string, { content: string; trigger?: string }>();
+  /** The session a resume or fork is opening, before it becomes the binding. */
+  private _openingId?: string;
   private _turnTokens?: SessionTokens;
 
   // -- Gates and questions --
@@ -281,6 +299,8 @@ export class MuseSession implements HarnessSession {
   private _approvals = new Map<string, AbortController>();
   private _userInputHandler?: MuseUserInputHandler;
   private _userInputs = new Map<string, AbortController>();
+  /** Questions already taken: the host sends a request and its notification twin, and re-sends on resume. */
+  private _askedInputs = new Set<string>();
 
   constructor(config: MuseSessionConfig = {}) {
     const bin = config.museBin ?? 'muse';
@@ -401,10 +421,15 @@ export class MuseSession implements HarnessSession {
     this._turnDone?.();
     this._turnDone = undefined;
     const host = this._host;
+    const client = this._client;
     this._host = null;
     this._client = null;
     this._session = null;
-    void host.close().catch(() => undefined);
+    this._held = [];
+    // Through the client first: it marks the EOF as ours, not a host death that discards sessions.
+    void Promise.resolve(client?.close())
+      .catch(() => undefined)
+      .finally(() => host.close().catch(() => undefined));
     this._emit({ kind: 'session_end', timestamp: Date.now() });
   }
 
@@ -432,12 +457,15 @@ export class MuseSession implements HarnessSession {
   fork(opts?: { cwd?: string; baseContext?: string }): HarnessSession {
     const source = this._externalSessionId;
     if (!source) throw new Error('Nothing to fork: the Muse session has no native id yet');
+    if (this._inflight) throw new Error('Cannot fork a Muse session while a turn is in flight');
+    // The branch already holds the parent's base context; only a new one is prepended. `cwd` moves
+    // the fork's host; the forked session keeps the source's workspace root.
     const fork = new MuseSession({
       ...this._config,
       externalSessionId: undefined,
       onSessionReady: undefined,
+      baseContext: opts?.baseContext,
       ...(opts?.cwd ? { cwd: opts.cwd } : {}),
-      ...(opts?.baseContext !== undefined ? { baseContext: opts.baseContext } : {}),
     });
     fork._forkFrom = { sessionId: source };
     for (const gate of this._gates.list()) fork._gates.add(gate);
@@ -515,7 +543,6 @@ export class MuseSession implements HarnessSession {
         type: 'host-ready',
         version: served,
         durability: this._durability.kind,
-        museHome: host.initializeResult.museHome,
         permissionMode: this._permissionMode,
       },
     });
@@ -803,6 +830,8 @@ export class MuseSession implements HarnessSession {
   }
 
   private async _resume(sessionId: string, a: TurnState): Promise<NativeSession> {
+    // Frames the host re-sends during the resume (an open question) belong to this session.
+    this._openingId = sessionId;
     try {
       return await this._client!.resumeSession({
         sessionId,
@@ -840,14 +869,20 @@ export class MuseSession implements HarnessSession {
       if (typeof id !== 'string' || !id) this._refuse('fork-missing-session');
       session = await this._resume(id, a);
     } else {
-      session = await this._client!.startSession({
-        workspaceRoot: this._cwd,
-        providerId: 'meta',
-        approvalMode,
-        permissionProfile,
-        requirePermissionProfile: true,
-        ...(this._model ? { modelId: this._model } : {}),
-      });
+      try {
+        session = await this._client!.startSession({
+          workspaceRoot: this._cwd,
+          providerId: 'meta',
+          approvalMode,
+          permissionProfile,
+          requirePermissionProfile: true,
+          ...(this._model ? { modelId: this._model } : {}),
+        });
+      } catch (error) {
+        if (error instanceof PermissionProfileNotApplied)
+          this._refuse('permission-profile-not-applied', String(error.served ?? 'unknown'));
+        throw error;
+      }
       session.onApproval((request) => this._approval(request));
       session.onApprovalError((failure) => this._approvalFailure(failure));
     }
@@ -862,6 +897,14 @@ export class MuseSession implements HarnessSession {
       this._refuse('permission-profile-not-applied', String(state?.profileId ?? 'unknown'));
     if (object(read?.approvalMode)?.mode !== approvalMode)
       this._refuse('approval-mode-not-applied', String(object(read?.approvalMode)?.mode));
+    // A gated session is answered by a person through the gates, never by Muse's AI reviewer.
+    if (
+      approvalMode === 'promptUnmatched' &&
+      (state.reviewerAuthority !== 'human' || object(state.axes)?.reviewer !== 'human')
+    )
+      this._refuse('reviewer-not-human', String(state.reviewerAuthority ?? 'unknown'));
+    // A resumed or forked session keeps its stored provider: only Meta bills the subscription login.
+    if (read?.providerId !== 'meta') this._refuse('provider-not-meta', String(read?.providerId));
     if (read?.activeTurnId != null) this._refuse('not-idle', 'active');
     this._session = session;
     this._externalSessionId = sessionId;
@@ -900,15 +943,24 @@ export class MuseSession implements HarnessSession {
 
   private async _sendTurn(turn: QueuedTurn): Promise<void> {
     const a = turn.evidence;
-    if (!this._session) await this._open(a);
-    // Timeout/kill during open must not cause a later model write.
-    if (this._inflight !== turn || a.localOutcome !== 'pending' || !this._alive)
-      throw Error('Local admission closed before turn/start; no turn was sent');
+    try {
+      if (!this._session) await this._open(a);
+      // Timeout/kill during open must not cause a later model write.
+      if (this._inflight !== turn || a.localOutcome !== 'pending' || !this._alive)
+        throw Error('Local admission closed before turn/start; no turn was sent');
+    } catch (error) {
+      // No turn/start was written, so nothing native is outstanding and the queue may move on.
+      a.dispatch = 'not-dispatched';
+      throw error;
+    }
     this._turnTokens = undefined;
     const ended = new Promise<'ended'>((resolve) => {
       this._turnDone = () => resolve('ended');
     });
     a.rpcOutcome = 'pending';
+    this._ackDue = new Promise<void>((resolve) => {
+      this._ackDone = resolve;
+    });
     let started: Awaited<ReturnType<NativeSession['sendUserTurn']>>;
     try {
       started = await this._session!.sendUserTurn({
@@ -924,12 +976,12 @@ export class MuseSession implements HarnessSession {
       });
     } catch (error) {
       a.rpcOutcome = error instanceof MspError ? 'failed' : 'unknown';
+      this._flushHeld();
       throw error;
     }
     a.rpcOutcome = 'resolved';
-    if (a.identity.turnId && a.identity.turnId !== started.turnId)
-      throw new NativeValidationError('Native turn/start answer conflicts with the owned turn');
     a.identity = { ...a.identity, turnId: started.turnId, correlation: 'native-turn' };
+    this._flushHeld();
     // The SDK's turn wait is the terminal of record; the classifier has already recorded it when the
     // notification named the owned turn, so only a terminal it could not attribute is recorded here.
     const outcome = await Promise.race([started.completed, ended]);
@@ -994,6 +1046,16 @@ export class MuseSession implements HarnessSession {
     }
   }
 
+  /** Classify the frames held for the turn/start answer, now that it named (or did not) our turn. */
+  private _flushHeld(): void {
+    this._ackDone?.();
+    this._ackDone = undefined;
+    this._ackDue = undefined;
+    const held = this._held;
+    this._held = [];
+    for (const frame of held) this._observe(frame.method, frame.params);
+  }
+
   private _limitEvent(snapshot: LimitSnapshot, raw?: Record<string, unknown>): SessionEvent {
     this._limits = mergeLimits(this._limits, snapshot);
     return {
@@ -1012,7 +1074,8 @@ export class MuseSession implements HarnessSession {
       return snapshot ? [this._limitEvent(snapshot)] : [];
     }
     const sessionId = str(params.sessionId);
-    if (!sessionId || sessionId !== this._externalSessionId) return [];
+    if (!sessionId || (sessionId !== this._externalSessionId && sessionId !== this._openingId))
+      return [];
     const now = Date.now();
     const unowned = (
       reason: NonNullable<SessionEvent['unattributedReason']>,
@@ -1040,29 +1103,33 @@ export class MuseSession implements HarnessSession {
     let turnId = str(params.turnId) ?? str(item?.turnId);
     if (!turnId && itemId) turnId = this._items.get(itemId)?.turnId;
     const a = this._inflight?.evidence;
-    // turn/started can precede the turn/start answer: adopt the first one while the answer is due.
+    // While our turn/start answer is due, a frame for a turn not yet known could be ours or one
+    // Muse started itself; hold it until the answer names our turn, rather than guess.
+    const known =
+      (!!turnId && (this._museTurns.has(turnId) || this._seenTerminals.has(turnId))) ||
+      (!turnId && !!itemId && this._items.has(itemId));
     if (
-      method === 'turn/started' &&
-      turnId &&
       a?.dispatch === 'attempted' &&
       a.rpcOutcome === 'pending' &&
       !a.identity.turnId &&
-      !this._seenTerminals.has(turnId)
-    )
-      a.identity = { ...a.identity, turnId, correlation: 'native-turn' };
+      !known &&
+      (!!turnId ||
+        method.startsWith('item/') ||
+        method.startsWith('turn/') ||
+        method === 'session/tokenUsage')
+    ) {
+      this._held.push({ method, params });
+      return [];
+    }
     const owned = !!a && !!turnId && turnId === a.identity.turnId;
     if (turnId && this._seenTerminals.has(turnId) && !method.startsWith('session/'))
       return unowned(method === 'turn/completed' ? 'duplicate-terminal' : 'after-terminal');
     if (!owned) {
-      if (
-        method === 'session/tokenUsage' ||
-        method.startsWith('item/') ||
-        method.startsWith('turn/')
-      )
-        return unowned(
-          a ? 'foreign-turn' : 'no-admission',
-          item ? { itemKind: kindLabel(item) } : {},
-        );
+      // Work Muse runs without a send from us still reaches the caller, marked as a task.
+      if (turnId) return this._museTurn(method, params, sessionId, turnId, item, itemId);
+      if (itemId && (item || this._items.has(itemId)))
+        return this._background(method, params, sessionId, item, itemId);
+      if (method === 'session/goalChanged') return this._goal(params, sessionId);
       return unowned('session-configuration');
     }
     const identity: EventBase = {
@@ -1092,15 +1159,19 @@ export class MuseSession implements HarnessSession {
           attempt: params.attempt,
           maxAttempts: params.maxAttempts,
         };
-        // A retry is a rate limit only when the provider said so; a server error is not one.
-        if (http === 429 || /rate|quota|limit/i.test(kind ?? ''))
-          return [
-            this._limitEvent(
-              { runtime: 'muse', source: 'stream', observedAt: now, windows: [] },
-              raw,
-            ),
-          ];
-        return [{ ...identity, kind: 'native_status', timestamp: now, raw }];
+        // The retry stays on the turn; it is also a rate limit only on HTTP 429 (a server error,
+        // or a context or output limit, is not one).
+        return [
+          { ...identity, kind: 'native_status', timestamp: now, raw },
+          ...(http === 429
+            ? [
+                this._limitEvent(
+                  { runtime: 'muse', source: 'stream', observedAt: now, windows: [] },
+                  raw,
+                ),
+              ]
+            : []),
+        ];
       }
       case 'session/tokenUsage': {
         const tokens = museTokens(params.usage);
@@ -1170,6 +1241,185 @@ export class MuseSession implements HarnessSession {
         ...(this._turnTokens ? { tokens: this._turnTokens } : {}),
         nativeOutcome: terminal === 'completed' && !error ? 'completed' : 'failed',
         terminal: { type: method, turnId, subtype: terminal, ...(reason ? { reason } : {}) },
+      },
+    ];
+  }
+
+  /**
+   * A turn Muse started itself: a cron firing, a monitor or background-terminal wake, a goal, or a
+   * message from another client of the same session. Its events fold as an admission's would, but
+   * belong to none (`unattributedReason: 'task'`); the turn itself is a `task` lifecycle keyed by
+   * its turn id, typed `muse-<trigger>` once its first item says what woke it.
+   */
+  private _museTurn(
+    method: string,
+    params: Record<string, unknown>,
+    sessionId: string,
+    turnId: string,
+    item: Record<string, unknown> | undefined,
+    itemId: string | undefined,
+  ): SessionEvent[] {
+    const now = Date.now();
+    const turnBase: EventBase = {
+      nativeSessionId: sessionId,
+      turnId,
+      correlation: 'native-turn',
+      unattributedReason: 'task',
+    };
+    const base: EventBase = { ...turnBase, ...(itemId ? { itemId } : {}) };
+    const status = (raw: Record<string, unknown> = {}): SessionEvent[] => [
+      { ...base, kind: 'native_status', timestamp: now, raw: { method, ...raw } },
+    ];
+    const out: SessionEvent[] = [];
+    let entry = this._museTurns.get(turnId);
+    const lifecycle = (
+      phase: 'started' | 'updated' | 'ended',
+      extra: Partial<TaskLifecycle> = {},
+    ): SessionEvent => ({
+      ...turnBase,
+      kind: 'task',
+      timestamp: now,
+      task: {
+        phase,
+        taskId: turnId,
+        taskType: entry?.trigger ? `muse-${entry.trigger}` : 'muse-turn',
+        ...extra,
+      },
+    });
+    if (!entry) {
+      entry = { content: '' };
+      this._museTurns.set(turnId, entry);
+      out.push(lifecycle('started'));
+    }
+    switch (method) {
+      case 'turn/completed':
+      case 'turn/unqueued': {
+        this._seenTerminals.add(turnId);
+        this._museTurns.delete(turnId);
+        const reason = str(object(params.error)?.message) ?? str(params.reason);
+        out.push(
+          lifecycle('ended', {
+            status: method === 'turn/unqueued' ? 'unqueued' : (str(params.terminal) ?? 'unknown'),
+            ...(entry.content ? { summary: entry.content } : {}),
+            ...(reason ? { reason } : {}),
+          }),
+        );
+        return out;
+      }
+      case 'session/tokenUsage': {
+        const tokens = museTokens(params.usage);
+        out.push(
+          ...(tokens ? [{ ...base, kind: 'usage' as const, timestamp: now, tokens }] : status()),
+        );
+        return out;
+      }
+      case 'item/delta':
+        out.push(...this._delta(params, itemId, base, status));
+        return out;
+      case 'item/started':
+      case 'item/updated':
+      case 'item/completed': {
+        if (!item || !itemId) return [...out, ...status()];
+        const trigger = museTrigger(item);
+        if (trigger && !entry.trigger) {
+          entry.trigger = trigger;
+          const description = triggerDescription(item);
+          out.push(lifecycle('updated', description ? { description } : {}));
+        }
+        const events = this._item(method, item, itemId, base, status);
+        for (const event of events)
+          if (event.kind === 'text' && event.text && !event.parentToolUseId)
+            entry.content = event.text;
+        out.push(...events);
+        return out;
+      }
+      default:
+        return [...out, ...status()];
+    }
+  }
+
+  /** An item outside any turn (`turnId: null`): a monitor's feed, a shell run from another client. */
+  private _background(
+    method: string,
+    params: Record<string, unknown>,
+    sessionId: string,
+    item: Record<string, unknown> | undefined,
+    itemId: string,
+  ): SessionEvent[] {
+    const now = Date.now();
+    const base: EventBase = {
+      nativeSessionId: sessionId,
+      itemId,
+      correlation: 'unknown',
+      unattributedReason: 'task',
+    };
+    const status = (raw: Record<string, unknown> = {}): SessionEvent[] => [
+      { ...base, kind: 'native_status', timestamp: now, raw: { method, ...raw } },
+    ];
+    if (method === 'item/delta') return this._delta(params, itemId, base, status);
+    if (!item) return status();
+    if (item.kind !== 'monitorFeed') return this._item(method, item, itemId, base, status);
+    const tracked = this._items.get(itemId) ?? {
+      kind: 'monitorFeed',
+      completed: false,
+      started: false,
+    };
+    this._items.set(itemId, tracked);
+    if (
+      tracked.completed ||
+      (method !== 'item/completed' && !TERMINAL_ITEM.has(String(item.status)))
+    )
+      return status({ itemKind: 'monitorFeed' });
+    tracked.completed = true;
+    const summary = str(item.text) ?? str(item.fallbackText);
+    const description = str(item.monitorDescription);
+    return [
+      {
+        ...base,
+        kind: 'task',
+        timestamp: now,
+        task: {
+          phase: 'progress',
+          taskId: str(item.monitorId) ?? itemId,
+          taskType: 'muse-monitor',
+          ...(description ? { description } : {}),
+          ...(summary ? { summary } : {}),
+        },
+      },
+    ];
+  }
+
+  /** The session's goal (create_goal, update_goal, report_progress), as a `muse-goal` task. */
+  private _goal(params: Record<string, unknown>, sessionId: string): SessionEvent[] {
+    const goal = object(params.goal);
+    const status = goal ? (str(goal.status) ?? 'unknown') : 'cleared';
+    const description = str(goal?.objective);
+    const summary = str(goal?.currentWork);
+    return [
+      {
+        nativeSessionId: sessionId,
+        correlation: 'unknown',
+        unattributedReason: 'task',
+        kind: 'task',
+        timestamp: Date.now(),
+        task: {
+          phase:
+            !goal || /^(complete|completed|cleared|cancelled|abandoned)$/i.test(status)
+              ? 'ended'
+              : 'updated',
+          taskId: 'goal',
+          taskType: 'muse-goal',
+          status,
+          ...(description ? { description } : {}),
+          ...(summary ? { summary } : {}),
+        },
+        raw: {
+          method: 'session/goalChanged',
+          ...(typeof goal?.percentComplete === 'number'
+            ? { percentComplete: goal.percentComplete }
+            : {}),
+          ...(str(goal?.nextWork) ? { nextWork: str(goal?.nextWork) } : {}),
+        },
       },
     ];
   }
@@ -1322,6 +1572,44 @@ export class MuseSession implements HarnessSession {
         },
       ];
     }
+    if (kind === 'reminderChild' || kind === 'workflow') {
+      // Muse's own background agents (skill, goal and verify reminders; workflows): tasks, never
+      // part of an admission's content.
+      const { admissionId: _admission, ...rest } = base;
+      const description =
+        str(item.reminderAgentId) ?? str(item.label) ?? str(item.entryId) ?? undefined;
+      const lifecycle = {
+        taskId: str(item.childSessionId) ?? str(item.workflowRunId) ?? itemId,
+        taskType: kind === 'reminderChild' ? 'muse-reminder' : 'muse-workflow',
+        ...(description ? { description } : {}),
+      };
+      const taskBase = { ...rest, unattributedReason: 'task' as const };
+      if (!tracked.started) {
+        tracked.started = true;
+        out.push({
+          ...taskBase,
+          kind: 'task',
+          timestamp: now,
+          task: { phase: 'started', ...lifecycle },
+        });
+      }
+      if (ended) {
+        tracked.completed = true;
+        const summary = str(item.finalSummary) ?? str(object(item.result)?.summary);
+        out.push({
+          ...taskBase,
+          kind: 'task',
+          timestamp: now,
+          task: {
+            phase: 'ended',
+            ...lifecycle,
+            status: String(item.status),
+            ...(summary ? { summary } : {}),
+          },
+        });
+      }
+      return out.length ? out : status({ itemKind: kind });
+    }
     if (done) tracked.completed = true;
     return status({ itemKind: kindLabel(item), status: str(item.status) });
   }
@@ -1350,6 +1638,8 @@ export class MuseSession implements HarnessSession {
     const controller = new AbortController();
     this._approvals.get(key)?.abort();
     this._approvals.set(key, controller);
+    // An approval can outrun our turn/start answer; attribute it once the answer names our turn.
+    await this._ackDue;
     const a = this._inflight?.evidence;
     const identity =
       a && a.identity.turnId === request.turnId
@@ -1380,7 +1670,16 @@ export class MuseSession implements HarnessSession {
     if (this._approvals.get(key) === controller) this._approvals.delete(key);
     const accepted = decision?.behavior === 'allow' && !controller.signal.aborted && !!allow;
     const choice = accepted ? allow : deny;
-    if (!choice) throw new Error('Muse offered no approve-once or reject choice');
+    if (!choice) {
+      this._emit({
+        ...identity,
+        kind: 'error',
+        timestamp: Date.now(),
+        text: `Muse offered no approve-once or reject choice for ${request.toolName}; the approval stays open`,
+        raw: { type: 'approval-unanswerable', choices: choices.map((c) => c.decision) },
+      });
+      throw new Error('Muse offered no approve-once or reject choice');
+    }
     const feedback =
       !accepted && decision?.behavior === 'deny' && choice.acceptsFeedback
         ? decision.message
@@ -1412,26 +1711,23 @@ export class MuseSession implements HarnessSession {
 
   private _question(params: Record<string, unknown>): void {
     const userInputId = str(params.userInputId);
-    if (!userInputId || this._userInputs.has(userInputId)) return;
+    const sessionId = str(params.sessionId);
+    if (!userInputId || !sessionId || this._askedInputs.has(userInputId)) return;
+    this._askedInputs.add(userInputId);
     const controller = new AbortController();
     this._userInputs.set(userInputId, controller);
     const turnId = str(params.turnId);
-    const a = this._inflight?.evidence;
-    const owned = !!a && !!turnId && a.identity.turnId === turnId;
-    const identity = owned
-      ? { ...a!.identity, admissionId: a!.admissionId }
-      : {
-          nativeSessionId: this._externalSessionId,
-          turnId,
-          correlation: 'unknown' as const,
-          unattributedReason: 'foreign-turn' as const,
-        };
     const questions = Array.isArray(params.questions)
       ? (params.questions as MuseUserInputQuestion[])
       : [];
-    const session = this._session;
     const connection = this._host?.connection;
     const handler = this._userInputHandler;
+    let identity: EventBase = {
+      nativeSessionId: sessionId,
+      ...(turnId ? { turnId } : {}),
+      correlation: 'unknown',
+      unattributedReason: 'task',
+    };
     const emit = (type: string, extra: Record<string, unknown> = {}) =>
       this._emit({
         ...identity,
@@ -1439,8 +1735,14 @@ export class MuseSession implements HarnessSession {
         timestamp: Date.now(),
         raw: { type, userInputId, questions: questions.length, ...extra },
       });
-    emit('question-request');
     void (async () => {
+      // A question can outrun our turn/start answer; attribute it once the answer names our turn.
+      // One from a turn Muse started itself is a task's, like the rest of that turn.
+      await this._ackDue;
+      const a = this._inflight?.evidence;
+      const owned = !!a && !!turnId && a.identity.turnId === turnId;
+      if (owned) identity = { ...a.identity, admissionId: a.admissionId };
+      emit('question-request');
       let answers: readonly MuseUserInputAnswer[] | undefined;
       let reason = 'No client handler answers Muse questions in this session';
       if (handler)
@@ -1450,7 +1752,7 @@ export class MuseSession implements HarnessSession {
             ...(turnId ? { turnId } : {}),
             ...(str(params.toolName) ? { toolName: str(params.toolName) } : {}),
             questions: retainEvidence(questions),
-            ...(owned ? { admissionId: a!.admissionId } : {}),
+            ...(owned ? { admissionId: a.admissionId } : {}),
             signal: controller.signal,
           });
           if (!answers?.length) reason = 'The client declined to answer';
@@ -1462,14 +1764,14 @@ export class MuseSession implements HarnessSession {
               300,
             );
         }
-      if (controller.signal.aborted || !session || !connection || !this._alive) return;
+      if (controller.signal.aborted || !connection || !this._alive) return;
       try {
         if (answers?.length) {
-          await session.answerUserInput(userInputId, answers);
+          await connection.command('userInput/answer', { sessionId, userInputId, answers });
           emit('question-answered');
         } else {
           await connection.command('userInput/cancel', {
-            sessionId: session.sessionId,
+            sessionId,
             userInputId,
             reason,
           });
@@ -1613,6 +1915,35 @@ async function spawnMuseHost(launch: MuseLaunch): Promise<MuseHost> {
 // ---------------------------------------------------------------------------
 
 const TOOL_KINDS = new Set(['toolCall', 'userShell', 'webSearch']);
+/** The item that says what woke a turn Muse started itself, and the task type it gives that turn. */
+const MUSE_TRIGGERS: Readonly<Record<string, string>> = {
+  scheduledFire: 'cron',
+  monitorFeed: 'monitor',
+  backgroundTerminalCompletion: 'background-terminal',
+  overdueNotice: 'overdue',
+  userMessage: 'message',
+};
+/** A monitor wake turn carries no feed item (feeds sit outside turns); its first answer names the source. */
+const wakeSources = (item: Record<string, unknown>): string[] =>
+  Array.isArray(item.wakeSourceDescriptions)
+    ? item.wakeSourceDescriptions.filter((d): d is string => typeof d === 'string' && !!d)
+    : [];
+function museTrigger(item: Record<string, unknown>): string | undefined {
+  return MUSE_TRIGGERS[String(item.kind)] ?? (wakeSources(item).length ? 'monitor' : undefined);
+}
+function triggerDescription(item: Record<string, unknown>): string | undefined {
+  if (item.kind === 'agentMessage' && wakeSources(item).length) return wakeSources(item).join('; ');
+  switch (item.kind) {
+    case 'scheduledFire':
+      return str(item.jobId) ? `cron job ${item.jobId}` : 'cron job';
+    case 'monitorFeed':
+      return str(item.monitorDescription);
+    case 'userMessage':
+      return 'a message sent by another client of this session';
+    default:
+      return str(item.fallbackText);
+  }
+}
 const TERMINAL_ITEM = new Set(['completed', 'failed', 'cancelled', 'rejected', 'timedOut']);
 const KNOWN_KINDS = new Set([
   'userMessage',

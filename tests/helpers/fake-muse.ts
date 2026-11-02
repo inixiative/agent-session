@@ -136,7 +136,13 @@ export function fakeMuse(
   });
   const committed = () => ({
     ...(state.profile
-      ? { permissionState: { profileId: state.profile, reviewerAuthority: 'human' } }
+      ? {
+          permissionState: {
+            profileId: state.profile,
+            reviewerAuthority: state.mode === 'allowAll' ? 'none' : 'human',
+            axes: { reviewer: state.mode === 'allowAll' ? 'none' : 'human' },
+          },
+        }
       : {}),
     ...(state.mode ? { approvalMode: { mode: state.mode, source: 'startup' } } : {}),
   });

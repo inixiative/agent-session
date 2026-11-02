@@ -108,6 +108,11 @@ describe('MuseSession on the recorded supervised turn', () => {
       MODEL_API_KEY: 'model-key',
       MODEL_URL: 'https://elsewhere.example',
       MUSE_PERMISSION_PROFILE_FAIL_OPEN: '1',
+      TBH_AUTH_BASE_URL: 'https://elsewhere.example',
+      OPENROUTER_API_KEY: 'router-key',
+      MUSE_MODEL: 'other-model',
+      MUSE_DISABLE_APPROVAL_JUDGE: '1',
+      MUSE_EXPERIMENTAL_ACP: '1',
     });
     try {
       const session = open(fake, {
@@ -127,6 +132,11 @@ describe('MuseSession on the recorded supervised turn', () => {
         'MODEL_API_KEY',
         'MODEL_URL',
         'MUSE_PERMISSION_PROFILE_FAIL_OPEN',
+        'TBH_AUTH_BASE_URL',
+        'OPENROUTER_API_KEY',
+        'MUSE_MODEL',
+        'MUSE_DISABLE_APPROVAL_JUDGE',
+        'MUSE_EXPERIMENTAL_ACP',
       ])
         expect(launch.env[key]).toBeUndefined();
       expect(launch.initialize.capabilities).toEqual({
@@ -249,6 +259,14 @@ describe('MuseSession on the recorded supervised turn', () => {
       ],
     });
     expect(limit.limits?.plan).toBeUndefined();
+    // Muse's own reminder agents ran beside the turn: tasks, outside the admission.
+    const reminders = session.events.filter((e) => e.task?.taskType === 'muse-reminder');
+    expect(reminders.map((e) => [e.task?.phase, e.task?.description])).toContainEqual([
+      'started',
+      'goal-reminder',
+    ]);
+    expect(reminders.every((e) => e.unattributedReason === 'task' && !e.admissionId)).toBe(true);
+    expect(done.events.some((e) => e.kind === 'task')).toBe(false);
     const configured = session.events.find(
       (e) => (e.raw as { type?: string } | undefined)?.type === 'session-configured',
     )!;
@@ -594,6 +612,35 @@ describe('MuseSession contract', () => {
     });
   });
 
+  test('resume refuses a session on another provider or with a non-human reviewer', async () => {
+    for (const [patch, reason] of [
+      [{ providerId: 'openrouter' }, 'provider-not-meta (openrouter)'],
+      [
+        {
+          permissionState: {
+            profileId: ':ask-me',
+            reviewerAuthority: 'autoReview',
+            axes: { reviewer: 'autoReview' },
+          },
+        },
+        'reviewer-not-human (autoReview)',
+      ],
+    ] as const) {
+      const { fake } = textHost();
+      const read = fake.handlers['session/read']!;
+      fake.handlers['session/read'] = async (p) => {
+        const answer = (await read(p)) as { session: Params };
+        return { ...answer, session: { ...answer.session, ...patch } };
+      };
+      const session = open(fake, { externalSessionId: SESSION_ID });
+      expect(String(await session.send('again').catch((e: Error) => e))).toContain(reason);
+      expect(fake.requests.some((r) => r.method === 'turn/start')).toBe(false);
+      // Nothing was written, so a refusal never leaves the session blocked.
+      expect(session.attempts[0]!.dispatch).toBe('not-dispatched');
+      expect(String(await session.send('again').catch((e: Error) => e))).toContain(reason);
+    }
+  });
+
   test('createSession builds a MuseSession by transport kind', () => {
     const { fake } = textHost();
     expect(createSession('muse-serve', { connect: fake.connect })).toBeInstanceOf(MuseSession);
@@ -620,5 +667,182 @@ describe('museLimitSnapshot', () => {
     });
     expect(museLimitSnapshot(usage, 'stream', 9)?.source).toBe('stream');
     expect(museLimitSnapshot({}, 'poll')).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Work Muse starts itself: cron firings, monitor feeds, goals. Nothing is
+// dropped outside a send; it is marked as a task (`unattributedReason: 'task'`).
+// ---------------------------------------------------------------------------
+
+describe('MuseSession surfaces Muse-initiated work', () => {
+  const cronTurn = (fake: FakeMuse, turnId: string) => {
+    fake.notify('turn/started', { turnId, commandId: turnId });
+    fake.notify('item/completed', {
+      item: {
+        itemId: `${turnId}-fire`,
+        kind: 'scheduledFire',
+        turnId,
+        revision: 1,
+        status: 'completed',
+        jobId: 'job-7',
+      },
+    });
+    fake.notify('item/completed', {
+      item: {
+        itemId: `${turnId}-msg`,
+        kind: 'agentMessage',
+        turnId,
+        revision: 1,
+        status: 'completed',
+        text: 'The build is green.',
+      },
+    });
+    fake.notify('session/tokenUsage', {
+      turnId,
+      modelId: 'muse-wonder-1.0',
+      usage: { inputTokens: 100, outputTokens: 10, cachedTokens: 0, reasoningTokens: 0 },
+      promptTokens: 100,
+      totalTokens: 110,
+      cumulative: { promptTokens: 100, outputTokens: 10, totalTokens: 110 },
+    });
+    fake.notify('turn/completed', { turnId, terminal: 'completed' });
+  };
+
+  test('a cron firing between sends folds into task-marked events and a muse-cron task', async () => {
+    const { fake } = textHost();
+    const session = open(fake);
+    await session.start();
+    await session.send('hi');
+    const before = session.events.length;
+    cronTurn(fake, 'cron-turn-1');
+    await Bun.sleep(10);
+    const fired = session.events.slice(before);
+    expect(fired.every((e) => e.unattributedReason === 'task' && !e.admissionId)).toBe(true);
+    expect(fired.filter((e) => e.kind === 'task').map((e) => e.task)).toEqual([
+      { phase: 'started', taskId: 'cron-turn-1', taskType: 'muse-turn' },
+      {
+        phase: 'updated',
+        taskId: 'cron-turn-1',
+        taskType: 'muse-cron',
+        description: 'cron job job-7',
+      },
+      {
+        phase: 'ended',
+        taskId: 'cron-turn-1',
+        taskType: 'muse-cron',
+        status: 'completed',
+        summary: 'The build is green.',
+      },
+    ]);
+    expect(fired.find((e) => e.kind === 'text')).toMatchObject({
+      text: 'The build is green.',
+      turnId: 'cron-turn-1',
+    });
+    expect(fired.find((e) => e.kind === 'usage')?.tokens).toMatchObject({ input: 100, output: 10 });
+    expect(session.turns).toBe(1);
+  });
+
+  test('a Muse turn that starts before our turn/start answer is not mistaken for ours', async () => {
+    const fake = fakeMuse();
+    fake.handlers['turn/start'] = async (p) => {
+      // Muse's own turn is under way when our answer comes back.
+      fake.notify('turn/started', { turnId: 'cron-turn-2', commandId: 'cron-turn-2' });
+      fake.notify('item/completed', {
+        item: {
+          itemId: 'c2',
+          kind: 'agentMessage',
+          turnId: 'cron-turn-2',
+          revision: 1,
+          status: 'completed',
+          text: 'cron says hi',
+        },
+      });
+      fake.notify('turn/started', { turnId: TURN_ID, commandId: p.commandId });
+      await Bun.sleep(5);
+      queueMicrotask(() => {
+        fake.notify('item/completed', {
+          item: {
+            itemId: 'm1',
+            kind: 'agentMessage',
+            turnId: TURN_ID,
+            revision: 1,
+            status: 'completed',
+            text: 'ours',
+          },
+        });
+        fake.notify('turn/completed', { turnId: TURN_ID, terminal: 'completed' });
+        fake.notify('turn/completed', { turnId: 'cron-turn-2', terminal: 'completed' });
+      });
+      return {
+        commandId: p.commandId,
+        disposition: 'started',
+        startedNewTurn: true,
+        status: 'accepted',
+        turnId: TURN_ID,
+      };
+    };
+    const session = open(fake);
+    await session.start();
+    const done = await session.send('mine');
+    expect(done.content).toBe('ours');
+    expect(done.events.some((e) => e.text === 'cron says hi')).toBe(false);
+    await Bun.sleep(10);
+    expect(session.events.find((e) => e.text === 'cron says hi')).toMatchObject({
+      unattributedReason: 'task',
+      turnId: 'cron-turn-2',
+    });
+    expect(
+      session.events.find((e) => e.task?.taskId === 'cron-turn-2' && e.task.phase === 'ended')
+        ?.task,
+    ).toMatchObject({ summary: 'cron says hi', status: 'completed' });
+  });
+
+  test('a monitor feed outside any turn and a goal change surface as tasks', async () => {
+    const { fake } = textHost();
+    const session = open(fake);
+    await session.start();
+    await session.send('hi');
+    const before = session.events.length;
+    fake.notify('item/completed', {
+      item: {
+        itemId: 'feed-1',
+        kind: 'monitorFeed',
+        turnId: null,
+        revision: 1,
+        status: 'completed',
+        monitorId: 'monitor-call-1',
+        monitorDescription: 'CI on main',
+        text: 'CI failed on main',
+      },
+    });
+    fake.notify('session/goalChanged', {
+      goal: {
+        objective: 'Ship the release',
+        percentComplete: 40,
+        status: 'active',
+        currentWork: 'tests',
+      },
+    });
+    await Bun.sleep(10);
+    const tasks = session.events.slice(before).filter((e) => e.kind === 'task');
+    expect(tasks.map((e) => e.task)).toEqual([
+      {
+        phase: 'progress',
+        taskId: 'monitor-call-1',
+        taskType: 'muse-monitor',
+        description: 'CI on main',
+        summary: 'CI failed on main',
+      },
+      {
+        phase: 'updated',
+        taskId: 'goal',
+        taskType: 'muse-goal',
+        status: 'active',
+        description: 'Ship the release',
+        summary: 'tests',
+      },
+    ]);
+    expect(tasks.every((e) => e.unattributedReason === 'task')).toBe(true);
   });
 });

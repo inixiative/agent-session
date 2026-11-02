@@ -135,7 +135,8 @@ export function museLimitSnapshot(
     source,
     observedAt: ms(usage?.observedAtMs) ?? observedAt,
     windows,
-    ...(windows.some((w) => w.usedPercent >= 100) ? { blocked: true } : {}),
+    // Explicit both ways, so a later report clears a block an earlier one (or a quota stop) set.
+    blocked: windows.some((w) => w.usedPercent >= 100),
   };
 }
 
