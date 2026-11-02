@@ -73,7 +73,7 @@ export const TRANSPORTS: Readonly<Record<TransportKind, TransportDescriptor>> = 
       fork: 'native',
       rollback: 'none',
       interrupt: 'acknowledged',
-      push: 'none',
+      push: 'steer',
       approvals: 'callback',
       usage: true,
       limits: { stream: true, poll: true },
@@ -87,6 +87,7 @@ export const TRANSPORTS: Readonly<Record<TransportKind, TransportDescriptor>> = 
       'textOnly launches with no tools, MCP servers, slash commands or user settings.',
       'Primed decisions (ClaudePrimedSessions) fork a persisted primed session per cycle with a pre-spawned spare.',
       "interruptNative() and readLimits() use the CLI's stdio control protocol (`interrupt`, `get_usage`).",
+      'push() steers: a stream-json user message with `priority: "next"` and a `uuid`, tracked by its `command_lifecycle` frames; one the turn had not taken in when its result came runs as a follow-on result of the same turn, and a stop withdraws it (`cancel_async_message`). Live-verified on claude 2.1.316.',
       'toolGate: true launches with `--permission-prompt-tool stdio` and registers a PreToolUse callback over the control protocol: onToolRequest() gates see every call (`pre-use`, any mode, bypass included; only a deny counts) and the asks the permission mode raises (`permission`, final).',
       'Rollback (`--resume-session-at`) exists natively but is not wired here.',
       'Images ride in the same stream-json user message as base64 `image` content blocks, before the text.',
@@ -147,7 +148,7 @@ export const TRANSPORTS: Readonly<Record<TransportKind, TransportDescriptor>> = 
       "Work Muse starts itself (cron firings, monitor and background-terminal wakes, goals, reminder agents, workflows, another client's messages) is folded like a turn's and emitted with `unattributedReason: 'task'`, plus a `task` lifecycle typed `muse-cron`, `muse-monitor`, `muse-goal`, `muse-reminder`, `muse-workflow` or `muse-turn`; it is seen only while this host has the session loaded.",
       "interruptNative() sends turn/interrupt; push() sends turn/steer; fork() runs session/fork on the new session's own host; readLimits() sends usage/read.",
       'userInput/request questions go to onUserInput(); without an answer they are cancelled with a reason, so a turn never waits on them.',
-      'Live-verified (muse 1.4.14): start, profile read-back, multi-stage shell and network approvals, text and tool events, token usage, usage/changed and usage/read (recorded in fixtures/muse); fork, resume with setApprovalMode and sessionNotFound were checked live without a model turn (not recorded). Images, steer, interrupt, questions and Muse-initiated turns follow the SDK wire types without a live run.',
+      'Live-verified (muse 1.4.14): start, profile read-back, multi-stage shell and network approvals, text and tool events, token usage, usage/changed and usage/read (recorded in fixtures/muse); fork, resume with setApprovalMode and sessionNotFound were checked live without a model turn (not recorded). A steer (`turn/steer` into a running shell turn, answered in that turn) was checked live 2026-11-02 (not recorded). Images, interrupt, questions and Muse-initiated turns follow the SDK wire types without a live run.',
     ],
   },
   'claude-agent-sdk': {
@@ -172,6 +173,7 @@ export const TRANSPORTS: Readonly<Record<TransportKind, TransportDescriptor>> = 
     notes: [
       'Drives `@anthropic-ai/claude-agent-sdk` query() supplied by the caller; this package keeps zero dependencies.',
       "Reuses ClaudeCodeSession's event classification and admission evidence over the SDK message stream.",
+      'push() is not wired: whether the SDK stream surfaces `command_lifecycle` (which a steer is tracked by) is unverified.',
     ],
   },
   acp: {

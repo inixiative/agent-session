@@ -486,7 +486,7 @@ describe('ClaudeCodeSession', () => {
     expect(art.errors).toBe(0);
   });
 
-  test('push() emits a push_ignored error event (current CLI has no OOB channel)', async () => {
+  test('push() without an owned in-flight turn is ignored with a push_ignored event', async () => {
     const fake = makeFakeProc();
     const session = makeSession(fake);
     await session.start();
@@ -496,11 +496,14 @@ describe('ClaudeCodeSession', () => {
       captured.push(e);
     });
 
-    await session.push({ kind: 'guard_alert', text: 'stop editing auth' });
+    expect(await session.push({ kind: 'guard_alert', text: 'stop editing auth' })).toEqual({
+      outcome: 'ignored',
+      reason: 'no owned in-flight turn',
+    });
 
     const err = captured.find((e) => e.kind === 'error');
-    expect(err).toBeDefined();
     expect(err!.text).toContain('push_ignored');
+    expect(fake.stdinLines).toEqual([]);
   });
 
   test('onEvent handlers receive live events and can be unsubscribed', async () => {

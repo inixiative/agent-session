@@ -84,7 +84,7 @@ const session = createSession(kind, { cwd, model: "gpt-6-luna", env: { CODEX_HOM
 | Status | ✅ live | ✅ live | ✅ live | ✅ live | stub | stub |
 | Resume / fork | native / native | native / – | native / native | native / native | – | – |
 | Interrupt | acknowledged | acknowledged | acknowledged | acknowledged | – | – |
-| Push | – | steer | steer | – | – | – |
+| Push | steer | steer | steer | – | – | – |
 | Approvals | callback | callback | callback | callback | – | – |
 | Limits stream / poll | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ | ✅ / – | – | – |
 | Primed reset | fork | fork | – | – | – | – |
