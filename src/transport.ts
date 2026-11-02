@@ -73,7 +73,7 @@ export const TRANSPORTS: Readonly<Record<TransportKind, TransportDescriptor>> = 
       fork: 'native',
       rollback: 'none',
       interrupt: 'acknowledged',
-      push: 'none',
+      push: 'steer',
       approvals: 'callback',
       usage: true,
       limits: { stream: true, poll: true },
@@ -87,6 +87,7 @@ export const TRANSPORTS: Readonly<Record<TransportKind, TransportDescriptor>> = 
       'textOnly launches with no tools, MCP servers, slash commands or user settings.',
       'Primed decisions (ClaudePrimedSessions) fork a persisted primed session per cycle with a pre-spawned spare.',
       "interruptNative() and readLimits() use the CLI's stdio control protocol (`interrupt`, `get_usage`).",
+      'push() steers: a stream-json user message with `priority: "next"` and a `uuid`, tracked by its `command_lifecycle` frames; one the turn had not taken in when its result came runs as a follow-on result of the same turn, and a stop withdraws it (`cancel_async_message`). Live-verified on claude 2.1.316.',
       'toolGate: true launches with `--permission-prompt-tool stdio` and registers a PreToolUse callback over the control protocol: onToolRequest() gates see every call (`pre-use`, any mode, bypass included; only a deny counts) and the asks the permission mode raises (`permission`, final).',
       'Rollback (`--resume-session-at`) exists natively but is not wired here.',
       'Images ride in the same stream-json user message as base64 `image` content blocks, before the text.',
@@ -172,6 +173,7 @@ export const TRANSPORTS: Readonly<Record<TransportKind, TransportDescriptor>> = 
     notes: [
       'Drives `@anthropic-ai/claude-agent-sdk` query() supplied by the caller; this package keeps zero dependencies.',
       "Reuses ClaudeCodeSession's event classification and admission evidence over the SDK message stream.",
+      'push() is not wired: whether the SDK stream surfaces `command_lifecycle` (which a steer is tracked by) is unverified.',
     ],
   },
   acp: {

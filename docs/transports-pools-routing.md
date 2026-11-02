@@ -30,7 +30,7 @@ Callers branch on capabilities, not on kinds.
 | Fork | native | none | native | native | – | – |
 | Rollback | none¹ | none² | none | none | – | – |
 | Interrupt | acknowledged | acknowledged | acknowledged | acknowledged | – | – |
-| Mid-turn push | none | steer | steer | none | – | – |
+| Mid-turn push | steer | steer | steer | none | – | – |
 | Approvals | callback (`toolGate`) | callback | callback | callback | – | – |
 | Usage per turn | yes | yes | yes | yes | – | – |
 | Limits: stream / poll | yes / yes | yes / yes | yes / yes | yes / no | – | – |
@@ -62,8 +62,16 @@ New optional `HarnessSession` members (existing implementers and consumers are u
   `interrupt()`, a confirmed stop settles native ownership.
 - `readLimits()` — account limits without a model turn: Claude `get_usage`
   control request, Codex `account/rateLimits/read`.
-- `push()` on app-server steers the owned in-flight turn (`turn/steer`); a refusal
-  records `push_ignored`, no answer within 10 s records `push-unknown`.
+- `push()` steers the owned in-flight turn and returns what became of it (`PushOutcome`:
+  `steered`, `unknown`, or `ignored` with the reason). app-server and Muse send `turn/steer`; a
+  refusal is `ignored` (`push_ignored`), no answer within 10 s is `unknown` (`push-unknown`).
+  `claude-cli` writes a stream-json user message with `priority: "next"` and its own `uuid` and
+  tracks it by `command_lifecycle`. Claude takes it in at the turn's next model request (after a
+  tool result); when the reply was already final it runs it right after that result, so the turn
+  stays open and send() settles on the follow-on result, with both results' usage. A stop first
+  withdraws a steer not yet started (`cancel_async_message`). `claude-agent-sdk` does not steer
+  (`command_lifecycle` through the SDK stream is unverified). Recorded runs:
+  `fixtures/claude-steer/`.
 - `rate_limit` events with `limits` (from Claude `rate_limit_event` and Codex
   `account/rateLimits/updated`). They are account-level (`unattributedReason:
   "account-status"`) and never part of an admission's output.

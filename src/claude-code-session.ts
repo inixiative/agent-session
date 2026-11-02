@@ -51,6 +51,7 @@ import type {
   BeforeSendHook,
   HarnessSession,
   NativeInterruptOutcome,
+  PushOutcome,
   SessionArtifact,
   SessionEvent,
   SessionEventHandler,
@@ -218,7 +219,39 @@ interface QueuedTurn {
   timeout: number;
   resolve: (result: SessionResult) => void;
   reject: (error: Error) => void;
+  /**
+   * Messages push() wrote into this turn, by uuid, with their `command_lifecycle` state. One not yet
+   * `started` when a result arrives is answered after it, in a follow-on result of the same turn.
+   */
+  steers?: Map<string, SteerState>;
+  /** The turn reached a result while a steer was still waiting: it settles on the next result. */
+  held?: { nativeOutcome: 'completed'; tokens?: SessionTokens };
 }
+
+/** `written` until the CLI's `command_lifecycle` names it; `unconfirmed` after push() gave up waiting. */
+type SteerState = 'written' | 'queued' | 'started' | 'completed' | 'cancelled' | 'unconfirmed';
+const STEER_ACK_MS = 10_000;
+
+const TOKEN_KEYS = [
+  'input',
+  'output',
+  'cacheRead',
+  'cacheWrite',
+  'cacheWrite5m',
+  'cacheWrite1h',
+  'thinking',
+] as const;
+/** One turn's usage over several results (a steer answered after a result). Provider usage is the last result's. */
+const addTokens = (
+  a: SessionTokens | undefined,
+  b: SessionTokens | undefined,
+): SessionTokens | undefined => {
+  if (!a || !b) return b ?? a;
+  const sum: SessionTokens = { ...b };
+  for (const key of TOKEN_KEYS)
+    if (a[key] !== undefined || b[key] !== undefined) sum[key] = (a[key] ?? 0) + (b[key] ?? 0);
+  return sum;
+};
 
 // ---------------------------------------------------------------------------
 // Session
@@ -342,6 +375,10 @@ export class ClaudeCodeSession implements HarnessSession {
   private _agentsDir?: string;
   /** Inbound control requests awaiting a gate decision, by request id. */
   private _inbound = new Map<string, AbortController>();
+  /** push() calls waiting for the CLI to name their message, by uuid. */
+  private _steerAcks = new Map<string, (state: SteerState) => void>();
+  /** Steers written and not yet ended natively: a late `completed` after their turn settled is theirs. */
+  private _steerUuids = new Set<string>();
   private readonly _hookCallbackId = `agent-session-pre-tool-${crypto.randomUUID()}`;
   private _limits?: LimitSnapshot;
   private _controlSeq = 0;
@@ -501,21 +538,126 @@ export class ClaudeCodeSession implements HarnessSession {
   }
 
   /**
-   * Mid-turn push. Claude Code's stream-json stdin accepts user messages
-   * only; there is no dedicated out-of-band signal channel. So the current
-   * behavior is to emit a "push_ignored" error event — callers observe it
-   * but the model does not see the payload until the next turn.
-   *
-   * A future improvement: push via the MCP bridge (FLOW.md Loop 4) so the
-   * signal reaches the in-flight turn as a tool result the model must read.
+   * Mid-turn steer: a stream-json user message with `priority: "next"` and its own `uuid`, written
+   * while the owned turn runs. The CLI answers `command_lifecycle` queued → started → completed for
+   * that uuid. It takes the message in at the turn's next model request (after a tool result), or,
+   * when the turn's reply was already final, runs it right after that result as a follow-on result:
+   * either way it is this turn's, and send() settles on the last result (validated against claude
+   * 2.1.316, fixtures/s0/claude-steer-*.jsonl).
    */
-  async push(payload: { kind: string; text: string }): Promise<void> {
+  async push(payload: { kind: string; text: string }): Promise<PushOutcome> {
+    const ignored = (reason: string): PushOutcome => {
+      this._emitPushIgnored(payload.kind, reason);
+      return { outcome: 'ignored', reason };
+    };
+    const turn = this._inflight;
+    const a = turn?.evidence;
+    if (!turn || !a || a.dispatch !== 'attempted' || a.nativeOutcome !== 'unknown')
+      return ignored('no owned in-flight turn');
+    if (!this._proc || !this._alive) return ignored('session not running');
+    const uuid = crypto.randomUUID();
+    turn.steers ??= new Map();
+    const steers = turn.steers;
+    steers.set(uuid, 'written');
+    this._steerUuids.add(uuid);
+    const acknowledged = new Promise<SteerState>((resolve) => this._steerAcks.set(uuid, resolve));
+    try {
+      this._proc.stdin.write(
+        `${JSON.stringify({
+          type: 'user',
+          message: { role: 'user', content: [{ type: 'text', text: payload.text }] },
+          uuid,
+          parent_tool_use_id: null,
+          priority: 'next',
+        })}\n`,
+      );
+      this._proc.stdin.flush();
+    } catch (error) {
+      steers.delete(uuid);
+      this._steerAcks.delete(uuid);
+      return ignored(`write failed: ${(error as Error).message.slice(0, 200)}`);
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const state = await Promise.race([
+      acknowledged,
+      new Promise<'unconfirmed'>((resolve) => {
+        timer = setTimeout(() => resolve('unconfirmed'), STEER_ACK_MS);
+      }),
+    ]).finally(() => clearTimeout(timer));
+    this._steerAcks.delete(uuid);
+    const identity = { ...a.identity, admissionId: a.admissionId };
+    if (state === 'cancelled')
+      return ignored('the runtime cancelled it before the turn took it in');
+    if (state === 'unconfirmed') {
+      // Never named by the CLI: it no longer holds the turn open.
+      if (steers.get(uuid) === 'written') steers.set(uuid, 'unconfirmed');
+      this._releaseHeld(turn);
+      this._emit({
+        ...identity,
+        kind: 'native_status',
+        timestamp: Date.now(),
+        raw: { type: 'push-unknown', kind: payload.kind },
+      });
+      return { outcome: 'unknown' };
+    }
+    this._emit({
+      ...identity,
+      kind: 'native_status',
+      timestamp: Date.now(),
+      raw: { type: 'push-steered', kind: payload.kind, uuid },
+    });
+    return { outcome: 'steered' };
+  }
+
+  protected _emitPushIgnored(kind: string, reason: string): void {
     this._emit({
       kind: 'error',
       timestamp: Date.now(),
-      text: `push_ignored: kind=${payload.kind} — stream-json stdin has no OOB channel`,
-      raw: payload,
+      text: `push_ignored: kind=${kind} — ${reason}`,
+      raw: { kind },
     });
+  }
+
+  /** A steer of `turn` the CLI has not started yet (or not named yet). */
+  private _steerWaiting(turn: QueuedTurn): boolean {
+    for (const state of turn.steers?.values() ?? [])
+      if (state === 'written' || state === 'queued') return true;
+    return false;
+  }
+
+  /**
+   * A held turn settles with the result it already had once no steer can still produce a result:
+   * none waiting, and none started (a started steer of a held turn is its follow-on run).
+   */
+  private _releaseHeld(turn: QueuedTurn): void {
+    if (!turn.held || this._inflight !== turn || this._steerWaiting(turn)) return;
+    for (const state of turn.steers?.values() ?? []) if (state === 'started') return;
+    const a = turn.evidence;
+    a.tokens = turn.held.tokens;
+    a.nativeOutcome = turn.held.nativeOutcome;
+    turn.held = undefined;
+    this._resolveTurn();
+  }
+
+  /** Withdraw `turn`'s steers the CLI has not started, so none outlives it as an unowned turn. */
+  private async _withdrawSteers(turn: QueuedTurn, timeoutMs: number): Promise<void> {
+    const waiting = [...(turn.steers ?? [])].filter(
+      ([, state]) => state === 'queued' || state === 'written',
+    );
+    await Promise.all(
+      waiting.map(([uuid]) =>
+        this._controlRequest(
+          { subtype: 'cancel_async_message', message_uuid: uuid },
+          timeoutMs,
+        ).then(
+          (response) => {
+            if ((response.response as { cancelled?: unknown } | undefined)?.cancelled === true)
+              turn.steers?.set(uuid, 'cancelled');
+          },
+          () => {},
+        ),
+      ),
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -822,6 +964,10 @@ export class ClaudeCodeSession implements HarnessSession {
     if (turn?.evidence.dispatch !== 'attempted' || turn.evidence.nativeOutcome !== 'unknown')
       return 'no-turn';
     const deadline = Date.now() + (opts?.timeoutMs ?? 5_000);
+    // A stop is for the whole turn: a steer still waiting dies with it, never runs after it.
+    await this._withdrawSteers(turn, Math.max(1, Math.min(2_000, deadline - Date.now())));
+    this._releaseHeld(turn);
+    if (turn.evidence.nativeOutcome !== 'unknown') return 'acknowledged';
     try {
       await this._controlRequest({ subtype: 'interrupt' }, Math.max(1, deadline - Date.now()));
     } catch {
@@ -1278,6 +1424,30 @@ export class ClaudeCodeSession implements HarnessSession {
       return;
     }
 
+    // A steer's lifecycle: the CLI naming a message push() wrote into the owned turn.
+    if (raw.type === 'command_lifecycle' && typeof raw.command_uuid === 'string') {
+      const turn = this._inflight;
+      const state = raw.state;
+      const ours = this._steerUuids.has(raw.command_uuid);
+      if (ours && (state === 'completed' || state === 'cancelled'))
+        this._steerUuids.delete(raw.command_uuid);
+      if (
+        turn?.steers?.has(raw.command_uuid) &&
+        (state === 'queued' ||
+          state === 'started' ||
+          state === 'completed' ||
+          state === 'cancelled')
+      ) {
+        turn.steers.set(raw.command_uuid, state);
+        this._steerAcks.get(raw.command_uuid)?.(state);
+        if (state === 'cancelled') this._releaseHeld(turn);
+        return;
+      }
+      // A steer's own end after its turn settled (its follow-on result settled the turn first).
+      if (!ours) this._unattributed(raw, 'no-admission');
+      return;
+    }
+
     // Account limits are account-level evidence, never part of an admission's output.
     if (raw.type === 'rate_limit_event') {
       const snapshot = claudeRateLimitSnapshot(raw.rate_limit_info);
@@ -1353,6 +1523,7 @@ export class ClaudeCodeSession implements HarnessSession {
       correlation: 'ordered-stream',
     };
     const terminal = raw.type === 'result';
+    let holding = false;
     if (terminal) {
       if (terminalKey) this._seenTerminals.add(terminalKey);
       const subtype = typeof raw.subtype === 'string' ? raw.subtype : undefined;
@@ -1369,6 +1540,12 @@ export class ClaudeCodeSession implements HarnessSession {
         (status !== undefined && status >= 400) ||
         reason === 'api_error';
       a.nativeOutcome = failed ? 'failed' : subtype === 'success' ? 'completed' : 'unknown';
+      // A steer the CLI has not started yet runs after this result, still in this turn: the turn
+      // stays open (and this result reads as an intermediate one) until the steer's own result.
+      if (a.nativeOutcome === 'completed' && this._steerWaiting(turn)) {
+        holding = true;
+        a.nativeOutcome = 'unknown';
+      }
       a.terminal = {
         type: 'result',
         eventId: terminalKey,
@@ -1405,6 +1582,16 @@ export class ClaudeCodeSession implements HarnessSession {
       this._emit(e);
     }
     if (terminal) {
+      // Each result reports its own run's usage: the turn's is their sum.
+      const tokens = addTokens(turn.held?.tokens, a.tokens);
+      if (holding) {
+        turn.held = { nativeOutcome: 'completed', ...(tokens ? { tokens } : {}) };
+        a.tokens = tokens;
+        return;
+      }
+      turn.held = undefined;
+      a.tokens = tokens;
+      if (a.nativeOutcome === 'failed') void this._withdrawSteers(turn, 2_000);
       if (a.nativeOutcome !== 'unknown') this._resolveTurn();
       else
         this._rejectInflight(

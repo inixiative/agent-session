@@ -23,6 +23,7 @@ import {
   type ClaudeCodeSessionConfig,
   type PipedSubprocess,
 } from './claude-code-session';
+import type { PushOutcome } from './harness-session';
 import { TRANSPORTS } from './transport';
 
 /** The subset of the SDK's Query this transport uses. */
@@ -427,6 +428,16 @@ export class ClaudeAgentSdkSession extends ClaudeCodeSession {
       spawn: bridge(config),
     });
     this._sdk = config;
+  }
+
+  /**
+   * Not wired here: the bridge forwards a steer's `priority` to the SDK's input, but whether the SDK
+   * stream surfaces the `command_lifecycle` frames a steer is tracked by has not been verified.
+   */
+  override async push(payload: { kind: string; text: string }): Promise<PushOutcome> {
+    const reason = 'the Agent SDK transport does not steer (not verified)';
+    this._emitPushIgnored(payload.kind, reason);
+    return { outcome: 'ignored', reason };
   }
 
   /** get_usage is not reachable through the SDK Query API. */

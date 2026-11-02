@@ -18,6 +18,7 @@ import {
   type HarnessSession,
   NativeBindingMissingError,
   type NativeInterruptOutcome,
+  type PushOutcome,
   type SessionArtifact,
   type SessionAttempt,
   type SessionEvent,
@@ -1859,16 +1860,18 @@ export class MuseSession implements HarnessSession {
   }
 
   /** Mid-turn steer (turn/steer) into the owned in-flight turn; otherwise records push_ignored. */
-  async push(payload: { kind: string; text: string }): Promise<void> {
+  async push(payload: { kind: string; text: string }): Promise<PushOutcome> {
     const a = this._inflight?.evidence;
     const sessionId = this._externalSessionId;
-    const ignored = (reason: string) =>
+    const ignored = (reason: string): PushOutcome => {
       this._emit({
         kind: 'error',
         timestamp: Date.now(),
         text: `push_ignored: kind=${payload.kind} — ${reason}`,
         raw: { kind: payload.kind },
       });
+      return { outcome: 'ignored', reason };
+    };
     if (
       a?.dispatch !== 'attempted' ||
       a.nativeOutcome !== 'unknown' ||
@@ -1894,16 +1897,18 @@ export class MuseSession implements HarnessSession {
         timestamp: Date.now(),
         raw: { type: 'push-steered', kind: payload.kind },
       });
+      return { outcome: 'steered' };
     } catch (error) {
       // A refusal is the runtime's answer; no answer leaves delivery unknown, never "ignored".
-      if (error instanceof MspError) ignored(`turn/steer refused: ${error.message.slice(0, 200)}`);
-      else
-        this._emit({
-          ...identity,
-          kind: 'native_status',
-          timestamp: Date.now(),
-          raw: { type: 'push-unknown', kind: payload.kind },
-        });
+      if (error instanceof MspError)
+        return ignored(`turn/steer refused: ${error.message.slice(0, 200)}`);
+      this._emit({
+        ...identity,
+        kind: 'native_status',
+        timestamp: Date.now(),
+        raw: { type: 'push-unknown', kind: payload.kind },
+      });
+      return { outcome: 'unknown' };
     }
   }
 }

@@ -411,6 +411,11 @@ export type ToolGate = (request: ToolRequest) => ToolDecision | Promise<ToolDeci
 /** `acknowledged`: the runtime confirmed the stop and the turn reached a native terminal. */
 export type NativeInterruptOutcome = 'acknowledged' | 'no-turn' | 'unacknowledged';
 
+/** What became of a push(): `steered` (the runtime took it into the owned turn), `unknown` (sent, never confirmed), `ignored` (not delivered; `reason` says why). */
+export type PushOutcome =
+  | { readonly outcome: 'steered' | 'unknown' }
+  | { readonly outcome: 'ignored'; readonly reason: string };
+
 export interface HarnessSession {
   /** How this session reaches its model, with the capabilities that transport declares. */
   readonly transport?: TransportDescriptor;
@@ -484,15 +489,15 @@ export interface HarnessSession {
   onToolRequest?(gate: ToolGate): () => void;
 
   /**
-   * Mid-turn push: out-of-band signal injected into an in-flight turn.
-   * Used by guards and Herald to deliver urgent feedback. Best-effort —
-   * the underlying runtime may or may not honor the push.
+   * Mid-turn push (steer): add input to the owned in-flight turn, where the transport declares
+   * `push: "steer"`. It never opens a turn of its own: the pushed text is answered inside the turn
+   * it was pushed into, whose send() settles once that turn (and everything pushed into it) ends.
    *
-   * Implementations that cannot support mid-turn push should emit a
-   * "push_ignored" error event rather than throw, so callers can observe
-   * that the push was attempted but not delivered.
+   * Never throws. `ignored` (with an emitted "push_ignored" error event) means nothing was
+   * delivered: no owned in-flight turn, the runtime refused, or the transport cannot steer.
+   * `unknown` means it was written but the runtime never confirmed it.
    */
-  push(payload: { kind: string; text: string }): Promise<void>;
+  push(payload: { kind: string; text: string }): Promise<PushOutcome>;
 
   /** Full session record for Oracle evaluation. */
   artifact(): SessionArtifact;

@@ -892,13 +892,15 @@ for (const engine of ['claude', 'app'] as const) {
     }
   });
 }
-test("claude: event ownership detaches caller data without freezing the caller's object", async () => {
+test("claude: an ignored push records only its kind, never the caller's object", async () => {
   const f = setup('claude');
   const payload = { kind: 'controlled', text: 'payload', nested: { values: ['ORIGINAL'] } };
-  await f.session.push(payload);
+  expect(await f.session.push(payload)).toEqual({
+    outcome: 'ignored',
+    reason: 'no owned in-flight turn',
+  });
   payload.nested.values[0] = 'CALLER_CHANGED';
   const event = f.session.events[0];
-  expect((event.raw as typeof payload).nested.values).toEqual(['ORIGINAL']);
+  expect(event.raw).toEqual({ kind: 'controlled' });
   expect(Object.isFrozen(payload.nested)).toBe(false);
-  expect(Object.isFrozen((event.raw as typeof payload).nested.values)).toBe(true);
 });

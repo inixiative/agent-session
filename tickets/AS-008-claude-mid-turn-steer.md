@@ -1,6 +1,6 @@
 # AS-008: Claude mid-turn steer
 
-**Status:** Proposed (not built)
+**Status:** ✅ Built for `claude-cli` (2026-11-02). `claude-agent-sdk` stays `push: 'none'`: the SDK stream's `command_lifecycle` frames are unverified.
 
 ## Goal
 
@@ -19,9 +19,15 @@ Then flip `TRANSPORTS[...].push` from `'none'` to `'steer'` for each transport t
 
 ## Acceptance
 
-- [ ] A steer during a running Claude turn is consumed by that turn (cassette).
-- [ ] `TRANSPORTS` reflects what each transport really does.
-- [ ] Foundry CORE-001 can then gate on it.
+- [x] A steer during a running Claude turn is consumed by that turn (cassette: `fixtures/claude-steer/`, `tests/claude-steer.test.ts`). The bare CLI honours `priority` (2.1.316): no SDK needed.
+- [x] `TRANSPORTS` reflects what each transport really does.
+- [x] Foundry CORE-001 can then gate on it.
+
+## As built
+
+- Taken in after a tool result: one result. Reply already final: the steer runs right after that result as a follow-on result; the session holds the turn open until it (send() settles once, usage summed).
+- A stop withdraws a steer not yet started (`cancel_async_message`) before it interrupts.
+- `push()` now returns `PushOutcome` (`steered` / `unknown` / `ignored` + reason) on every transport.
 
 ## Related
 

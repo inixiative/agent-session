@@ -24,7 +24,7 @@ Proposed after the T3 Code / Paseo refresh (Oracle `docs/foundry/reference/COMPA
 | Ticket | Goal | Status |
 | --- | --- | --- |
 | [AS-007](AS-007-codex-plans-and-subagent-items.md) | Codex plans and collab sub-agent items reach the session stream | Proposed |
-| [AS-008](AS-008-claude-mid-turn-steer.md) | Claude mid-turn steer (`priority`) on both Claude transports | Proposed |
+| [AS-008](AS-008-claude-mid-turn-steer.md) | Claude mid-turn steer (`priority`) on both Claude transports | ✅ claude-cli (2026-11-02); Agent SDK not verified |
 
 ## Responsibilities
 
