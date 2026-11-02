@@ -13,9 +13,15 @@
 // is declared absent, with a note.
 // ---------------------------------------------------------------------------
 
-export type TransportKind = 'claude-cli' | 'codex-app-server' | 'claude-agent-sdk' | 'acp' | 'api';
+export type TransportKind =
+  | 'claude-cli'
+  | 'codex-app-server'
+  | 'muse-serve'
+  | 'claude-agent-sdk'
+  | 'acp'
+  | 'api';
 
-export type TransportRuntime = 'claude' | 'codex' | 'external';
+export type TransportRuntime = 'claude' | 'codex' | 'muse' | 'external';
 
 export interface TransportCapabilities {
   /** Continue a thread by native ID in a new process. */
@@ -113,6 +119,35 @@ export const TRANSPORTS: Readonly<Record<TransportKind, TransportDescriptor>> = 
       'Primed decisions (CodexPrimedSessions) host every key as a thread of one process per account and fork the primed thread per cycle.',
       'thread/rollback is refused by codex-cli 0.155 for both ephemeral and paginated threads; session fork() is not wired.',
       'Images go to turn/start as `image` inputs with a `data:` URL, after the text.',
+    ],
+  },
+  'muse-serve': {
+    kind: 'muse-serve',
+    runtime: 'muse',
+    status: 'implemented',
+    verified: 'live',
+    capabilities: {
+      resume: 'native',
+      fork: 'native',
+      rollback: 'none',
+      interrupt: 'acknowledged',
+      push: 'steer',
+      approvals: 'callback',
+      usage: true,
+      limits: { stream: true, poll: true },
+      textOnly: false,
+      images: true,
+      primed: 'none',
+      billing: 'subscription',
+    },
+    notes: [
+      "`muse serve --trust-workspace` (plus `--disable-sandbox` under bypassPermissions) driven through Meta's `@muse-code/sdk` MuseClient, pinned to the installed CLI's version.",
+      'Billing is the saved Muse Code login: metered keys and endpoints (META_, LLM_, MODEL_, LLAMA_, OPENROUTER_, ANTHROPIC_, OPENAI_), Meta auth endpoints (TBH_) and the MUSE_ model, experiment, contributor, approval-judge and fail-open switches are removed from the child environment; a resumed or forked session must report provider `meta`.',
+      'Approvals use an explicit permission profile (`:ask-me` supervised, `:read-only` plan, `:unrestricted` bypass), never the host default `:auto-review`, whose AI reviewer would decide instead of the gates; the committed profile, approval mode and (gated) a human reviewer are read back before any turn.',
+      "Work Muse starts itself (cron firings, monitor and background-terminal wakes, goals, reminder agents, workflows, another client's messages) is folded like a turn's and emitted with `unattributedReason: 'task'`, plus a `task` lifecycle typed `muse-cron`, `muse-monitor`, `muse-goal`, `muse-reminder`, `muse-workflow` or `muse-turn`; it is seen only while this host has the session loaded.",
+      "interruptNative() sends turn/interrupt; push() sends turn/steer; fork() runs session/fork on the new session's own host; readLimits() sends usage/read.",
+      'userInput/request questions go to onUserInput(); without an answer they are cancelled with a reason, so a turn never waits on them.',
+      'Live-verified (muse 1.4.14): start, profile read-back, multi-stage shell and network approvals, text and tool events, token usage, usage/changed and usage/read (recorded in fixtures/muse); fork, resume with setApprovalMode and sessionNotFound were checked live without a model turn (not recorded). Images, steer, interrupt, questions and Muse-initiated turns follow the SDK wire types without a live run.',
     ],
   },
   'claude-agent-sdk': {

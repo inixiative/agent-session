@@ -1,10 +1,10 @@
 // Subscription usage limits, normalized across runtimes. Account identity
 // (email, account/organization IDs) is never read into a snapshot.
 
-export type LimitRuntime = 'claude' | 'codex';
+export type LimitRuntime = 'claude' | 'codex' | 'muse';
 
 export interface LimitWindow {
-  /** Stable per runtime: Claude `five_hour`/`seven_day`/…, Codex `primary`/`secondary`. */
+  /** Stable per runtime: Claude `five_hour`/`seven_day`/…, Codex `primary`/`secondary`, Muse `window`/`weekly`. */
   readonly id: string;
   /** 0–100. */
   readonly usedPercent: number;
@@ -101,6 +101,42 @@ export function codexLimitSnapshot(
     ...(blocked !== undefined ? { blocked } : {}),
     ...(reached ? { reachedType: reached } : {}),
     ...(typeof snapshot.planType === 'string' ? { plan: snapshot.planType } : {}),
+  };
+}
+
+/**
+ * Muse `usage/read` result (`{ usage }`) or `usage/changed` params (the usage itself): the plan's
+ * rolling `window` (five hours) and `weekly` windows, in percent used. Meta reports the windows from
+ * its latest model response, so a host that has not served a turn yet reports none. `tier` is not read:
+ * on the wire it is a numeric id (the CLI shows the plan's name), not a label known to be account-free.
+ */
+export function museLimitSnapshot(
+  value: unknown,
+  source: LimitSnapshot['source'],
+  observedAt = Date.now(),
+): LimitSnapshot | undefined {
+  const outer = object(value);
+  const usage = object(outer?.usage) ?? outer;
+  const rolling = object(usage?.window),
+    weekly = object(usage?.weekly);
+  const ms = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : undefined);
+  const windows = [
+    ...window(
+      'window',
+      percent(rolling?.usedPercent),
+      ms(rolling?.resetsAtMs),
+      typeof rolling?.windowDurationMins === 'number' ? rolling.windowDurationMins : undefined,
+    ),
+    ...window('weekly', percent(weekly?.usedPercent), ms(weekly?.resetsAtMs), 10_080),
+  ];
+  if (!windows.length) return undefined;
+  return {
+    runtime: 'muse',
+    source,
+    observedAt: ms(usage?.observedAtMs) ?? observedAt,
+    windows,
+    // Explicit both ways, so a later report clears a block an earlier one (or a quota stop) set.
+    blocked: windows.some((w) => w.usedPercent >= 100),
   };
 }
 

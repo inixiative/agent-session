@@ -74,23 +74,36 @@ arrive as `rate_limit` events.
 ```ts
 import { createSession, TRANSPORTS } from "@inixiative/agent-session";
 
-const kind = "codex-app-server";            // or claude-cli, claude-agent-sdk
+const kind = "codex-app-server";            // or claude-cli, claude-agent-sdk, muse-serve
 if (TRANSPORTS[kind].capabilities.interrupt === "acknowledged") { /* … */ }
 const session = createSession(kind, { cwd, model: "gpt-6-luna", env: { CODEX_HOME: profile } });
 ```
 
-| | claude-cli | codex-app-server | claude-agent-sdk | acp | api |
-|---|---|---|---|---|---|
-| Status | ✅ live | ✅ live | ✅ live | stub | stub |
-| Resume / fork | native / native | native / – | native / native | – | – |
-| Interrupt | acknowledged | acknowledged | acknowledged | – | – |
-| Push | – | steer | – | – | – |
-| Approvals | callback | callback | callback | – | – |
-| Limits stream / poll | ✅ / ✅ | ✅ / ✅ | ✅ / – | – | – |
-| Primed reset | fork | fork | – | – | – |
+| | claude-cli | codex-app-server | muse-serve | claude-agent-sdk | acp | api |
+|---|---|---|---|---|---|---|
+| Status | ✅ live | ✅ live | ✅ live | ✅ live | stub | stub |
+| Resume / fork | native / native | native / – | native / native | native / native | – | – |
+| Interrupt | acknowledged | acknowledged | acknowledged | acknowledged | – | – |
+| Push | – | steer | steer | – | – | – |
+| Approvals | callback | callback | callback | callback | – | – |
+| Limits stream / poll | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ | ✅ / – | – | – |
+| Primed reset | fork | fork | – | – | – | – |
 
 Codex runs only over `codex app-server --listen stdio://` (`CodexAppServerSession`);
 Codex CLI 0.155 has no `mcp-server` subcommand.
+
+Muse Code runs over `muse serve` through Meta's `@muse-code/sdk` (`MuseSession`), pinned to
+the CLI's version (1.4.14): a host serving another version is refused at start. It bills the
+saved Muse login: metered keys and endpoints never reach it (nor Muse's own tool runs, which
+inherit its environment: a repo command needing `OPENAI_API_KEY` will not see it under Muse),
+and a resumed session must be on provider `meta`. Per-login isolation is `env: { XDG_CONFIG_HOME, XDG_DATA_HOME }` (login and
+sessions). `musePermissions(mode)` maps the host modes to an explicit permission profile, because
+the host default lets Muse's AI reviewer answer approvals instead of the gates. Questions arrive
+through `onUserInput()`; unanswered ones are cancelled with a reason. An approval offering
+no approve-once or reject choice is reported as an `error` event and left open (the turn ends
+at its timeout). Work Muse starts itself
+(cron firings, monitors, goals, reminder agents) is emitted too, marked
+`unattributedReason: "task"` with a `task` lifecycle typed `muse-cron`, `muse-monitor`, ….
 
 Full matrix, notes and what is stubbed: [docs/transports-pools-routing.md](docs/transports-pools-routing.md).
 
@@ -254,6 +267,7 @@ snapshots in the artifact but do not fabricate a completed-turn total.
 | Claude Code | ✅ shipped |
 | Codex app-server | ✅ shipped (`CodexAppServerSession`, `CodexPrimedSessions`) |
 | Claude Agent SDK | ✅ shipped (`ClaudeAgentSdkSession`; caller supplies `query`) |
+| Muse Code | ✅ shipped (`MuseSession`, through `@muse-code/sdk`) |
 | ACP agents / direct API | typed stubs |
 | Gemini CLI | planned |
 | Grok CLI | planned (when its headless/stream mode matures) |

@@ -12,6 +12,7 @@ import {
   createSession,
   describeTransport,
   type HarnessSession,
+  MuseSession,
   type SessionEvent,
   sdkOptionsFromArgv,
   TRANSPORTS,
@@ -106,6 +107,7 @@ describe('transport matrix', () => {
     const spawn = () => fakeProcess().proc;
     expect(new ClaudeCodeSession({ spawn }).transport).toBe(TRANSPORTS['claude-cli']);
     expect(new CodexAppServerSession({ spawn }).transport).toBe(TRANSPORTS['codex-app-server']);
+    expect(new MuseSession().transport).toBe(TRANSPORTS['muse-serve']);
     expect(
       new ClaudeAgentSdkSession({
         query: () => ({
@@ -126,9 +128,10 @@ describe('transport matrix', () => {
 
   test('capability flags match the methods each implementation exposes', () => {
     const spawn = () => fakeProcess().proc;
-    const sessions: Record<'claude-cli' | 'codex-app-server', HarnessSession> = {
+    const sessions: Record<'claude-cli' | 'codex-app-server' | 'muse-serve', HarnessSession> = {
       'claude-cli': new ClaudeCodeSession({ spawn }),
       'codex-app-server': new CodexAppServerSession({ spawn }),
+      'muse-serve': new MuseSession(),
     };
     for (const [kind, session] of Object.entries(sessions)) {
       const caps = TRANSPORTS[kind as keyof typeof sessions].capabilities;
