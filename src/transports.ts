@@ -8,6 +8,7 @@ import {
 import { ClaudeCodeSession, type ClaudeCodeSessionConfig } from './claude-code-session';
 import { CodexAppServerSession, type CodexSessionConfig } from './codex-session';
 import type { HarnessSession } from './harness-session';
+import { MuseSession, type MuseSessionConfig } from './muse-session';
 import {
   TRANSPORTS,
   type TransportDescriptor,
@@ -37,6 +38,7 @@ export interface ApiSessionConfig {
 export interface TransportConfigs {
   'claude-cli': ClaudeCodeSessionConfig;
   'codex-app-server': CodexSessionConfig;
+  'muse-serve': MuseSessionConfig;
   'claude-agent-sdk': ClaudeAgentSdkSessionConfig;
   acp: AcpSessionConfig;
   api: ApiSessionConfig;
@@ -47,7 +49,7 @@ export class AcpSession {
   constructor(_config: AcpSessionConfig) {
     throw new TransportUnavailableError(
       'acp',
-      'no ACP client is implemented in this package; use claude-cli, claude-agent-sdk or codex-app-server',
+      'no ACP client is implemented in this package; use claude-cli, claude-agent-sdk, codex-app-server or muse-serve',
     );
   }
 }
@@ -82,6 +84,8 @@ export function createSession<K extends TransportKind>(
       return new ClaudeCodeSession(config as ClaudeCodeSessionConfig);
     case 'codex-app-server':
       return new CodexAppServerSession(config as CodexSessionConfig);
+    case 'muse-serve':
+      return new MuseSession(config as MuseSessionConfig);
     case 'claude-agent-sdk':
       return new ClaudeAgentSdkSession(config as ClaudeAgentSdkSessionConfig);
     case 'acp':

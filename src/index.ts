@@ -67,8 +67,28 @@ export {
   type LimitWindow,
   limitUtilization,
   mergeLimits,
+  museLimitSnapshot,
 } from './limits';
 export { type LimitProbeOptions, probeClaudeLimits, probeCodexLimits } from './limits-probe';
+// Muse Code adapter: one `muse serve` host per session through Meta's @muse-code/sdk.
+export {
+  MUSE_SDK_VERSION,
+  type MuseApprovalMode,
+  type MuseConnect,
+  type MuseHost,
+  type MuseInitializeResult,
+  type MuseLaunch,
+  type MusePermissionProfile,
+  type MusePermissions,
+  type MuseReasoningEffort,
+  MuseSession,
+  type MuseSessionConfig,
+  type MuseUserInputAnswer,
+  type MuseUserInputHandler,
+  type MuseUserInputQuestion,
+  type MuseUserInputRequest,
+  musePermissions,
+} from './muse-session';
 export {
   ContinuityError,
   type ContinuityRefusal,

@@ -217,7 +217,12 @@ export class SubscriptionPool {
       if (!config.id || this._instances.has(config.id))
         throw Error(`Duplicate or empty instance id "${config.id}"`);
       const descriptor = TRANSPORTS[config.transport];
-      if (descriptor?.status !== 'implemented' || descriptor.runtime === 'external')
+      // Muse keeps its login and sessions under two XDG homes, not one profile variable; not pooled yet.
+      if (
+        descriptor?.status !== 'implemented' ||
+        descriptor.runtime === 'external' ||
+        descriptor.runtime === 'muse'
+      )
         throw Error(`Instance ${config.id}: transport "${config.transport}" cannot be pooled`);
       const runtime = descriptor.runtime;
       const variable = PROFILE_VARIABLE[runtime];

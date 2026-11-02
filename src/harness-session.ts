@@ -11,7 +11,7 @@
 // captures every event for Oracle, and supports fork/interrupt.
 //
 // Implementations: ClaudeCodeSession, CodexAppServerSession,
-// ClaudeAgentSdkSession. How a model is reached is the session's transport
+// ClaudeAgentSdkSession, MuseSession. How a model is reached is the session's transport
 // (see transport.ts); every transport implements this one contract.
 // ---------------------------------------------------------------------------
 
@@ -84,12 +84,13 @@ export class SessionTurnError extends Error {
  * session's cwd and config home: Claude found no transcript ("No conversation found with session
  * ID": cleaned up, deleted, or kept under another project directory or `CLAUDE_CONFIG_DIR`), or
  * Codex found no rollout ("no rollout found for thread id": deleted, or under another
- * `CODEX_HOME`). No turn ran. The caller decides what comes next, typically a fresh session seeded
+ * `CODEX_HOME`), or Muse answered `sessionNotFound` (deleted, under another `XDG_DATA_HOME`, or
+ * an ephemeral host that died with it). No turn ran. The caller decides what comes next, typically a fresh session seeded
  * from its own record of the conversation; `cwd` says where the lookup was made.
  */
 export class NativeBindingMissingError extends Error {
   constructor(
-    readonly runtime: 'claude-code' | 'codex-app-server',
+    readonly runtime: 'claude-code' | 'codex-app-server' | 'muse',
     readonly binding: string,
     message: string,
     readonly cwd?: string,
