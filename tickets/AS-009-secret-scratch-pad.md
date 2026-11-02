@@ -1,6 +1,6 @@
 # AS-009: Secret scratch pad
 
-**Status:** 📝 Proposed (Aron, 2026-11-02). Foundry turns it on with a setting: Foundry FEAT-005.
+**Status:** ✅ Built (0.10.0, 2026-11-02): `src/secret-scratch.ts`. Foundry turns it on with a setting: Foundry FEAT-005.
 
 ## Goal
 
@@ -56,3 +56,13 @@ A session option, off by default, that lets a user hand secrets to an agent with
 - [ ] `consume: true` removes the block, and the dagger once empty.
 - [ ] Read, Grep, Edit and a `cat` naming the pad or a `.private` path are denied (Claude; Codex with approvals on).
 - [ ] The pad file is 0600. The consumer chooses its directory (`scratchDir`) and removes it when the work ends; the pad survives a session restart on the same directory.
+
+## As built (2026-11-02)
+
+- `SecretScratchPad(dir)`: `lift` (synchronous, so a turn path that cannot wait can call it), `list`, `threads`, `env`, `write`, `pipe` (async), `consume`, `clear`, `scrub`, `heldFiles`. A reference is thread, message, position: `†<message>.<n>` inside its thread, `†<thread>/<message>.<n>` from anywhere, so a leftover pad can be found and used from another thread.
+- The pad is plain text, one per thread (`<thread>.pad`), values JSON-encoded on their block line; a line it doesn't recognise makes the pad unreadable rather than being dropped on the next rewrite. Only a missing file reads as empty: any other read failure stops the operation.
+- `env` writes single quotes when a value holds `$` (no expansion), double quotes with escapes when it holds `'` or a newline, and replaces the last line for the key (loaders take the last). `pipe` reads a key back the same way, kills the whole process group on a timeout, and keeps the block when the command fails.
+- Files `env` and `write` touched are recorded (`held-files.json`); `privatePathDenial` refuses a call that names one, a `.private` path, an extra glob or the pad directory. The tool's own calls are exempt only through the caller's `isOwnTool`; the pad directory is never a target.
+- Not done, by design: a multi-line secret cannot be lifted (one word after `$$`); a mid-word or quoted `$$` is not a marker; trailing punctuation is part of the word.
+- Limits: a pipe command can still copy a value out (`cat > file`), and the exit code is a one-byte channel. The gate reads names, not contents: a directory-wide search can still reach a held file. Codex under full access asks no approvals, so the gate never sees its calls.
+- Reviewed adversarially before release; the findings fixed are in the PR.
