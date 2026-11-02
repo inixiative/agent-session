@@ -26,6 +26,12 @@ Proposed after the T3 Code / Paseo refresh (Oracle `docs/foundry/reference/COMPA
 | [AS-007](AS-007-codex-plans-and-subagent-items.md) | Codex plans and collab sub-agent items reach the session stream | Proposed |
 | [AS-008](AS-008-claude-mid-turn-steer.md) | Claude mid-turn steer (`priority`) on both Claude transports | ✅ claude-cli (2026-11-02); Agent SDK not verified |
 
+## Secrets (2026-11-02)
+
+| Ticket | Goal | Status |
+| --- | --- | --- |
+| [AS-009](AS-009-secret-scratch-pad.md) | `$$` secrets lifted into a scratch pad the agent uses through a tool that returns nothing; private paths blocked. Opt-in | Proposed |
+
 ## Responsibilities
 
 - **agent-session:** manage sessions, allocate execution from configured pools, and continue work within caller-supplied policies.
