@@ -226,12 +226,12 @@ const CLIENT_INFO = { name: 'agent_session', title: 'agent-session', version: '1
 /**
  * Inherited variables that would bill, route or loosen Muse away from its saved subscription login
  * and the gates, by the names the 1.4.14 binary reads: metered keys and endpoints (META_, LLM_,
- * MODEL_, LLAMA_, OPENROUTER_, ANTHROPIC_, OPENAI_), Meta's auth and key-mint endpoints (TBH_), and
- * MUSE_ switches for the model, experiments, contributor mode, the approval judge and a fail-open
- * profile.
+ * MODEL_, LLAMA_, OPENROUTER_, ANTHROPIC_, OPENAI_), Meta's auth and key-mint endpoints, and MUSE_
+ * switches for the model, experiments, contributor mode, the approval judge and a fail-open
+ * profile. Muse's own tool runs inherit this environment, so they do not see these either.
  */
 const COMPETING_ENV =
-  /^(META_|LLM_|MODEL_|LLAMA_|OPENROUTER_|ANTHROPIC_|OPENAI_|TBH_|MUSE_EXPERIMENTAL_|MUSE_(MODEL|CONTRIBUTOR_MODE|DISABLE_APPROVAL_JUDGE|PERMISSION_PROFILE_FAIL_OPEN)$)/;
+  /^(META_|LLM_|MODEL_|LLAMA_|OPENROUTER_|ANTHROPIC_|OPENAI_|TBH_(AUTH|MINT)_BASE_URL$|MUSE_EXPERIMENTAL_|MUSE_(MODEL|CONTRIBUTOR_MODE|DISABLE_APPROVAL_JUDGE|PERMISSION_PROFILE_FAIL_OPEN)$)/;
 
 export class MuseSession implements HarnessSession {
   get transport() {
@@ -285,6 +285,8 @@ export class MuseSession implements HarnessSession {
   private _items = new Map<string, TrackedItem>();
   /** Frames for turns not yet known while our turn/start answer is due: the answer names our turn. */
   private _held: Array<{ method: string; params: unknown }> = [];
+  /** Turns seen while a turn/start answer was lost: possibly ours, so never claimed as Muse's. */
+  private _unknownTurns = new Set<string>();
   /** Settles when the in-flight turn/start answer arrives (or fails). */
   private _ackDue?: Promise<void>;
   private _ackDone?: () => void;
@@ -425,7 +427,10 @@ export class MuseSession implements HarnessSession {
     this._host = null;
     this._client = null;
     this._session = null;
-    this._held = [];
+    // Frames the host already sent still reach the record; their ownership is unknown.
+    const pending = this._inflight?.evidence;
+    if (pending?.rpcOutcome === 'pending') pending.rpcOutcome = 'unknown';
+    this._flushHeld();
     // Through the client first: it marks the EOF as ours, not a host death that discards sessions.
     void Promise.resolve(client?.close())
       .catch(() => undefined)
@@ -700,6 +705,8 @@ export class MuseSession implements HarnessSession {
     if (turn.timeout > 0)
       this._turnTimer = setTimeout(() => {
         this._turnTimer = null;
+        // An approval waiting on an answer that never came must not hold the host forever.
+        this._releaseAck();
         this._rejectInflight(new Error(`Turn timed out after ${turn.timeout}ms`), 'timeout');
       }, turn.timeout);
   }
@@ -1046,13 +1053,25 @@ export class MuseSession implements HarnessSession {
     }
   }
 
-  /** Classify the frames held for the turn/start answer, now that it named (or did not) our turn. */
-  private _flushHeld(): void {
+  /** Approvals and questions waiting on the turn/start answer go on, attributed or not. */
+  private _releaseAck(): void {
     this._ackDone?.();
     this._ackDone = undefined;
     this._ackDue = undefined;
+  }
+
+  /** Classify the frames held for the turn/start answer, now that it named (or did not) our turn. */
+  private _flushHeld(): void {
+    this._releaseAck();
     const held = this._held;
     this._held = [];
+    const a = this._inflight?.evidence;
+    if (a?.rpcOutcome === 'unknown' && !a.identity.turnId)
+      for (const frame of held) {
+        const params = object(frame.params);
+        const turnId = str(params?.turnId) ?? str(object(params?.item)?.turnId);
+        if (turnId && !this._museTurns.has(turnId)) this._unknownTurns.add(turnId);
+      }
     for (const frame of held) this._observe(frame.method, frame.params);
   }
 
@@ -1122,8 +1141,17 @@ export class MuseSession implements HarnessSession {
       return [];
     }
     const owned = !!a && !!turnId && turnId === a.identity.turnId;
-    if (turnId && this._seenTerminals.has(turnId) && !method.startsWith('session/'))
+    // A finished turn never starts again: late frames (usage after the terminal) are diagnostics.
+    if (turnId && this._seenTerminals.has(turnId))
       return unowned(method === 'turn/completed' ? 'duplicate-terminal' : 'after-terminal');
+    // Held while a turn/start answer that never came was due: the turn may be ours; claim nothing.
+    if (turnId && this._unknownTurns.has(turnId))
+      return unowned('no-admission').map((event) => ({
+        ...event,
+        turnId,
+        ...(itemId ? { itemId } : {}),
+        ...(item ? { raw: { method, itemKind: kindLabel(item) } } : {}),
+      }));
     if (!owned) {
       // Work Muse runs without a send from us still reaches the caller, marked as a task.
       if (turnId) return this._museTurn(method, params, sessionId, turnId, item, itemId);
@@ -1321,7 +1349,8 @@ export class MuseSession implements HarnessSession {
       case 'item/completed': {
         if (!item || !itemId) return [...out, ...status()];
         const trigger = museTrigger(item);
-        if (trigger && !entry.trigger) {
+        // A specific wake (cron, monitor, …) outranks the prompt message it delivers.
+        if (trigger && (!entry.trigger || (entry.trigger === 'message' && trigger !== 'message'))) {
           entry.trigger = trigger;
           const description = triggerDescription(item);
           out.push(lifecycle('updated', description ? { description } : {}));

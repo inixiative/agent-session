@@ -620,10 +620,20 @@ describe('MuseSession contract', () => {
           permissionState: {
             profileId: ':ask-me',
             reviewerAuthority: 'autoReview',
-            axes: { reviewer: 'autoReview' },
+            axes: { reviewer: 'human' },
           },
         },
         'reviewer-not-human (autoReview)',
+      ],
+      [
+        {
+          permissionState: {
+            profileId: ':ask-me',
+            reviewerAuthority: 'human',
+            axes: { reviewer: 'autoReview' },
+          },
+        },
+        'reviewer-not-human (human)',
       ],
     ] as const) {
       const { fake } = textHost();
@@ -796,6 +806,59 @@ describe('MuseSession surfaces Muse-initiated work', () => {
       session.events.find((e) => e.task?.taskId === 'cron-turn-2' && e.task.phase === 'ended')
         ?.task,
     ).toMatchObject({ summary: 'cron says hi', status: 'completed' });
+  });
+
+  test('usage after a terminal is a diagnostic, never a new task', async () => {
+    const { fake } = textHost();
+    const session = open(fake);
+    await session.start();
+    await session.send('hi');
+    cronTurn(fake, 'cron-turn-3');
+    await Bun.sleep(10);
+    const before = session.events.length;
+    for (const turnId of [TURN_ID, 'cron-turn-3'])
+      fake.notify('session/tokenUsage', {
+        turnId,
+        usage: { inputTokens: 1, outputTokens: 1, cachedTokens: 0, reasoningTokens: 0 },
+      });
+    await Bun.sleep(10);
+    const late = session.events.slice(before);
+    expect(late.map((e) => [e.kind, e.unattributedReason])).toEqual([
+      ['native_status', 'after-terminal'],
+      ['native_status', 'after-terminal'],
+    ]);
+  });
+
+  test('kill while frames wait on the turn/start answer still records them, claiming no owner', async () => {
+    const fake = fakeMuse();
+    fake.handlers['turn/start'] = () => {
+      fake.notify('turn/started', { turnId: 'who-knows', commandId: 'who-knows' });
+      fake.notify('item/completed', {
+        item: {
+          itemId: 'w1',
+          kind: 'agentMessage',
+          turnId: 'who-knows',
+          revision: 1,
+          status: 'completed',
+          text: 'held',
+        },
+      });
+      return new Promise(() => {}); // the answer never comes
+    };
+    const session = open(fake);
+    await session.start();
+    const send = session.send('mine').catch((e: Error) => e);
+    await fake.waitFor('turn/start');
+    await Bun.sleep(10);
+    expect(
+      session.events.some((e) => e.raw && JSON.stringify(e.raw).includes('item/completed')),
+    ).toBe(false);
+    session.kill();
+    await send;
+    const flushed = session.events.filter((e) => e.turnId === 'who-knows');
+    expect(flushed.length).toBe(2);
+    expect(flushed.every((e) => e.unattributedReason === 'no-admission')).toBe(true);
+    expect(session.events.some((e) => e.kind === 'task')).toBe(false);
   });
 
   test('a monitor feed outside any turn and a goal change surface as tasks', async () => {
