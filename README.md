@@ -125,7 +125,10 @@ session.onToolRequest(async (call) => {
 
 - `pre-use` (Claude only) runs before every call in every mode,
   `bypassPermissions` included; only a deny counts. A PreToolUse callback over
-  the control protocol; one the session cannot read is denied.
+  the control protocol; one the session cannot read is denied. An allow may
+  carry `updatedInput`: the call runs with that input (the next gate sees it as
+  `toolInput`), and the runtime's own mode still decides whether it runs.
+  Foundry uses it to add the chorus's brief to a subagent's prompt.
 - `permission` is an ask the runtime's mode raised; the answer is final (no gate:
   denied). Claude: `--permission-prompt-tool stdio`; `decisionReason` says why it
   asked, `agentId` marks a subagent's call. Codex app-server: command and

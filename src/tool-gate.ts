@@ -25,17 +25,22 @@ export class ToolGates {
     return [...this._gates];
   }
 
-  /** Never rejects. Undefined means no decision: only a `pre-use` request without a deny. */
+  /**
+   * Never rejects. Undefined means no decision: only a `pre-use` request without a deny or a new
+   * input. A gate's `updatedInput` (pre-use) is the next gate's `toolInput` and the decision's.
+   */
   async decide(request: ToolRequest): Promise<ToolDecision | undefined> {
     const gates = [...this._gates];
     if (!gates.length)
       return request.stage === 'permission'
         ? { behavior: 'deny', message: 'No approval handler' }
         : undefined;
+    let current = request;
+    let updatedInput: Readonly<Record<string, unknown>> | undefined;
     for (const gate of gates) {
       let decision: ToolDecision;
       try {
-        decision = await gate(request);
+        decision = await gate(current);
       } catch (error) {
         return {
           behavior: 'deny',
@@ -46,8 +51,19 @@ export class ToolGates {
         return { behavior: 'deny', message: String(decision.message ?? 'Denied') };
       if (decision?.behavior !== 'allow')
         return { behavior: 'deny', message: 'Tool gate failed: malformed decision' };
+      if (decision.updatedInput !== undefined && request.stage === 'pre-use') {
+        if (
+          !decision.updatedInput ||
+          typeof decision.updatedInput !== 'object' ||
+          Array.isArray(decision.updatedInput)
+        )
+          return { behavior: 'deny', message: 'Tool gate failed: malformed updatedInput' };
+        updatedInput = Object.freeze(structuredClone(decision.updatedInput));
+        current = { ...current, toolInput: updatedInput };
+      }
     }
-    return request.stage === 'permission' ? { behavior: 'allow' } : undefined;
+    if (request.stage === 'permission') return { behavior: 'allow' };
+    return updatedInput ? { behavior: 'allow', updatedInput } : undefined;
   }
 }
 

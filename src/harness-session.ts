@@ -399,7 +399,15 @@ export interface ToolRequest {
   readonly signal?: AbortSignal;
 }
 export type ToolDecision =
-  | { readonly behavior: 'allow' }
+  | {
+      readonly behavior: 'allow';
+      /**
+       * `pre-use` only (Claude): the input the call runs with instead of the one the model wrote
+       * (e.g. a subagent's prompt with context appended). The runtime's own mode still decides
+       * whether the call runs. Later gates see it as their `toolInput`.
+       */
+      readonly updatedInput?: Readonly<Record<string, unknown>>;
+    }
   | { readonly behavior: 'deny'; readonly message: string };
 /** Gates compose in registration order: the first deny wins; a thrown or rejected gate denies. */
 export type ToolGate = (request: ToolRequest) => ToolDecision | Promise<ToolDecision>;
