@@ -208,27 +208,66 @@ export class SecretScratchPad {
     return this._dir;
   }
 
-  /** Lift every `$$word` out of `text` into `thread`'s pad, under the dagger for `message`. */
+  /**
+   * Lift every `$$word` out of `text` into `thread`'s pad, under the dagger for `message`. With
+   * `patterns` (global regexes, e.g. a caller's known token shapes), every match is lifted too, the
+   * person having forgotten the marker; a match may span lines (a private key). Positions follow the
+   * text's order; a match inside another lifted span is left to it. `recognised` counts the matches.
+   */
   lift(
     text: string,
     at: { thread: string; message: string; now?: Date },
-  ): { text: string; refs: string[] } {
-    const values = [...text.matchAll(MARKED)].map((match) => match[2] ?? '');
-    if (!values.length) return { text, refs: [] };
+    options: { patterns?: readonly RegExp[] } = {},
+  ): { text: string; refs: string[]; recognised: number } {
+    const spans: Array<{
+      start: number;
+      end: number;
+      value: string;
+      marked: boolean;
+    }> = [];
+    for (const match of text.matchAll(MARKED)) {
+      const lead = match[1] ?? '';
+      spans.push({
+        start: (match.index ?? 0) + lead.length,
+        end: (match.index ?? 0) + match[0].length,
+        value: match[2] ?? '',
+        marked: true,
+      });
+    }
+    for (const pattern of options.patterns ?? []) {
+      if (!pattern.global) throw new SecretScratchError('A lift pattern must be global (/g).');
+      for (const match of text.matchAll(pattern)) {
+        if (!match[0]) continue;
+        const start = match.index ?? 0;
+        spans.push({
+          start,
+          end: start + match[0].length,
+          value: match[0],
+          marked: false,
+        });
+      }
+    }
+    if (!spans.length) return { text, refs: [], recognised: 0 };
+    // Earliest first, the longer of two at one place; a span overlapping a kept one is dropped.
+    spans.sort((a, b) => a.start - b.start || b.end - a.end);
+    const kept: typeof spans = [];
+    for (const span of spans)
+      if (!kept.length || span.start >= kept[kept.length - 1]!.end) kept.push(span);
     checkId(at.thread, 'thread');
     checkId(at.message, 'message');
     const daggers = this._read(at.thread);
     let dagger = daggers.find((d) => d.message === at.message);
     const first = dagger ? Math.max(0, ...dagger.blocks.keys()) + 1 : 1;
-    const refs: string[] = [];
-    const lifted = text.replace(MARKED, (_whole, lead: string) => {
-      const ref = formatScratchRef(
-        { thread: at.thread, message: at.message, position: first + refs.length },
-        at.thread,
-      );
-      refs.push(ref);
-      return `${lead}${ref}`;
+    const refs = kept.map((_, i) =>
+      formatScratchRef({ thread: at.thread, message: at.message, position: first + i }, at.thread),
+    );
+    let lifted = '';
+    let cursor = 0;
+    kept.forEach((span, i) => {
+      lifted += text.slice(cursor, span.start) + refs[i];
+      cursor = span.end;
     });
+    lifted += text.slice(cursor);
     if (!dagger) {
       dagger = {
         message: at.message,
@@ -238,9 +277,9 @@ export class SecretScratchPad {
       };
       daggers.push(dagger);
     }
-    for (const [i, value] of values.entries()) dagger.blocks.set(first + i, value);
+    for (const [i, span] of kept.entries()) dagger.blocks.set(first + i, span.value);
     this._write(at.thread, daggers);
-    return { text: lifted, refs };
+    return { text: lifted, refs, recognised: kept.filter((span) => !span.marked).length };
   }
 
   /** Every pad here (or one thread's) with what it holds pending, never the values. */
