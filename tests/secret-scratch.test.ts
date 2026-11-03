@@ -62,6 +62,7 @@ describe('lift', () => {
     expect(await pad.lift('costs $5 and $$ alone', { thread: 't', message: 'm' })).toEqual({
       text: 'costs $5 and $$ alone',
       refs: [],
+      recognised: 0,
     });
     expect(await pad.threads()).toEqual([]);
   });
@@ -70,6 +71,49 @@ describe('lift', () => {
     const { pad } = setup();
     const out = await pad.lift('a$$b $$c', { thread: 't', message: 'm' });
     expect(out.text).toBe('a$$b †m.1');
+  });
+});
+
+describe('recognised patterns', () => {
+  const GITHUB = /gh[pousr]_[A-Za-z0-9]{20,}/g;
+  const KEY = /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g;
+
+  test('a token the person forgot to mark is lifted too, in text order, and counted', () => {
+    const { pad } = setup();
+    const token = `ghp_${'a'.repeat(30)}`;
+    const out = pad.lift(
+      `use ${token} and $$marked-one then token=${token}x`,
+      { thread: 't', message: 'm' },
+      {
+        patterns: [GITHUB],
+      },
+    );
+    expect(out.text).toBe('use †m.1 and †m.2 then token=†m.3');
+    expect(out.recognised).toBe(2);
+    expect(out.text).not.toContain('ghp_');
+  });
+
+  test('a private key across lines is lifted whole, and written back exactly', () => {
+    const { root, pad } = setup();
+    const key = '-----BEGIN RSA PRIVATE KEY-----\nMIIEabc\ndef==\n-----END RSA PRIVATE KEY-----';
+    const out = pad.lift(
+      `the key:\n${key}\nthanks`,
+      { thread: 't', message: 'm' },
+      { patterns: [KEY] },
+    );
+    expect(out.text).toBe('the key:\n†m.1\nthanks');
+    pad.write('m.1', 't', 'id_rsa', { cwd: root });
+    expect(readFileSync(join(root, 'id_rsa'), 'utf8')).toBe(key);
+  });
+
+  test('a marked word that also matches a pattern is lifted once; a non-global pattern is refused', () => {
+    const { pad } = setup();
+    const token = `ghp_${'b'.repeat(30)}`;
+    const out = pad.lift(`$$${token}`, { thread: 't', message: 'm' }, { patterns: [GITHUB] });
+    expect(out).toMatchObject({ text: '†m.1', recognised: 0 });
+    expect(() => pad.lift('x', { thread: 't', message: 'n' }, { patterns: [/x/] })).toThrow(
+      'global',
+    );
   });
 });
 
