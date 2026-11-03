@@ -2,7 +2,7 @@
 
 > Part of [inixiative](https://www.inixiative.com), technology for cooperation. See [all the projects](https://github.com/inixiative).
 
-Drive Claude Code, Codex and Muse as persistent streaming sessions behind one
+Drive Claude Code and Codex as persistent streaming sessions behind one
 interface. Claude Code runs over its CLI or the Agent SDK, Codex over its
 app-server and Muse over `muse serve`; Gemini and Grok are planned. The package
 also holds warm **primed decision sessions**, **subscription pools** with
