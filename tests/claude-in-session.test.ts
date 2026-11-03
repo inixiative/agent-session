@@ -520,6 +520,80 @@ describe('ClaudeInSessionDecisions', () => {
     expect(cli.results).toEqual(['READY']);
   });
 
+  test('roles split into fixed slices, one dispatcher each; a fan-out is refilled through every dispatcher at once', async () => {
+    const { cli, host } = await setup({}, { dispatchers: 3 });
+    const roles = ['a', 'b', 'c', 'd', 'e', 'f'];
+    host.prestart(
+      't',
+      roles.map((r) => ({ spec: spec(r), standby: 'S' })),
+    );
+    await host.ready(3_000);
+    expect(host.setup.status).toBe('ready');
+    expect(cli.hookOutputs.filter((h) => h.type === 'foundry-dispatch').length).toBe(3);
+    /** Which dispatcher started each member of a role, wave by wave. */
+    const startedBy = () => {
+      const by = new Map<string, string[]>();
+      for (const h of cli.hookOutputs.filter((o) => o.type === 'foundry-warden')) {
+        const role = /be the (\w) warden/.exec(h.output?.updatedInput?.prompt ?? '')?.[1];
+        if (role) by.set(role, [...(by.get(role) ?? []), h.by!]);
+      }
+      return by;
+    };
+    const first = startedBy();
+    // Two roles per dispatcher.
+    const perDispatcher = new Map<string, number>();
+    for (const [, [by]] of first) perDispatcher.set(by!, (perDispatcher.get(by!) ?? 0) + 1);
+    expect([...perDispatcher.values()]).toEqual([2, 2, 2]);
+    const results = await Promise.all(
+      roles.map((r) => host.decide(spec(r), { input: `M ${r}`, standby: 'S' })),
+    );
+    expect(results.every((r) => r.prime === 'warm')).toBe(true);
+    await until(
+      () => host.holding().held === 6 && [...startedBy().values()].every((b) => b.length === 2),
+    );
+    // Each role's replacement came from the same dispatcher as its first member: its slice.
+    for (const [role, by] of startedBy())
+      expect(by).toEqual([first.get(role)![0]!, first.get(role)![0]!]);
+    expect(cli.results).toEqual(['READY']);
+  });
+
+  test("a slice's dispatcher past its bound recycles alone; the other slices keep theirs", async () => {
+    const { cli, host, events } = await setup(
+      { dispatcherContext: 6_000 },
+      { recycleTokens: 10_000, dispatchers: 2 },
+    );
+    host.prestart(
+      't',
+      ['a', 'b'].map((r) => ({ spec: spec(r), standby: 'S' })),
+    );
+    await host.ready(3_000);
+    expect(cli.hookOutputs.filter((h) => h.type === 'foundry-dispatch').length).toBe(2);
+    // Role a's replacement is its dispatcher's second member start: past the bound.
+    expect((await host.decide(spec('a'), { input: 'M1', standby: 'S' })).content).toBe('ANS:M1');
+    await until(() => cli.hookOutputs.filter((h) => h.type === 'foundry-dispatch').length >= 3);
+    await tick(20);
+    expect(cli.hookOutputs.filter((h) => h.type === 'foundry-dispatch').length).toBe(3);
+    expect(events.filter((e) => e.type === 'process-recycled').length).toBe(1);
+    await until(() => host.holding().held === 2);
+    expect((await host.decide(spec('b'), { input: 'M2', standby: 'S' })).content).toBe('ANS:M2');
+    expect((await host.decide(spec('a'), { input: 'M3', standby: 'S' })).content).toBe('ANS:M3');
+    expect(cli.results).toEqual(['READY']);
+  });
+
+  test('a decision for a role in no slice starts its member through a live dispatcher', async () => {
+    const { host } = await setup({}, { dispatchers: 2 });
+    host.prestart('t', [{ spec: spec('a'), standby: 'S' }]);
+    await host.ready(3_000);
+    const r = await host.decide(spec('z'), { input: 'M', standby: 'S' });
+    expect(r).toMatchObject({ prime: 'cold', content: 'ANS:SM' });
+  });
+
+  test('dispatchers must be a positive whole number', () => {
+    expect(() => new ClaudeInSessionDecisions({ model: 'm', dispatchers: 0 })).toThrow(
+      /Invalid in-session decision bounds/,
+    );
+  });
+
   test('spawns the CLI refuses go out again once a slot frees', async () => {
     const { cli, host } = await setup({ limit: 4 });
     // root + dispatcher + 2 members fit; the third member is refused.
