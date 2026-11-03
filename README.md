@@ -2,18 +2,18 @@
 
 > Part of [inixiative](https://www.inixiative.com), technology for cooperation. See [all the projects](https://github.com/inixiative).
 
-Drive coding-agent CLIs as **persistent, streaming, event-captured sessions** —
-one interface, any agent, over interchangeable **transports**. Claude Code
-(CLI or Agent SDK) and Codex (app-server) today; Gemini and Grok planned.
-Also: warm **primed decision sessions**, **subscription pools** with
+Drive Claude Code, Codex and Muse as persistent streaming sessions behind one
+interface. Claude Code runs over its CLI or the Agent SDK, Codex over its
+app-server and Muse over `muse serve`; Gemini and Grok are planned. The package
+also holds warm **primed decision sessions**, **subscription pools** with
 deterministic routing, **limit polling** and **session continuity**.
 
-Most ways to script a coding agent are one-shot (`claude -p "…"`) and lose the
-process. `agent-session` keeps a single long-lived agent process, streams turns
-in over stdin, and classifies **every** event coming back — text, thinking,
-tool calls, tool results, usage — so you can drive multi-turn work and capture
-exactly what the agent did. Built for eval harnesses, agent comparisons, and
-multi-agent orchestration.
+A one-shot call (`claude -p "…"`) ends the process after one answer.
+`agent-session` keeps one long-lived agent process per session, sends each turn
+in over stdin, and classifies each event that comes back (text, thinking, tool
+calls, tool results, usage), so you can drive multi-turn work and record what
+the agent did. Foundry, Oracle and Archive run their agent sessions on it, as do
+our eval harnesses and agent comparisons.
 
 ```ts
 import { ClaudeCodeSession } from "@inixiative/agent-session";
@@ -35,23 +35,23 @@ for (const e of result.events) {      // full classified event stream
 session.kill();
 ```
 
-## Why it's different
+## What you get
 
 - **Persistent, multi-turn.** One process per session; `send()` per turn,
-  resolves on the runtime's `result` event. Not one-shot `-p`.
+  resolves on the runtime's `result` event.
 - **Full event capture.** A normalized `SessionEvent` taxonomy
   (`text` / `thinking` / `tool_use` / `tool_result` / `result` / `error` /
-  `session_compact`) — the same shape regardless of runtime.
+  `session_compact`), the same shape for every runtime.
 - **Subscription auth, no API billing.** The Claude Code adapter strips
   `ANTHROPIC_API_KEY` and authenticates via the CLI's subscription / an
-  `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token` — works headless and in
+  `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`; it works headless and in
   containers.
 - **Images with a turn.** `send(text, { images: [{ mediaType, data }] })` (png, jpeg, gif or
   webp, base64) where the transport declares `capabilities.images`: Claude gets base64 `image`
   blocks in the same user message, Codex `image` inputs with a `data:` URL. Anything else is
   refused before a byte is written.
 - **fork / resume / interrupt** and pre-send hooks (rewrite the outgoing
-  message — e.g. inject just-in-time context per turn).
+  message, for example to add context for that turn).
 - **A resume whose native conversation is not found is typed.** Claude finding no transcript
   ("No conversation found with session ID": cleaned up, deleted, or under another project
   directory or config home) and Codex finding no rollout ("no rollout found for thread id") both
@@ -59,9 +59,10 @@ session.kill();
   with the `cwd` the lookup ran in). No turn ran, so the attempt settles as a no-send instead of
   uncertain native work, and the caller can start fresh from its own record.
 - **Transports with declared capabilities.** How a model is reached is a
-  pluggable transport; switching it is a routing change, not a rewrite.
-- **Zero dependencies.** Just Bun + the agent CLI you're driving. The Agent SDK
-  transport takes the SDK's `query` from the caller.
+  pluggable transport; switching it is a routing change.
+- **Two dependencies.** `@inixiative/json-rules` and Meta's `@muse-code/sdk`
+  (for the Muse transport), plus Bun and the agent CLI you're driving. The Agent
+  SDK transport takes the SDK's `query` from the caller.
 
 ## Interface
 
@@ -274,15 +275,15 @@ snapshots in the artifact but do not fabricate a completed-turn total.
 | Gemini CLI | planned |
 | Grok CLI | planned (when its headless/stream mode matures) |
 
-Opaque runtimes degrade gracefully — fewer event types, never a hard failure.
+A runtime that reports less produces fewer event types; it never fails a turn for that.
 
 [Subscription pooling goals](tickets/README.md) (AS-001…005) are implemented as described in [docs/transports-pools-routing.md](docs/transports-pools-routing.md); each ticket lists what remains.
 
 ## Provenance
 
 Extracted from [`inixiative/foundry`](https://github.com/inixiative/foundry),
-where it runs Foundry's agent sessions. Consumed by foundry, oracle,
-and the inixiative bench.
+where it runs Foundry's agent sessions. Foundry, Oracle, Archive and the
+inixiative bench use it.
 
 ## License
 
