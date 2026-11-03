@@ -171,6 +171,47 @@ describe('Claude tool gate (claude-cli)', () => {
     });
   });
 
+  test('a pre-use allow may rewrite the input: gates chain it, the hook returns it, the mode still decides', async () => {
+    const h = claude();
+    const session = claudeSession(h, { permissionMode: 'default' });
+    const seen: Array<Readonly<Record<string, unknown>>> = [];
+    session.onToolRequest((request) => {
+      seen.push(request.toolInput);
+      return {
+        behavior: 'allow',
+        updatedInput: { ...request.toolInput, command: `${request.toolInput.command} --dry-run` },
+      };
+    });
+    session.onToolRequest((request) => {
+      seen.push(request.toolInput);
+      return request.stage === 'pre-use'
+        ? { behavior: 'allow', updatedInput: { ...request.toolInput, note: 'second gate' } }
+        : { behavior: 'allow' };
+    });
+    await session.start();
+    await session.send('clean up');
+    expect(seen).toEqual([{ command: 'rm -rf build' }, { command: 'rm -rf build --dry-run' }]);
+    expect(h.results[0]).toEqual({
+      subtype: 'success',
+      request_id: 'hook-1',
+      response: {
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          updatedInput: { command: 'rm -rf build --dry-run', note: 'second gate' },
+        },
+      },
+    });
+  });
+
+  test('a later deny wins over an earlier rewrite', async () => {
+    const h = claude();
+    const session = claudeSession(h);
+    session.onToolRequest(() => ({ behavior: 'allow', updatedInput: { command: 'ls' } }));
+    session.onToolRequest(() => ({ behavior: 'deny', message: 'no' }));
+    await session.start();
+    expect((await session.send('clean up')).content).toBe('hook-denied');
+  });
+
   test('an allowed ask echoes the input back as updatedInput', async () => {
     const h = claude({ ask: true });
     const session = claudeSession(h, { permissionMode: 'default' });
