@@ -19,9 +19,13 @@
 //              standby context matches answers that call with its input; the member answers
 //              through `answer`. A decision with no spare starts a member with its input inline.
 //              Each member serves one decision (fresh every call); a used one is started again.
+//   slices     the roles are split into `dispatchers` fixed slices, each started by its own
+//              dispatcher generation under the root, so their refills are written at once: a
+//              dispatcher writes one Agent call per member as output tokens, so one dispatcher for a
+//              large roster is slow to refill (75 members took ~20 s; 2026-11-02).
 //   recycle    a dispatcher's context grows with every member it starts. Past a bound the root
-//              starts a new generation; the old one's held spares are retired as their
-//              replacements hold, and it ends into the root once empty.
+//              starts a new generation of that slice; the old one's held spares are retired as
+//              their replacements hold, and it ends into the root once empty.
 //
 // Agent definitions are generic (no prompt of their own): every member's composed text rides in
 // its pinned prompt, so an edit reaches the next spare without relaunching the session.
@@ -99,6 +103,11 @@ export interface ClaudeInSessionConfig {
   /** A dispatcher whose context passes this many tokens is replaced. Default 100k. */
   recycleTokens?: number;
   /**
+   * Dispatchers running at once, each starting a fixed slice of the roles (a role keeps its slice
+   * while it is wanted; a new one joins the smallest). Default 1.
+   */
+  dispatchers?: number;
+  /**
    * Subagents this host may run on top of the user's own concurrent-subagent cap
    * (`CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS`, 20 by default in Claude Code 2.1.300): the root, a
    * dispatcher or two, every held spare and its replacement while the used one finishes, and
@@ -146,6 +155,8 @@ interface Starter {
   ended?: boolean;
   /** A dispatcher whose line went out to the root. */
   issued?: boolean;
+  /** A dispatcher's slice of the roles. */
+  slice?: number;
 }
 
 interface Member {
@@ -214,6 +225,7 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
         | 'recycleTokens'
         | 'maxOrphans'
         | 'maxSetups'
+        | 'dispatchers'
       >
     >;
   private _host?: ClaudeSessionHost;
@@ -221,7 +233,12 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
   private _seq = 0;
   private _generation = 0;
   private _root?: Starter;
-  private _gen?: Starter;
+  /** The current dispatcher generation of each slice. */
+  private _current: Array<Starter | undefined> = [];
+  /** Each wanted role's slice. */
+  private readonly _sliceOf = new Map<string, number>();
+  /** Direct members of roles outside every slice go out round-robin. */
+  private _nextDirect = 0;
   private readonly _gens = new Map<string, Starter>();
   private readonly _spares = new Map<string, Spare>();
   private readonly _members = new Set<Member>();
@@ -254,8 +271,14 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
       recycleTokens: config.recycleTokens ?? 100_000,
       maxOrphans: config.maxOrphans ?? 40,
       maxSetups: config.maxSetups ?? 2,
+      dispatchers: config.dispatchers ?? 1,
     };
-    if (this._config.sparesPerRole < 1 || this._config.recycleTokens < 10_000)
+    if (
+      this._config.sparesPerRole < 1 ||
+      this._config.recycleTokens < 10_000 ||
+      !Number.isSafeInteger(this._config.dispatchers) ||
+      this._config.dispatchers < 1
+    )
       throw Error('Invalid in-session decision bounds');
     // On top of the user's own cap (Claude Code's default 20), so the main agent keeps its slots.
     const own = Number(process.env.CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS) || 20;
@@ -368,7 +391,8 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
     }
     this._spares.clear();
     this._gens.clear();
-    this._root = this._gen = undefined;
+    this._root = undefined;
+    this._current = [];
   }
 
   mcp(_server: string, requestId: string, message: Record<string, unknown>): void {
@@ -591,7 +615,7 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
         const waiting = this._awaitingSlot.shift();
         if (waiting) {
           this._reissue(waiting);
-          if (this._gen) this._feed(this._gen);
+          if (waiting.gen) this._feed(waiting.gen);
         }
       }
       return true;
@@ -621,10 +645,11 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
         owner.context = add.input + add.cacheRead + add.cacheWrite;
         if (
           owner.kind === 'dispatch' &&
-          owner === this._gen &&
+          owner.slice !== undefined &&
+          owner === this._current[owner.slice] &&
           owner.context > this._config.recycleTokens
         )
-          this._recycle();
+          this._recycle(owner.slice);
       } else {
         const target = owner.member?.deliveredAt ? owner.usage : owner.standby;
         for (const key of Object.keys(add) as Array<keyof Usage>) target[key] += add[key];
@@ -740,6 +765,7 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
         ];
       }),
     );
+    this._assignSlices();
     for (const spare of this._spares.values())
       if (
         !spare.direct &&
@@ -864,7 +890,8 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
       lines: [],
       context: 0,
     };
-    this._newGeneration();
+    this._current = [];
+    for (let slice = 0; slice < this._config.dispatchers; slice++) this._newGeneration(slice);
     clearTimeout(this._setupTimer);
     this._setupTimer = setTimeout(() => {
       if (this._setup.status === 'starting') this._publishSetup('degraded');
@@ -891,25 +918,37 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
       [...this._spares.values()].filter((s) => s.held && !s.done && !s.retired).map((s) => s.name),
     );
     const all = [...this._desired.keys()].every((name) => held.has(name));
-    if (this._rostered && all && this._gen?.next) {
+    // Every slice's dispatcher has taken its lines (it waits in `next` again).
+    const dispatching = this._current.length > 0 && this._current.every((gen) => !!gen?.next);
+    if (this._rostered && all && dispatching) {
       clearTimeout(this._setupTimer);
       this._publishSetup('ready');
     } else this._publishSetup('starting');
   }
 
-  private _newGeneration(): Starter {
+  private _newGeneration(slice: number): Starter {
     const token = `g${++this._generation}`;
-    const gen: Starter = { token, kind: 'dispatch', prompt: STARTER(token), lines: [], context: 0 };
+    const gen: Starter = {
+      token,
+      kind: 'dispatch',
+      prompt: STARTER(token),
+      lines: [],
+      context: 0,
+      slice,
+    };
     this._gens.set(token, gen);
-    this._gen = gen;
+    this._current[slice] = gen;
     this._root!.lines.push(`${IN_SESSION_AGENTS.dispatch} ${token}`);
     this._feed(this._root!);
     return gen;
   }
 
-  /** A dispatcher past its bound: a new generation takes new spares; the old one's are retired as replacements hold. */
-  private _recycle(): void {
-    const old = this._gen;
+  /**
+   * A slice's dispatcher past its bound: a new generation of that slice takes new spares; the old
+   * one's are retired as replacements hold.
+   */
+  private _recycle(slice: number): void {
+    const old = this._current[slice];
     if (!old || old.stopping || !this._root?.taskId) return;
     old.stopping = true;
     this._emit({
@@ -919,9 +958,31 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
     });
     for (const spare of this._spares.values())
       if (spare.gen === old && !spare.member && !spare.done) spare.superseded = true;
-    this._newGeneration();
+    this._newGeneration(slice);
     this._replenish();
     this._endIfEmpty(old);
+  }
+
+  /** Keep every wanted role in a slice: a role keeps its slice; a new one joins the smallest. */
+  private _assignSlices(): void {
+    for (const name of [...this._sliceOf.keys()])
+      if (!this._desired.has(name)) this._sliceOf.delete(name);
+    const sizes = Array.from({ length: this._config.dispatchers }, () => 0);
+    for (const slice of this._sliceOf.values()) sizes[slice]!++;
+    for (const name of this._desired.keys()) {
+      if (this._sliceOf.has(name)) continue;
+      const slice = sizes.indexOf(Math.min(...sizes));
+      this._sliceOf.set(name, slice);
+      sizes[slice]!++;
+    }
+  }
+
+  /** The dispatcher that starts this role's members now: its slice's, or round-robin for a role in none. */
+  private _genFor(name: string): Starter | undefined {
+    const slice = this._sliceOf.get(name);
+    if (slice !== undefined) return this._current[slice];
+    const live = this._current.filter((gen): gen is Starter => !!gen && !gen.stopping);
+    return live.length ? live[this._nextDirect++ % live.length] : undefined;
   }
 
   /** Answer a starter's held `next` with what it should start (or stop). */
@@ -1007,16 +1068,19 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
     return best;
   }
 
-  /** Keep `sparesPerRole` free spares of every desired role, in the current generation. */
+  /** Keep `sparesPerRole` free spares of every desired role, in its slice's current generation. */
   private _replenish(): void {
-    const gen = this._gen;
-    if (this._closed || !gen || gen.stopping) return;
+    if (this._closed) return;
     const free = new Map<string, number>();
     for (const spare of this._spares.values())
       if (!spare.direct && !spare.member && !spare.done && !spare.superseded && !spare.retired)
         if (this._desired.get(spare.name)?.standbyHash === spare.standbyHash)
           free.set(spare.name, (free.get(spare.name) ?? 0) + 1);
-    for (const [name, desired] of this._desired)
+    const fed = new Set<Starter>();
+    for (const [name, desired] of this._desired) {
+      const gen = this._genFor(name);
+      if (!gen || gen.stopping) continue;
+      fed.add(gen);
       for (let n = free.get(name) ?? 0; n < this._config.sparesPerRole; n++) {
         const token = `w${++this._seq}`;
         this._spares.set(token, {
@@ -1032,7 +1096,8 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
         });
         gen.lines.push(`${IN_SESSION_AGENTS.member} ${token}`);
       }
-    this._feed(gen);
+    }
+    for (const gen of fed) this._feed(gen);
   }
 
   /** A spare's replacement holds: retire one superseded spare of the same role. */
@@ -1144,8 +1209,8 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
   /** A decision with no spare: a member started with its whole input. */
   private async _direct(member: Member, composed: string): Promise<void> {
     if (!(await this._admit(member))) return;
-    const gen = this._gen;
-    if (!gen) {
+    const gen = this._genFor(member.name);
+    if (!gen || gen.stopping) {
       member.reject(
         new DecisionError(
           'No dispatcher running',
@@ -1230,7 +1295,7 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
         if (this._closed) return;
         const orphaned = [...this._spares.values()].filter((sp) => !sp.done);
         this._gens.clear();
-        this._gen = undefined;
+        this._current = [];
         this._root = undefined;
         this._publishSetup('degraded');
         this._startSetup();
@@ -1241,7 +1306,13 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
       // Its members outlive it (nested background agents are not stopped with their parent).
       this._gens.delete(owner.token);
       const planned = owner.stopping && this._empty(owner);
-      if (owner === this._gen && !this._closed) this._newGeneration();
+      if (
+        owner.slice !== undefined &&
+        owner === this._current[owner.slice] &&
+        !this._closed &&
+        this._root
+      )
+        this._newGeneration(owner.slice);
       if (!planned && !this._closed)
         for (const spare of this._spares.values())
           if (spare.gen === owner && !spare.done) this._orphan(spare);
@@ -1293,8 +1364,8 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
   }
 
   private _reissue(spare: Spare): void {
-    const gen = this._gen;
-    if (this._closed || !gen || spare.done) return;
+    const gen = this._genFor(spare.name);
+    if (this._closed || !gen || gen.stopping || spare.done) return;
     spare.gen = gen;
     spare.issued = false;
     const line = `${IN_SESSION_AGENTS.member} ${spare.token}`;

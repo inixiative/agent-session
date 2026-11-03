@@ -221,9 +221,14 @@ const result = await decisions.decide(spec, { input, standby });
   own subagents go to the tool gate untouched.
 - **Fresh per call.** Each member serves one decision. A used one is replaced
   at once; a role with no held spare starts a member with its input inline.
+- **Slices.** `dispatchers` (default 1) splits the roles into fixed slices,
+  each started by its own dispatcher, so refills are written at once. A
+  dispatcher writes one Agent call per member as output tokens: one
+  dispatcher refilled 75 members in ~20 s (2026-11-02). A role keeps its
+  slice while it is wanted; a new role joins the smallest.
 - **Recycle.** A dispatcher's context grows ~700 tokens per member started;
-  past `recycleTokens` (100k) a new generation takes over and the old one
-  ends into the root once empty.
+  past `recycleTokens` (100k) a new generation of its slice takes over and
+  the old one ends into the root once empty.
 - **Orphans.** A nested agent whose parent ended reports its own end to the
   main thread, which wakes the main model (Claude Code 2.1.300). Members of a
   dispatcher that ended unasked are therefore never retired or stopped, and an
