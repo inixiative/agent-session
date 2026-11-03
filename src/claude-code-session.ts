@@ -379,7 +379,7 @@ export class ClaudeCodeSession implements HarnessSession {
   private _steerAcks = new Map<string, (state: SteerState) => void>();
   /** Steers written and not yet ended natively: a late `completed` after their turn settled is theirs. */
   private _steerUuids = new Set<string>();
-  private readonly _hookCallbackId = `agent-session-pre-tool-${crypto.randomUUID()}`;
+  private readonly _hookCallbackId = `agent-session-pre-tool-${Bun.randomUUIDv7()}`;
   private _limits?: LimitSnapshot;
   private _controlSeq = 0;
   private _control = new Map<
@@ -555,7 +555,7 @@ export class ClaudeCodeSession implements HarnessSession {
     if (!turn || !a || a.dispatch !== 'attempted' || a.nativeOutcome !== 'unknown')
       return ignored('no owned in-flight turn');
     if (!this._proc || !this._alive) return ignored('session not running');
-    const uuid = crypto.randomUUID();
+    const uuid = Bun.randomUUIDv7();
     turn.steers ??= new Map();
     const steers = turn.steers;
     steers.set(uuid, 'written');
@@ -999,7 +999,7 @@ export class ClaudeCodeSession implements HarnessSession {
     timeoutMs: number,
   ): Promise<Record<string, unknown>> {
     if (!this._proc || !this._alive) return Promise.reject(new Error('Session not running'));
-    const requestId = `agent-session-${++this._controlSeq}-${crypto.randomUUID()}`;
+    const requestId = `agent-session-${++this._controlSeq}-${Bun.randomUUIDv7()}`;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this._control.delete(requestId);

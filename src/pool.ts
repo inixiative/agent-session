@@ -584,7 +584,7 @@ export class SubscriptionPool {
     utilizationPercent: number | null,
     rank: number,
   ): Lease {
-    const leaseId = crypto.randomUUID();
+    const leaseId = Bun.randomUUIDv7();
     state.leases.add(leaseId);
     let released = false;
     const lease: Lease = {

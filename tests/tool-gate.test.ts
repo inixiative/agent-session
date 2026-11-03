@@ -88,7 +88,7 @@ function claude(opts: { ask?: boolean; hold?: boolean } = {}) {
       subtype: 'success',
       result: outcome,
       session_id: SESSION,
-      uuid: crypto.randomUUID(),
+      uuid: Bun.randomUUIDv7(),
     });
   });
   return { fake, results, argv: [] as string[], answers };

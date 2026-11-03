@@ -1335,7 +1335,7 @@ export class CodexPrimedSessions implements PrimedSessions {
       if (session) session.model ??= model;
       const branchMs = Math.round(performance.now() - t1);
       let branch = opened.branch;
-      admissionId = crypto.randomUUID();
+      admissionId = Bun.randomUUIDv7();
       try {
         await request.onAdmission?.({ admissionId, key: spec.key, runtime: 'codex', threadId });
       } catch (cause) {
