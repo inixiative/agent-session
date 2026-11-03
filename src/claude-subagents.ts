@@ -472,7 +472,7 @@ export class ClaudeSubagentSessions implements PrimedSessions {
 
   /** Admit a decision onto its spare; the input goes out when the spare's moment call is held. */
   private async _reserve(spare: Spare, member: Member): Promise<void> {
-    member.admissionId = crypto.randomUUID();
+    member.admissionId = Bun.randomUUIDv7();
     const ours = () => spare.member === member && member.spare === spare;
     try {
       await Promise.race([
@@ -789,7 +789,7 @@ export class ClaudeSubagentSessions implements PrimedSessions {
       return;
     }
     const spares = [...side.spares.values()];
-    const uuid = crypto.randomUUID();
+    const uuid = Bun.randomUUIDv7();
     const turnEnded = new Promise<void>((resolve) => {
       side.onResult = resolve;
     });
@@ -1041,7 +1041,7 @@ export class ClaudeSubagentSessions implements PrimedSessions {
   }
 
   private _control(side: Side, request: Record<string, unknown>, timeoutMs = 30_000) {
-    const id = `c-${crypto.randomUUID()}`;
+    const id = `c-${Bun.randomUUIDv7()}`;
     return new Promise<Record<string, unknown>>((resolve, reject) => {
       const timer = setTimeout(() => {
         side.control.delete(id);
@@ -1417,7 +1417,7 @@ export class ClaudeSubagentSessions implements PrimedSessions {
     await Promise.all(
       chunk.map(async (m) => {
         if (m.settled) return;
-        m.admissionId ??= crypto.randomUUID();
+        m.admissionId ??= Bun.randomUUIDv7();
         try {
           if (!retry && !m.admitted)
             await Promise.race([
@@ -1463,7 +1463,7 @@ export class ClaudeSubagentSessions implements PrimedSessions {
       m.token = `m${i + 1}`;
     });
     side.members = new Map(admitted.map((m) => [m.token, m]));
-    const uuid = crypto.randomUUID();
+    const uuid = Bun.randomUUIDv7();
     const turnEnded = new Promise<void>((resolve) => {
       side.onResult = resolve;
     });

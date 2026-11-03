@@ -187,7 +187,7 @@ function bridge(
     const awaiting = new Map<string, (response: unknown) => void>();
     const ask = (request: Record<string, unknown>, signal?: AbortSignal) =>
       new Promise<unknown>((resolve) => {
-        const id = `sdk-bridge-${crypto.randomUUID()}`;
+        const id = `sdk-bridge-${Bun.randomUUIDv7()}`;
         awaiting.set(id, resolve);
         signal?.addEventListener(
           'abort',

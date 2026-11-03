@@ -9,7 +9,7 @@ import {
 import { retainEvidence } from './retained-evidence';
 /** Per-admission evidence. Caller settlement never transfers native ownership. */
 export class TurnState {
-  readonly admissionId = crypto.randomUUID();
+  readonly admissionId = Bun.randomUUIDv7();
   identity: SessionIdentity = {};
   nativeOutcome: SessionAttempt['nativeOutcome'] = 'unknown';
   localOutcome: SessionAttempt['localOutcome'] = 'pending';

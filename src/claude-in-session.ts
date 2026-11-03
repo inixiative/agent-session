@@ -1068,7 +1068,7 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
   }
 
   private async _admit(member: Member): Promise<boolean> {
-    member.admissionId ??= crypto.randomUUID();
+    member.admissionId ??= Bun.randomUUIDv7();
     if (member.admitted) return true;
     try {
       await Promise.race([
