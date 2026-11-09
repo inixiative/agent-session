@@ -1,6 +1,6 @@
 # Goals and tickets
 
-These tickets capture product goals and outcomes. Version 0.2.0 implements them as described in [docs/transports-pools-routing.md](../docs/transports-pools-routing.md); each ticket records what remains.
+These tickets capture product goals and outcomes. Version 0.2.0 first implemented the pooling goals as described in [docs/transports-pools-routing.md](../docs/transports-pools-routing.md); each ticket records what remains. The package is now 0.12.0; later tickets name the version that built them.
 
 ## Subscription pooling
 
@@ -30,7 +30,7 @@ Proposed after the T3 Code / Paseo refresh (Oracle `docs/foundry/reference/COMPA
 
 | Ticket | Goal | Status |
 | --- | --- | --- |
-| [AS-009](AS-009-secret-scratch-pad.md) | `$$` secrets lifted into a scratch pad the agent uses through a tool that returns nothing; private paths blocked. Opt-in | Proposed |
+| [AS-009](AS-009-secret-scratch-pad.md) | `$$` secrets lifted into a scratch pad the agent uses through a tool that returns nothing; private paths blocked. Opt-in | ✅ Built (0.10.0, 2026-11-02) |
 
 ## Responsibilities
 
