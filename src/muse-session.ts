@@ -234,7 +234,7 @@ const CLIENT_INFO = { name: 'agent_session', title: 'agent-session', version: '1
  * channel and install switches, the credential backend, and the eval and test hooks (prompt injection,
  * policy and grant overrides). The CA and TLS roots stay: a machine behind a proxy needs them. Muse's own tool runs inherit this environment, so they do not see these either.
  */
-const COMPETING_ENV =
+export const MUSE_COMPETING_ENV =
   /^(META_|LLM_|MODEL_|LLAMA_|OPENROUTER_|ANTHROPIC_|OPENAI_|TBH_(AUTH|MINT)_BASE_URL$|MUSE_EXPERIMENTAL_|TBH_(CREDENTIAL_BACKEND$|EVAL_|TEST_)|MUSE_CUA_DEV_|MUSE_(MODEL|CHANNEL|LAUNCHER_INSTALL|CONTRIBUTOR_MODE|DISABLE_APPROVAL_JUDGE|PERMISSION_PROFILE_FAIL_OPEN|WWW_ROUTING|CUSTOM_HEADERS)$)/;
 
 export class MuseSession implements HarnessSession {
@@ -510,7 +510,7 @@ export class MuseSession implements HarnessSession {
     const env: Record<string, string> = {};
     // Subscription transport: a metered key or another endpoint never replaces the saved login.
     for (const [key, value] of Object.entries(merged))
-      if (value !== undefined && !COMPETING_ENV.test(key)) env[key] = value;
+      if (value !== undefined && !MUSE_COMPETING_ENV.test(key)) env[key] = value;
     return env;
   }
 
@@ -1917,7 +1917,8 @@ export class MuseSession implements HarnessSession {
 }
 
 // ---------------------------------------------------------------------------
-// Default host: `muse serve` through the SDK's owned-process handshake; exported for scripts/record-muse.ts
+// Default host: `muse serve` through the SDK's owned-process handshake; exported so a caller that wraps
+// `connect` (to learn when the host exits) and scripts/record-muse.ts launch the same host
 // ---------------------------------------------------------------------------
 
 export async function spawnMuseHost(launch: MuseLaunch): Promise<MuseHost> {

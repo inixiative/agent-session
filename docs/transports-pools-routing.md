@@ -1,6 +1,6 @@
 # Transports, primed sessions, pools and routing
 
-Status: implemented (first in 0.2.0, current in 0.12.1). Each transport's live verification is
+Status: implemented (first in 0.2.0, current in 0.12.2). Each transport's live verification is
 recorded in its `TRANSPORTS[kind].notes` (`src/transport.ts`).
 
 ## Ownership
