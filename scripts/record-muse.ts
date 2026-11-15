@@ -44,7 +44,7 @@ const session = new MuseSession({
     connection.command = async (method, params, options) => {
       const result = await command(method, params, options);
       const type = RESULT_TYPES[method];
-      // The last answer wins: session/read is asked again after the turn, as the fixture holds it.
+      // The last answer per method is the one the fixture holds.
       if (type) results.set(type, result);
       return result;
     };
@@ -74,6 +74,7 @@ if (missing.length) throw new Error(`recording incomplete: no ${missing.join(', 
 const scrub = (line: string) =>
   line
     .replaceAll(workspace, '/workspace')
+    .replaceAll(realpathSync(tmpdir()), '/tmp')
     .replaceAll(homedir(), '/home/user')
     .replace(/"tier":"[^"]*"/g, '"tier":"tier-0"');
 writeFileSync(OUT, `${ordered.map((r) => scrub(JSON.stringify(r))).join('\n')}\n`);

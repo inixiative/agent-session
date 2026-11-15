@@ -50,7 +50,8 @@ transport are `CodexPrimedSessions` (the "Primed reset" row).
 multi-stage shell and network approvals, text, tool and usage events, `usage/changed`,
 `usage/read`. Checked live on 1.4.14 without a model turn, not recorded: fork, resume with
 `session/setApprovalMode`, `sessionNotFound`. A steer (`turn/steer` into a running shell
-turn) was checked live on 1.4.14, not recorded. Images, interrupt, questions and Muse-initiated turns
+turn) and an interrupt (`turn/interrupt`, terminal `cancelled`) were checked live on 1.4.20, not
+recorded. Images, questions and Muse-initiated turns
 follow the SDK's wire types without a live run. Muse is not pooled yet: its login and sessions live under two XDG homes, not one
 profile variable.
 

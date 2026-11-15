@@ -117,6 +117,10 @@ describe('MuseSession on the recorded supervised turn', () => {
       MUSE_CUA_DEV_SKIP_IDENTITY: '1',
       MUSE_WWW_ROUTING: 'other',
       MUSE_CUSTOM_HEADERS: 'x-route: other',
+      MUSE_CHANNEL: 'muse-canary',
+      TBH_CREDENTIAL_BACKEND: 'other',
+      TBH_EVAL_APPEND_SYSTEM_PROMPT: 'injected',
+      TBH_TEST_CUA_GRANTS: 'all',
     });
     try {
       const session = open(fake, {
@@ -145,6 +149,10 @@ describe('MuseSession on the recorded supervised turn', () => {
         'MUSE_CUA_DEV_SKIP_IDENTITY',
         'MUSE_WWW_ROUTING',
         'MUSE_CUSTOM_HEADERS',
+        'MUSE_CHANNEL',
+        'TBH_CREDENTIAL_BACKEND',
+        'TBH_EVAL_APPEND_SYSTEM_PROMPT',
+        'TBH_TEST_CUA_GRANTS',
       ])
         expect(launch.env[key]).toBeUndefined();
       expect(launch.initialize.capabilities).toEqual({
@@ -206,6 +214,9 @@ describe('MuseSession on the recorded supervised turn', () => {
         totalStages: 2,
       },
     });
+    expect(gated[2]!.toolInput).toMatchObject({
+      approval: { kind: 'shell', argv: ['head', '-1'], position: 2, totalStages: 2 },
+    });
     expect(gated[3]!.toolInput).toMatchObject({
       approval: { kind: 'network', host: 'example.com', port: 443, protocol: 'https' },
     });
@@ -248,9 +259,16 @@ describe('MuseSession on the recorded supervised turn', () => {
       callId: 'call_01a1dfd68cd6762cafdb9346b8cffb32',
       toolInput: { command: 'echo probe-ok' },
     });
-    const toolResult = done.events.find((e) => e.kind === 'tool_result')!;
-    expect(toolResult.toolError).toBe(false);
-    expect(toolResult.toolOutput).toContain('"exit_code": 0');
+    const uses = done.events.filter((e) => e.kind === 'tool_use');
+    expect(uses[1]).toMatchObject({
+      toolName: 'bash',
+      toolInput: { command: 'curl -sI https://example.com | head -1' },
+    });
+    const results = done.events.filter((e) => e.kind === 'tool_result');
+    expect(results.map((r) => r.toolError)).toEqual([false, false]);
+    expect(results[0]!.toolOutput).toContain('"exit_code": 0');
+    expect(results[1]!.toolOutput).toContain('HTTP/1.1 200');
+    expect(done.events.filter((e) => e.unattributedReason === 'unrecognized-event')).toEqual([]);
     // Input excludes cache reads; the turn total is the sum of the three requests.
     expect(done.events.filter((e) => e.kind === 'usage').map((e) => e.tokens)).toEqual([
       expect.objectContaining({ input: 35601, output: 382, cacheRead: 0, thinking: 190 }),
