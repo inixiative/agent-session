@@ -1,6 +1,6 @@
 # Goals and tickets
 
-These tickets capture product goals and outcomes. Version 0.2.0 first implemented the pooling goals as described in [docs/transports-pools-routing.md](../docs/transports-pools-routing.md); each ticket records what remains. The package is now 0.12.2; later tickets name the version that built them.
+These tickets capture product goals and outcomes. Version 0.2.0 first implemented the pooling goals as described in [docs/transports-pools-routing.md](../docs/transports-pools-routing.md); each ticket records what remains. The package is now 0.12.3; later tickets name the version that built them.
 
 ## Subscription pooling
 
