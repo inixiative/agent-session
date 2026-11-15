@@ -46,11 +46,11 @@ Codex has one transport, `codex app-server --listen stdio://`; Codex CLI 0.155 h
 thread history") and for persisted ones ("paginated threads do not support thread/rollback").
 ³ `CodexAppServerSession` runs with the profile's tools; tool-free text sessions on this
 transport are `CodexPrimedSessions` (the "Primed reset" row).
-⁴ Muse Code 1.4.14, live and recorded (`fixtures/muse`): start with the profile read back,
+⁴ Muse Code 1.4.20, live and recorded (`fixtures/muse`): start with the profile read back,
 multi-stage shell and network approvals, text, tool and usage events, `usage/changed`,
-`usage/read`. Checked live without a model turn, not recorded: fork, resume with
+`usage/read`. Checked live on 1.4.14 without a model turn, not recorded: fork, resume with
 `session/setApprovalMode`, `sessionNotFound`. A steer (`turn/steer` into a running shell
-turn) was checked live, not recorded. Images, interrupt, questions and Muse-initiated turns
+turn) was checked live on 1.4.14, not recorded. Images, interrupt, questions and Muse-initiated turns
 follow the SDK's wire types without a live run. Muse is not pooled yet: its login and sessions live under two XDG homes, not one
 profile variable.
 

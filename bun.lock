@@ -6,7 +6,7 @@
       "name": "@inixiative/agent-session",
       "dependencies": {
         "@inixiative/json-rules": "^3.22.0",
-        "@muse-code/sdk": "1.4.14",
+        "@muse-code/sdk": "1.4.20",
       },
       "devDependencies": {
         "@biomejs/biome": "2.5.2",
@@ -40,7 +40,7 @@
 
     "@inixiative/json-rules": ["@inixiative/json-rules@3.22.0", "", { "dependencies": { "dayjs": "^1.11.13", "fastest-levenshtein": "^1.0.16", "re2js": "^2.8.6" }, "peerDependencies": { "@prisma/client": ">=6.0.0", "typescript": ">=6.0.0" }, "optionalPeers": ["@prisma/client", "typescript"] }, "sha512-hNHMXXp1yE4F/n5hDpBwIJzss7tY85OxGG9jiK+DymfpEHFIcq6y/scdXmWSrIsE6lQgppVkV/2fJKlkZabaUQ=="],
 
-    "@muse-code/sdk": ["@muse-code/sdk@1.4.14", "", { "peerDependencies": { "@types/node": ">=20" }, "optionalPeers": ["@types/node"] }, "sha512-LMBcXGhZjBrzO/KhvPAvqLAt5DsJeiESRKmHMDNIKdBO74kUb4aFo4ieM/r7/O5cCee1Alrjn7dL6zXQnIYWJA=="],
+    "@muse-code/sdk": ["@muse-code/sdk@1.4.20", "", { "peerDependencies": { "@types/node": ">=20" }, "optionalPeers": ["@types/node"] }, "sha512-eEdVdqof0Ffpo8NYRipIfgsG7vldX8LNMmbXn0rTrYcK85D1HeDYV0TrNmGpVIwS5wLPcZgHXgGUX5GJ2Tb24g=="],
 
     "@types/bun": ["@types/bun@1.4.4", "", { "dependencies": { "bun-types": "1.4.4" } }, "sha512-9wkRDXUXK124pEnAutE6n/l18j+i9GC5IAHK8TmX/2nlySETmky0OU6yL5U8pW1AoKh++AN9auDCr647BfurjQ=="],
 

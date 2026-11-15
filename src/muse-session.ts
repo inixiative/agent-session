@@ -46,11 +46,11 @@ import { TurnState } from './turn-state';
 // Every view notification is classified into the shared SessionEvent taxonomy.
 // The Muse session id is the externalSessionId used for cold resume.
 //
-// Wire contract: Muse Code 1.4.14 / @muse-code/sdk 1.4.14 (lockstep).
+// Wire contract: Muse Code 1.4.20 / @muse-code/sdk 1.4.20 (lockstep).
 // ---------------------------------------------------------------------------
 
 /** The SDK version this session is built against; the served CLI must report the same. */
-export const MUSE_SDK_VERSION = '1.4.14';
+export const MUSE_SDK_VERSION = '1.4.20';
 
 export type MuseApprovalMode = 'allowAll' | 'promptUnmatched';
 export type MusePermissionProfile = ':ask-me' | ':read-only' | ':unrestricted';
@@ -226,13 +226,13 @@ const CLIENT_INFO = { name: 'agent_session', title: 'agent-session', version: '1
 
 /**
  * Inherited variables that would bill, route or loosen Muse away from its saved subscription login
- * and the gates, by the names the 1.4.14 binary reads: metered keys and endpoints (META_, LLM_,
+ * and the gates, by the names the 1.4.20 binary reads: metered keys and endpoints (META_, LLM_,
  * MODEL_, LLAMA_, OPENROUTER_, ANTHROPIC_, OPENAI_), Meta's auth and key-mint endpoints, and MUSE_
- * switches for the model, experiments, contributor mode, the approval judge and a fail-open
- * profile. Muse's own tool runs inherit this environment, so they do not see these either.
+ * switches for the model, experiments, contributor mode, the approval judge, a fail-open profile,
+ * request routing and custom headers, and the computer-use dev policy and identity skip. Muse's own tool runs inherit this environment, so they do not see these either.
  */
 const COMPETING_ENV =
-  /^(META_|LLM_|MODEL_|LLAMA_|OPENROUTER_|ANTHROPIC_|OPENAI_|TBH_(AUTH|MINT)_BASE_URL$|MUSE_EXPERIMENTAL_|MUSE_(MODEL|CONTRIBUTOR_MODE|DISABLE_APPROVAL_JUDGE|PERMISSION_PROFILE_FAIL_OPEN)$)/;
+  /^(META_|LLM_|MODEL_|LLAMA_|OPENROUTER_|ANTHROPIC_|OPENAI_|TBH_(AUTH|MINT)_BASE_URL$|MUSE_EXPERIMENTAL_|MUSE_CUA_DEV_|MUSE_(MODEL|CONTRIBUTOR_MODE|DISABLE_APPROVAL_JUDGE|PERMISSION_PROFILE_FAIL_OPEN|WWW_ROUTING|CUSTOM_HEADERS)$)/;
 
 export class MuseSession implements HarnessSession {
   get transport() {
@@ -1914,10 +1914,10 @@ export class MuseSession implements HarnessSession {
 }
 
 // ---------------------------------------------------------------------------
-// Default host: `muse serve` through the SDK's owned-process handshake
+// Default host: `muse serve` through the SDK's owned-process handshake; exported for scripts/record-muse.ts
 // ---------------------------------------------------------------------------
 
-async function spawnMuseHost(launch: MuseLaunch): Promise<MuseHost> {
+export async function spawnMuseHost(launch: MuseLaunch): Promise<MuseHost> {
   const handshake = spawnMspConnection({
     command: launch.museBin,
     args: launch.args,
