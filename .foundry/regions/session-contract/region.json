@@ -1,0 +1,51 @@
+{
+  "id": "session-contract",
+  "title": "HarnessSession contract and events",
+  "routing": "Is this about the provider-agnostic session contract itself? HarnessSession start/send/kill/fork/resume, interrupt() vs interruptNative(), the SessionEvent kinds (text, thinking, tool_use, tool_result, usage, rate_limit, result, error, session_compact, subagent, task), SessionResult content/tokens/events, images on a turn (send images option, sendableImages), a failed turn's evidence (SessionTurnError, SessionAttempt), a resume that finds no native conversation (NativeBindingMissingError, nativeBindingMissing), token accounting (SessionTokens, parseClaudeUsage, codexTokens, providerUsage), or subagent/task activity on onEvent (SubagentLifecycle, parentToolUseId, unattributedReason). Jobs: drive a multi-turn agent, record what it did, stop a turn for real, count tokens, start fresh when a resume fails.",
+  "concepts": [
+    "session-contract",
+    "admission-evidence",
+    "usage-telemetry",
+    "subagent-task-events",
+    "package-scope"
+  ],
+  "tokens": 10268,
+  "tokenMethod": "chars/4",
+  "files": {
+    "recognise": {
+      "path": "recognise.md",
+      "tokens": 1407,
+      "experimental": true,
+      "note": "a smaller recognise-only document; knowledge.md is the Warden document"
+    },
+    "knowledge": {
+      "path": "knowledge.md",
+      "tokens": 10268
+    }
+  },
+  "runsAgreed": 3,
+  "sources": {
+    "docs": ["README.md", "docs/transports-pools-routing.md"],
+    "docUnits": [
+      "doc:README.md#preface",
+      "doc:README.md#what-you-get",
+      "doc:README.md#interface",
+      "doc:docs/transports-pools-routing.md#transports",
+      "doc:README.md#usage-telemetry",
+      "doc:README.md#subagents",
+      "doc:README.md#runtime",
+      "doc:docs/transports-pools-routing.md#ownership"
+    ],
+    "catalogClusters": [
+      "contract-admission-evidence",
+      "contract-harness-session",
+      "contract-subagent-and-task-events",
+      "contract-usage-telemetry",
+      "transport-claude-cli"
+    ],
+    "codeEntries": 9,
+    "docMembers": 16
+  },
+  "bypassLines": 11,
+  "glossaryTerms": 28
+}

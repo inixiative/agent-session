@@ -51,7 +51,8 @@ session.kill();
   blocks in the same user message, Codex `image` inputs with a `data:` URL. Anything else is
   refused before a byte is written.
 - **fork / resume / interrupt** and pre-send hooks (rewrite the outgoing
-  message, for example to add context for that turn).
+  message, for example to add context for that turn). Resume is configuration, not a
+  method: build the session with `externalSessionId`.
 - **A resume whose native conversation is not found is typed.** Claude finding no transcript
   ("No conversation found with session ID": cleaned up, deleted, or under another project
   directory or config home) and Codex finding no rollout ("no rollout found for thread id") both
@@ -100,8 +101,9 @@ the CLI's version (1.4.14): a host serving another version is refused at start. 
 saved Muse login: metered keys and endpoints never reach it (nor Muse's own tool runs, which
 inherit its environment: a repo command needing `OPENAI_API_KEY` will not see it under Muse),
 and a resumed session must be on provider `meta`. Per-login isolation is `env: { XDG_CONFIG_HOME, XDG_DATA_HOME }` (login and
-sessions). `musePermissions(mode)` maps the host modes to an explicit permission profile, because
-the host default lets Muse's AI reviewer answer approvals instead of the gates. Questions arrive
+sessions). The session's `permissionMode` (default `default`, gated) goes through `musePermissions(mode)`
+to an explicit permission profile, because the host default lets Muse's AI reviewer answer
+approvals instead of the gates. Questions arrive
 through `onUserInput()`; unanswered ones are cancelled with a reason. An approval offering
 no approve-once or reject choice is reported as an `error` event and left open (the turn ends
 at its timeout). Work Muse starts itself
@@ -233,9 +235,11 @@ const result = await decisions.decide(spec, { input, standby });
   main thread, which wakes the main model (Claude Code 2.1.300). Members of a
   dispatcher that ended unasked are therefore never retired or stopped, and an
   orphan's `answer` call is held for the session's life. Past `maxOrphans`
-  (40) the host stops serving and its caller falls back.
+  (40) `serving()` turns false and `setup` reports `degraded`; `decide()` does
+  not refuse on its own, so the caller checks `serving()` and falls back.
 - **Limits.** Claude Code runs 20 subagents at once by default; the launch
-  raises `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS` (`maxSubagents`, 96). The
+  raises `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS` to the user's own cap (20 when
+  unset) plus `maxSubagents` (76), so 96 by default. The
   session declares `perTaskStopAffordance`, so the user's Stop spares
   background agents.
 
@@ -251,9 +255,12 @@ const pool = new SubscriptionPool({ instances: [
 const { session, lease } = await pool.open({ runtime: "claude", model: "sonnet", organizationId: "org", preferredInstanceId: "work" });
 ```
 
-Routing is deterministic (quartile-balanced, owner-first or pinned) over
-observed limits, leases and health; stale or unknown limits exclude an instance
-and every exclusion has a reason. `continueOn` moves a thread only between
+Routing is deterministic over observed limits, priority, leases and health, by a
+named strategy (`quartile-balanced` by default, `owner-first`, `priority-balanced`,
+`priority-strict`, `least-used`) or an explicit term list; `pinned` restricts it to
+the preferred instance. By default stale or unknown limits exclude an instance
+(`unknownUtilization: 'rank-last'` ranks it last instead), and every exclusion has a
+reason. `continueOn` moves a thread only between
 instances that share native history, and says why when it cannot.
 
 ## Usage telemetry
@@ -270,6 +277,33 @@ events carry request snapshots with the original envelope (request/message IDs,
 model and tags) in `raw`; they may repeat across content blocks. Do not sum
 request snapshots together with result totals. Interrupted turns retain request
 snapshots in the artifact but do not fabricate a completed-turn total.
+
+## Secret scratch pad
+
+A person can hand an agent a secret as `$$word`. `SecretScratchPad(dir)` lifts it out
+of the message before the agent sees it (`lift`), into a private pad per thread
+(`<thread>.pad`, 0600 in a 0700 directory), and leaves a reference in its place:
+`†<message>.<n>` inside its thread, `†<thread>/<message>.<n>` from anywhere else.
+`lift(text, at, { patterns })` also lifts matches of the caller's global regexes, for
+tokens the person forgot to mark, and counts them as `recognised`.
+
+The agent uses a value without reading it. `env` sets `KEY=value` in an env file,
+`write` puts it in a file, and `pipe` runs a command with the value on its stdin,
+from a reference or a key already in an env file; only the exit code comes back, and
+a timeout kills the whole process group. `consume` (or `consume: true` on a use)
+removes a block, `list` shows what is pending without values, `scrub` swaps held
+values in text back to references, and `clear` deletes a pad.
+
+Files `env` and `write` touched are recorded (`heldFiles()`). `privatePathGate`
+(or `privatePathDenial` inside your own gate) denies a tool call naming one of them,
+a `.private` path, a `privatePaths` glob or the pad directory; `isOwnTool` exempts the
+scratch tool's own calls. A `privatePathGate` keeps the `heldFiles` list it was built
+with: rebuild it after `env` or `write`, or call
+`privatePathDenial(request, { scratchDir: pad.dir, heldFiles: pad.heldFiles() })` in your
+own gate on each request. `SECRET_SCRATCH_GUIDANCE` is the text to give the agent.
+The gate reads names, not contents, and a pipe command can still copy a value out:
+it keeps honest agents from reading secrets, it is not a sandbox. Design and
+limits: [tickets/AS-009](tickets/AS-009-secret-scratch-pad.md).
 
 ## Roadmap
 

@@ -1,0 +1,224 @@
+{
+  "version": 1,
+  "project": "agent-session",
+  "builtFrom": {
+    "docs": ["README.md", "docs/transports-pools-routing.md"],
+    "excluded": [
+      {
+        "path": "tickets/**",
+        "kind": "workItem",
+        "reason": "AS-001..009 and the index: AS-001..005 implemented in 0.2.0 (what was built is in the docs), AS-006 not started, AS-007 proposed, AS-008 built for claude-cli (now in docs and TRANSPORTS notes), AS-009 built (now a README section; its design and limits stay here)."
+      },
+      {
+        "path": "fixtures/**/*.md",
+        "kind": "history",
+        "reason": "Recording notes: the s0 READMEs label themselves 'historical report as written'; claude-steer/README.md describes one cassette set."
+      },
+      {
+        "path": "tests/**",
+        "kind": "excluded",
+        "reason": "Bun tests against scripted fakes and recorded fixtures; outside the regions (codeScope is src/)."
+      },
+      {
+        "path": "scripts/**",
+        "kind": "excluded",
+        "reason": "Measurement and recording tooling (measure-*.ts, s0 recorders), not part of the package."
+      },
+      {
+        "path": "docs/transports-pools-routing.md#migration-notes-for-foundry",
+        "kind": "excluded",
+        "reason": "History: the 0.2.0 migration steps for Foundry, done."
+      },
+      {
+        "path": "docs/transports-pools-routing.md#live-measurements-2026-09-24-this-machine",
+        "kind": "excluded",
+        "reason": "History: one machine's 2026-09-24 latency measurements; the README keeps the headline numbers."
+      }
+    ],
+    "catalog": "code read through the repo's Atlas map when it has one, else the plan's code scope; described with Foundry's catalog describer prompts",
+    "atlas": ".atlas/concepts.ts",
+    "libraries": {},
+    "method": "three independent model proposals, item-level majority vote (2 of 3), seams to the size ceiling, per-region authoring"
+  },
+  "concepts": [
+    {
+      "tag": "session-contract",
+      "atlas": "contract:harness-session",
+      "description": "The provider-agnostic HarnessSession contract: start/send/kill/fork/resume, interrupt vs interruptNative, push/PushOutcome, readLimits, SessionEvent/SessionEventKind, SessionResult, images, pre-send hooks",
+      "region": "session-contract"
+    },
+    {
+      "tag": "admission-evidence",
+      "atlas": "contract:admission-evidence",
+      "description": "Per-turn admission and typed turn failures: SessionAttempt, NativeTerminal/NativeOutcome, SessionTurnError, NativeBindingMissingError on a resume with no native conversation; internal TurnState and retainEvidence envelopes",
+      "region": "session-contract"
+    },
+    {
+      "tag": "usage-telemetry",
+      "atlas": "contract:usage-telemetry",
+      "description": "Token accounting: SessionTokens, cache/thinking counters, result totals vs usage events, parseClaudeUsage, codexTokens",
+      "region": "session-contract"
+    },
+    {
+      "tag": "subagent-task-events",
+      "atlas": "contract:subagent-and-task-events",
+      "description": "Subagent and runtime-task activity on onEvent: SubagentLifecycle, TaskLifecycle, parentToolUseId, unattributedReason (subagent/account-status/task), never part of a turn result",
+      "region": "session-contract"
+    },
+    {
+      "tag": "package-scope",
+      "atlas": null,
+      "description": "What the package owns vs Foundry/Kingdom, its two dependencies (json-rules, pinned @muse-code/sdk), the Bun runtime pin",
+      "region": "session-contract"
+    },
+    {
+      "tag": "transport-registry",
+      "atlas": "transport:registry",
+      "description": "Choosing and creating a transport: TRANSPORTS descriptors and declared capabilities, createSession/describeTransport, ACP/API stubs and TransportUnavailableError, runtime roadmap",
+      "region": "transports"
+    },
+    {
+      "tag": "transport-claude-cli",
+      "atlas": "transport:claude-cli",
+      "description": "ClaudeCodeSession over the claude CLI stream-json: control protocol, steer push, extend()/ClaudeSessionExtension, text-only args",
+      "region": "transports"
+    },
+    {
+      "tag": "transport-claude-agent-sdk",
+      "atlas": "transport:claude-agent-sdk",
+      "description": "ClaudeAgentSdkSession over a caller-supplied Agent SDK query, sdkOptionsFromArgv; no steer, no limit polling",
+      "region": "transports"
+    },
+    {
+      "tag": "transport-codex",
+      "atlas": "transport:codex-app-server",
+      "description": "CodexAppServerSession over codex app-server stdio, codexPermissions, the shared JsonRpcConnection; no session fork",
+      "region": "transports"
+    },
+    {
+      "tag": "transport-muse",
+      "atlas": "transport:muse",
+      "description": "MuseSession over muse serve via the pinned @muse-code/sdk, musePermissions, onUserInput questions, XDG isolation, Muse-initiated task events",
+      "region": "transports"
+    },
+    {
+      "tag": "tool-gate",
+      "atlas": "gate:tool-gate",
+      "description": "Deciding whether an agent tool call may run: onToolRequest gates, pre-use vs permission stages, composition (first deny wins), updatedInput, call.signal, per-runtime approval wiring",
+      "region": "tool-gates-and-secrets"
+    },
+    {
+      "tag": "secret-scratch-pad",
+      "atlas": "secrets:scratch-pad",
+      "description": "Keeping secrets from the agent: SecretScratchPad ($$ lift, \u2020references, env/write/pipe/scrub/clear), privatePathGate/privatePathDenial",
+      "region": "tool-gates-and-secrets"
+    },
+    {
+      "tag": "primed-contract",
+      "atlas": "primed:contract",
+      "description": "The PrimedSessions contract: prime/branch/re-prime by primeHash, DecisionRequest/DecisionError settlement, concurrency, hedging, cancellation, onAdmission",
+      "region": "primed-decisions"
+    },
+    {
+      "tag": "primed-codex",
+      "atlas": "primed:codex",
+      "description": "CodexPrimedSessions: one app-server per account, thread/fork per cycle, private CODEX_HOME, text-only thread config, service tier",
+      "region": "primed-decisions"
+    },
+    {
+      "tag": "primed-claude",
+      "atlas": "primed:claude",
+      "description": "ClaudePrimedSessions: a persisted primed session resumed with --fork-session per cycle, pre-spawned spares",
+      "region": "primed-decisions"
+    },
+    {
+      "tag": "primed-claude-subagents",
+      "atlas": "primed:claude-subagents",
+      "description": "ClaudeSubagentSessions: decision roles as subagents of a dedicated CLI process per group, fan-out batching, side sessions, standby spares",
+      "region": "primed-decisions"
+    },
+    {
+      "tag": "primed-claude-in-session",
+      "atlas": "primed:claude-in-session",
+      "description": "ClaudeInSessionDecisions: decision roles as subagents inside the main ClaudeCodeSession (dispatchers, recycle, orphans, subagent cap)",
+      "region": "primed-decisions"
+    },
+    {
+      "tag": "account-limits",
+      "atlas": "limits:snapshots-and-probes",
+      "description": "Account rate limits: LimitSnapshot, per-runtime snapshot parsers, mergeLimits/limitUtilization, probeCodexLimits/probeClaudeLimits without a model turn",
+      "region": "pools-routing-limits"
+    },
+    {
+      "tag": "routing",
+      "atlas": "routing:ordering-and-eligibility",
+      "description": "Deterministic candidate ranking: strategies (quartile-balanced default), ordering terms, pinned eligibility, allowedBilling, unknownUtilization, exclusion reasons",
+      "region": "pools-routing-limits"
+    },
+    {
+      "tag": "subscription-pool",
+      "atlas": "pool:subscription-pool",
+      "description": "SubscriptionPool: login instances, leases, health cooldowns, limit refresh, continuity (continueOn), pool events",
+      "region": "pools-routing-limits"
+    }
+  ],
+  "regions": [
+    {
+      "id": "session-contract",
+      "tokens": 10268,
+      "recogniseTokens": 1407,
+      "concepts": [
+        "session-contract",
+        "admission-evidence",
+        "usage-telemetry",
+        "subagent-task-events",
+        "package-scope"
+      ],
+      "runsAgreed": 3
+    },
+    {
+      "id": "transports",
+      "tokens": 11368,
+      "recogniseTokens": 1374,
+      "concepts": [
+        "transport-registry",
+        "transport-claude-cli",
+        "transport-claude-agent-sdk",
+        "transport-codex",
+        "transport-muse"
+      ],
+      "runsAgreed": 3
+    },
+    {
+      "id": "tool-gates-and-secrets",
+      "tokens": 7957,
+      "recogniseTokens": 1160,
+      "concepts": ["tool-gate", "secret-scratch-pad"],
+      "runsAgreed": 3
+    },
+    {
+      "id": "primed-decisions",
+      "tokens": 13345,
+      "recogniseTokens": 2307,
+      "concepts": [
+        "primed-contract",
+        "primed-codex",
+        "primed-claude",
+        "primed-claude-subagents",
+        "primed-claude-in-session"
+      ],
+      "runsAgreed": 3
+    },
+    {
+      "id": "pools-routing-limits",
+      "tokens": 11437,
+      "recogniseTokens": 1767,
+      "concepts": ["account-limits", "routing", "subscription-pool"],
+      "runsAgreed": 3
+    }
+  ],
+  "dropped": {
+    "doc:README.md#provenance": "History: where the package was extracted from and who uses it; nothing to reuse or obey.",
+    "doc:README.md#license": "One word (MIT); establishes nothing for a coding agent."
+  }
+}

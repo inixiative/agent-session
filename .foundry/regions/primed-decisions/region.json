@@ -1,0 +1,47 @@
+{
+  "id": "primed-decisions",
+  "title": "Primed decision sessions",
+  "routing": "Is this about running many small, tool-free model decisions (a Warden, guard or classifier judging each message) on warm sessions primed once per role and branched per decision \u2014 CodexPrimedSessions, ClaudePrimedSessions, ClaudeSubagentSessions, ClaudeInSessionDecisions, decide(spec, request), prime(spec), PrimeSpec keys `${threadId}:aux:${role}`, DecisionRequest (signal, onAdmission, standby), DecisionError, primeHash, hedgeAfterMs, serviceTier, maxConcurrent, maxBackgroundPrimes, sparesPerRole, prestart/ready, releaseGroup, dispatchers, recycleTokens, maxOrphans, maxSubagents, CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS, a private CODEX_HOME for decisions?",
+  "concepts": [
+    "primed-contract",
+    "primed-codex",
+    "primed-claude",
+    "primed-claude-subagents",
+    "primed-claude-in-session"
+  ],
+  "tokens": 13345,
+  "tokenMethod": "chars/4",
+  "files": {
+    "recognise": {
+      "path": "recognise.md",
+      "tokens": 2307,
+      "experimental": true,
+      "note": "a smaller recognise-only document; knowledge.md is the Warden document"
+    },
+    "knowledge": {
+      "path": "knowledge.md",
+      "tokens": 13345
+    }
+  },
+  "runsAgreed": 3,
+  "sources": {
+    "docs": ["README.md", "docs/transports-pools-routing.md"],
+    "docUnits": [
+      "doc:README.md#primed-decision-sessions",
+      "doc:docs/transports-pools-routing.md#primed-decision-sessions",
+      "doc:docs/transports-pools-routing.md#claude-subagent-decisions-claudesubagentsessions"
+    ],
+    "catalogClusters": [
+      "primed-claude",
+      "primed-claude-in-session",
+      "primed-claude-subagents",
+      "primed-codex",
+      "primed-contract",
+      "transport-claude-cli"
+    ],
+    "codeEntries": 13,
+    "docMembers": 37
+  },
+  "bypassLines": 8,
+  "glossaryTerms": 28
+}

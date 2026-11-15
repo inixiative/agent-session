@@ -1,7 +1,7 @@
 # Transports, primed sessions, pools and routing
 
-Status: implemented in 0.2.0. Verified against codex-cli 0.155.1, claude 2.1.281 and
-@anthropic-ai/claude-agent-sdk 0.3.281 on 2026-09-24.
+Status: implemented (first in 0.2.0, current in 0.12.0). Each transport's live verification is
+recorded in its `TRANSPORTS[kind].notes` (`src/transport.ts`).
 
 ## Ownership
 
@@ -49,11 +49,12 @@ transport are `CodexPrimedSessions` (the "Primed reset" row).
 ⁴ Muse Code 1.4.14, live and recorded (`fixtures/muse`): start with the profile read back,
 multi-stage shell and network approvals, text, tool and usage events, `usage/changed`,
 `usage/read`. Checked live without a model turn, not recorded: fork, resume with
-`session/setApprovalMode`, `sessionNotFound`. Images, steer, interrupt, questions and
-Muse-initiated turns follow the SDK's wire types without a live run. Muse is not pooled yet: its login and sessions live under two XDG homes, not one
+`session/setApprovalMode`, `sessionNotFound`. A steer (`turn/steer` into a running shell
+turn) was checked live, not recorded. Images, interrupt, questions and Muse-initiated turns
+follow the SDK's wire types without a live run. Muse is not pooled yet: its login and sessions live under two XDG homes, not one
 profile variable.
 
-New optional `HarnessSession` members (existing implementers and consumers are unaffected):
+Optional `HarnessSession` members, present where a transport supports them:
 
 - `transport` — the descriptor above.
 - `interruptNative()` — asks the runtime to stop the turn and waits for its own
@@ -61,7 +62,12 @@ New optional `HarnessSession` members (existing implementers and consumers are u
   app-server uses `turn/interrupt`, the SDK uses `Query.interrupt()`. Unlike
   `interrupt()`, a confirmed stop settles native ownership.
 - `readLimits()` — account limits without a model turn: Claude `get_usage`
-  control request, Codex `account/rateLimits/read`.
+  control request, Codex `account/rateLimits/read`, Muse `usage/read`.
+- `stopTask(taskId)` (Claude Code's `stop_task`), `inspectAttempt(admissionId)` and
+  `onToolRequest(gate)` (see the README's Tool gate).
+
+Every session has `push()`; where a transport's `push` is `none` it returns `ignored`:
+
 - `push()` steers the owned in-flight turn and returns what became of it (`PushOutcome`:
   `steered`, `unknown`, or `ignored` with the reason). app-server and Muse send `turn/steer`; a
   refusal is `ignored` (`push_ignored`), no answer within 10 s is `unknown` (`push-unknown`).
@@ -72,8 +78,8 @@ New optional `HarnessSession` members (existing implementers and consumers are u
   withdraws a steer not yet started (`cancel_async_message`). `claude-agent-sdk` does not steer
   (`command_lifecycle` through the SDK stream is unverified). Recorded runs:
   `fixtures/claude-steer/`.
-- `rate_limit` events with `limits` (from Claude `rate_limit_event` and Codex
-  `account/rateLimits/updated`). They are account-level (`unattributedReason:
+- `rate_limit` events carry `limits` (from Claude `rate_limit_event`, Codex
+  `account/rateLimits/updated` and Muse `usage/changed`). They are account-level (`unattributedReason:
   "account-status"`) and never part of an admission's output.
 
 Stubs: `AcpSession` and `ApiSession` are typed and throw `TransportUnavailableError`.
@@ -84,7 +90,7 @@ Subscription transports never fall back to either.
 ### Agent SDK transport
 
 `ClaudeAgentSdkSession` takes `query` from `@anthropic-ai/claude-agent-sdk` from
-the caller (this package keeps zero dependencies). It feeds SDK `query()` through
+the caller (this package does not depend on the SDK). It feeds SDK `query()` through
 a process-shaped bridge, so ClaudeCodeSession's classification, admission and
 ownership evidence apply unchanged; the CLI argv is mapped to SDK options
 (`sdkOptionsFromArgv`), with unmapped flags in `extraArgs`. It adds per-call
@@ -108,11 +114,11 @@ tag when one role runs under several instructions.
   they stay off the decision's critical path: a miss runs the decision inline on
   a fresh thread (context + input, same instructions) and primes in the
   background. A key whose primed context is replaced before it ever served is
-  volatile and primes again only once its context repeats. `prime(spec)` primes
-  a key ahead of its first decision.
+  volatile and primes again only once its context repeats. On Codex,
+  `prime(spec)` primes a key ahead of its first decision.
 - **Concurrency**: decisions on one key run concurrently (forks are independent);
-  priming is deduplicated per key and context. `maxBackgroundPrimes` bounds
-  primer turns outside the decision slots.
+  priming is deduplicated per key and context. `maxBackgroundPrimes` (Codex,
+  default 2) bounds primer turns outside the decision slots.
 - **Hedging** (`hedgeAfterMs`, Codex): a decision still running after the
   threshold starts the same input on a second branch; the first to finish wins
   and the other is interrupted off the result path (`hedged` / `hedge-settled`
@@ -131,14 +137,6 @@ tag when one role runs under several instructions.
 | Text-only | features, plugins, notify, project docs, tool instructions disabled; read-only sandbox; approvals never; run on a private `CODEX_HOME` holding only the login (the user's AGENTS.md, memories and MCP servers live in theirs) | `--safe-mode --tools "" --strict-mcp-config …` |
 | Violations | a thread reporting `instructionSources` → refused before any turn; non-text item, MCP startup or server request → interrupt, recycle process | tool activity → decision fails |
 
-### Claude subagent decisions (`ClaudeSubagentSessions`)
-
-One Claude CLI process per group (a Foundry thread) serves its decision roles as subagents, instead of a process per role. Each role is a custom agent (`--agents`) whose system prompt is the base instructions, the role's instructions and its stable context, read from the prompt cache. Decisions of a group arriving within `batchWindowMs` (25 ms) fan out in one dispatcher turn (`--tools Agent`, Haiku): the dispatcher calls the Agent tool once per listed member, and a PreToolUse hook replaces each call's prompt with that member's exact input and denies any call it cannot match. Members settle on their own task frames (`task_notification`, the subagent's forwarded text), so a decision never waits for the dispatcher's wrap-up, which is interrupted once every member answered; the turn is then rewound (`rewind_conversation`), so each fan-out starts from an empty conversation. A member the dispatcher skipped is sent in one more fan-out, then refused unsent. A deadline or abort refuses an unsent member and stops a running subagent (`stop_task`). Batches above `maxMembers` (12, measured: all answers at 3.9 s for 8, 4.4 s for 12, 7.9 s for 23) split evenly across up to `maxSessionsPerGroup` (4) side sessions, which also serve overlapping fan-outs. A changed role definition starts a side session holding it. Measured 2026-10-12 (CLI 2.1.296): one side session is about 210 MB idle and 300–320 MB with 23 subagents running.
-
-**Pre-started members (`prestart`, `DecisionRequest.standby`).** A group can keep its roles pre-started, so a decision starts without any dispatch. Each role also has a standby variant whose only tool is `mcp__foundry__moment`, served by the host as an SDK MCP server over the control channel (`mcp_message`). A standby fan-out (foreground, off any decision's path) starts every role with the group's standby context (in Foundry, the thread's own context, refreshed when a turn lands). Each member calls `moment` at once, and the host holds the call open (`MCP_TOOL_TIMEOUT` set to a day). A decision whose `standby` equals a spare's context is admitted, then answers that call with its `input`, so all such members continue in parallel with no dispatcher on the path. A spare serves one decision, which keeps each call fresh: what is pre-started is the composed context, never an earlier conversation. Each role keeps `sparesPerRole` (2) spares, each copy in its own standby side session, so a burst of decisions on one role (several guards in one turn) is served while the used copy refills. A decision takes the spare whose side session has the fewest free spares left, so a trigger empties whole side sessions. Refills are staggered so one copy of every role is always serving: used copies refill in a free standby side session (at most two beyond the full copy sets), while a partly used standby turn keeps serving its unused spares. It ends, and its side session is reused, once every spare is done, or once nothing it serves is in flight and every role it still holds has another held copy. New standby context retires the old spares (their turn ends once no decision uses them). A decision with no matching spare fans out with the standby context in front of its input, in a fan-out side session: standby side sessions never take a fan-out, and `maxSessionsPerGroup` bounds fan-out side sessions only. A group idle for `idleMs`, or released (`releaseGroup`, a closed thread), lets its spares go.
-
-Measured live 2026-10-14 (CLI 2.1.299, Haiku 5.5, 25 roles, `maxMembers` 6, `scripts/measure-subagents.ts`): a trigger on all 25 served by spares took 2.5 s the first time, 1.7 s after a hold and 1.8 s after new standby context, against 7.2 s for a fan-out; 15 processes (10 standby, 5 fan-out), 3.9 GB in all.
-
 Why fork and not rollback: codex-cli 0.155.1 refuses rollback on both thread
 kinds (above), and ephemeral threads cannot be forked ("no rollout found"), so
 the primed thread is persisted and each cycle forks it. A fork that does not
@@ -150,7 +148,7 @@ decision in flight on it fails at once (`transport`), and the next decision on
 each key re-primes on a fresh process.
 
 Decisions on one key run concurrently on both runtimes and are bounded across keys
-(`maxConcurrent`); only priming is serialized per key. Claude: the first decision
+(`maxConcurrent`: 8 on Codex, 1 on Claude); only priming is serialized per key. Claude: the first decision
 takes the key's spare fork, an overlapping one starts its own fork (a process
 start, no re-prime), and one spare is kept afterwards. A key replaced or evicted
 while decisions still fork from it keeps its primed transcript until the last one
@@ -163,7 +161,15 @@ anything was dispatched and whether the turn is settled (terminal observed or
 process exit observed). Blocked limits refuse before dispatch; there is no
 fallback and no retry.
 
-### Live measurements (2026-09-24, this machine)
+## Claude subagent decisions (`ClaudeSubagentSessions`)
+
+One Claude CLI process per group (a Foundry thread) serves its decision roles as subagents, instead of a process per role. Each role is a custom agent (`--agents`) whose system prompt is the base instructions, the role's instructions and its stable context, read from the prompt cache. Decisions of a group arriving within `batchWindowMs` (25 ms) fan out in one dispatcher turn (`--tools Agent`, on the configured `model`): the dispatcher calls the Agent tool once per listed member, and a PreToolUse hook replaces each call's prompt with that member's exact input and denies any call it cannot match. Members settle on their own task frames (`task_notification`, the subagent's forwarded text), so a decision never waits for the dispatcher's wrap-up, which is interrupted once every member answered; the turn is then rewound (`rewind_conversation`), so each fan-out starts from an empty conversation. A member the dispatcher skipped is sent in one more fan-out, then refused unsent. A deadline or abort refuses an unsent member and stops a running subagent (`stop_task`). Batches above `maxMembers` (12, measured: all answers at 3.9 s for 8, 4.4 s for 12, 7.9 s for 23) split evenly across up to `maxSessionsPerGroup` (6) fan-out side sessions, which also serve overlapping fan-outs. A changed role definition starts a side session holding it. Measured 2026-10-12 (CLI 2.1.296): one side session is about 210 MB idle and 300–320 MB with 23 subagents running.
+
+**Pre-started members (`prestart`, `DecisionRequest.standby`).** A group can keep its roles pre-started, so a decision starts without any dispatch. Each role also has a standby variant whose only tool is `mcp__foundry__moment`, served by the host as an SDK MCP server over the control channel (`mcp_message`). A standby fan-out (foreground, off any decision's path) starts every role with the group's standby context (in Foundry, the thread's own context, refreshed when a turn lands). Each member calls `moment` at once, and the host holds the call open (`MCP_TOOL_TIMEOUT` set to a day). A decision whose `standby` equals a spare's context is admitted, then answers that call with its `input`, so all such members continue in parallel with no dispatcher on the path. A spare serves one decision, which keeps each call fresh: what is pre-started is the composed context, never an earlier conversation. Each role keeps `sparesPerRole` (2) spares, each copy in its own standby side session, so a burst of decisions on one role (several guards in one turn) is served while the used copy refills. A decision takes the spare whose side session has the fewest free spares left, so a trigger empties whole side sessions. Refills are staggered so one copy of every role is always serving: used copies refill in a free standby side session (at most two beyond the full copy sets), while a partly used standby turn keeps serving its unused spares. It ends, and its side session is reused, once every spare is done, or once nothing it serves is in flight and every role it still holds has another held copy. New standby context retires the old spares (their turn ends once no decision uses them). A decision with no matching spare fans out with the standby context in front of its input, in a fan-out side session: standby side sessions never take a fan-out, and `maxSessionsPerGroup` bounds fan-out side sessions only. A group idle for `idleMs`, or released (`releaseGroup`, a closed thread), lets its spares go.
+
+Measured live 2026-10-14 (CLI 2.1.299, Haiku 5.5, 25 roles, `maxMembers` 6, `scripts/measure-subagents.ts`): a trigger on all 25 served by spares took 2.5 s the first time, 1.7 s after a hold and 1.8 s after new standby context, against 7.2 s for a fan-out; 15 processes (10 standby, 5 fan-out), 3.9 GB in all.
+
+## Live measurements (2026-09-24, this machine)
 
 `bun scripts/measure-primed.ts --runs 5 --model gpt-6-luna --effort low --claude haiku`,
 a 150-rule domain context and a one-line question per decision:
@@ -237,6 +243,8 @@ The final `id` term compares UTF-16 code units, which matches Postgres `C` /
 non-ASCII instance ids the JS and SQL rails can break an exact tie differently.
 Lowercase ids, including uuids, are unaffected.
 
+### Eligibility, billing and unknown limits
+
 **Eligibility is separate from ordering.** `pinned` (with `preferredInstanceId`)
 makes every other instance ineligible as `not-pinned` — it is a filter, not a sort,
 and composes with any term list.
@@ -272,6 +280,9 @@ capacity reading for an instance; `unknownUtilization` decides what that means:
 Under `owner-first` a preferred instance with an unknown reading is still tried
 first, because `preferred` outranks `utilization` in that preset. Put
 `utilization` or `quartile` first if an unknown reading should lose.
+
+### Limits, leases, health, continuity and attribution
+
 - **Limits**: `open()` refreshes instances whose limits are missing, older than
   the observation age, past a window reset, or blocked past their cooldown, with
   `probeCodexLimits` / `probeClaudeLimits` (no model turn). A poll that fails or
