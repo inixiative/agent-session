@@ -1,7 +1,7 @@
 {
   "id": "transports",
   "title": "Transports and runtime sessions",
-  "routing": "Is this about how a session reaches its model? Picking or building a transport (createSession(kind, config), TRANSPORTS[kind].capabilities, describeTransport), the concrete sessions ClaudeCodeSession (claude CLI stream-json, control protocol, steer push, CLAUDE_TEXT_ONLY_ARGS), ClaudeAgentSdkSession (caller-supplied query, sdkOptionsFromArgv), CodexAppServerSession (codex app-server --listen stdio://, codexPermissions), JsonRpcConnection, MuseSession (muse serve, permissionMode mapped by musePermissions, onUserInput, XDG homes, 1.4.14 pin), the AcpSession/ApiSession stubs and TransportUnavailableError, readLimits and rate_limit events on an open session, or the no-API-billing rule. Jobs: run Claude/Codex/Muse as a session, switch runtimes, steer mid-turn, map a permission mode to a runtime.",
+  "routing": "Is this about how a session reaches its model? Picking or building a transport (createSession(kind, config), TRANSPORTS[kind].capabilities, describeTransport), the concrete sessions ClaudeCodeSession (claude CLI stream-json, control protocol, steer push, CLAUDE_TEXT_ONLY_ARGS), ClaudeAgentSdkSession (caller-supplied query, sdkOptionsFromArgv), CodexAppServerSession (codex app-server --listen stdio://, codexPermissions), JsonRpcConnection, MuseSession (muse serve, permissionMode mapped by musePermissions, onUserInput, XDG homes, 1.4.20 pin), the AcpSession/ApiSession stubs and TransportUnavailableError, readLimits and rate_limit events on an open session, or the no-API-billing rule. Jobs: run Claude/Codex/Muse as a session, switch runtimes, steer mid-turn, map a permission mode to a runtime.",
   "concepts": [
     "transport-registry",
     "transport-claude-cli",

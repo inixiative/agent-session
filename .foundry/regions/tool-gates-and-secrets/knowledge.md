@@ -231,7 +231,7 @@ Codex runs only over `codex app-server --listen stdio://` (`CodexAppServerSessio
 Codex CLI 0.155 has no `mcp-server` subcommand.
 
 Muse Code runs over `muse serve` through Meta's `@muse-code/sdk` (`MuseSession`), pinned to
-the CLI's version (1.4.14): a host serving another version is refused at start. It bills the
+the CLI's version (1.4.20): a host serving another version is refused at start. It bills the
 saved Muse login: metered keys and endpoints never reach it (nor Muse's own tool runs, which
 inherit its environment: a repo command needing `OPENAI_API_KEY` will not see it under Muse),
 and a resumed session must be on provider `meta`. Per-login isolation is `env: { XDG_CONFIG_HOME, XDG_DATA_HOME }` (login and

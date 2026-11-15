@@ -36,9 +36,9 @@ const open = (fake: FakeMuse, config: MuseSessionConfig = {}) => {
 const kinds = (events: readonly SessionEvent[]) => events.map((e) => e.kind);
 
 // ---------------------------------------------------------------------------
-// The live recording (muse 1.4.14, 2026-11-01): a supervised turn that ran
-// `echo probe-ok; curl -sI https://example.com | head -1` through three shell
-// stages and a network approval. Replayed frame by frame; an approval frame
+// The live recording (muse 1.4.20, 2026-11-15, `bun scripts/record-muse.ts`): a
+// supervised turn that ran `echo probe-ok` (one shell stage), then
+// `curl -sI https://example.com | head -1` (two stages and a network approval). Replayed frame by frame; an approval frame
 // waits for this client's decision, as the host did.
 // ---------------------------------------------------------------------------
 
@@ -113,6 +113,14 @@ describe('MuseSession on the recorded supervised turn', () => {
       MUSE_MODEL: 'other-model',
       MUSE_DISABLE_APPROVAL_JUDGE: '1',
       MUSE_EXPERIMENTAL_ACP: '1',
+      MUSE_CUA_DEV_POLICY: 'DANGEROUS_NO_BLOCKING',
+      MUSE_CUA_DEV_SKIP_IDENTITY: '1',
+      MUSE_WWW_ROUTING: 'other',
+      MUSE_CUSTOM_HEADERS: 'x-route: other',
+      MUSE_CHANNEL: 'muse-canary',
+      TBH_CREDENTIAL_BACKEND: 'other',
+      TBH_EVAL_APPEND_SYSTEM_PROMPT: 'injected',
+      TBH_TEST_CUA_GRANTS: 'all',
     });
     try {
       const session = open(fake, {
@@ -137,6 +145,14 @@ describe('MuseSession on the recorded supervised turn', () => {
         'MUSE_MODEL',
         'MUSE_DISABLE_APPROVAL_JUDGE',
         'MUSE_EXPERIMENTAL_ACP',
+        'MUSE_CUA_DEV_POLICY',
+        'MUSE_CUA_DEV_SKIP_IDENTITY',
+        'MUSE_WWW_ROUTING',
+        'MUSE_CUSTOM_HEADERS',
+        'MUSE_CHANNEL',
+        'TBH_CREDENTIAL_BACKEND',
+        'TBH_EVAL_APPEND_SYSTEM_PROMPT',
+        'TBH_TEST_CUA_GRANTS',
       ])
         expect(launch.env[key]).toBeUndefined();
       expect(launch.initialize.capabilities).toEqual({
@@ -178,7 +194,7 @@ describe('MuseSession on the recorded supervised turn', () => {
       input: [{ type: 'text', text: 'Run the two probes.' }],
     });
 
-    // Three shell stages, then the network target the command reached.
+    // The echo's one shell stage, the pipeline's two, then the network target curl reached.
     expect(gated.map((g) => [g.stage, g.toolName])).toEqual([
       ['permission', 'bash'],
       ['permission', 'bash'],
@@ -186,14 +202,26 @@ describe('MuseSession on the recorded supervised turn', () => {
       ['permission', 'network'],
     ]);
     expect(gated[0]!.toolInput).toMatchObject({
-      command: 'echo probe-ok; curl -sI https://example.com | head -1',
-      approval: { kind: 'shell', argv: ['echo', 'probe-ok'], position: 1, totalStages: 3 },
+      command: 'echo probe-ok',
+      approval: { kind: 'shell', argv: ['echo', 'probe-ok'], position: 1, totalStages: 1 },
+    });
+    expect(gated[1]!.toolInput).toMatchObject({
+      command: 'curl -sI https://example.com | head -1',
+      approval: {
+        kind: 'shell',
+        argv: ['curl', '-sI', 'https://example.com'],
+        position: 1,
+        totalStages: 2,
+      },
+    });
+    expect(gated[2]!.toolInput).toMatchObject({
+      approval: { kind: 'shell', argv: ['head', '-1'], position: 2, totalStages: 2 },
     });
     expect(gated[3]!.toolInput).toMatchObject({
       approval: { kind: 'network', host: 'example.com', port: 443, protocol: 'https' },
     });
     expect(gated.every((g) => g.admissionId === done.admissionId)).toBe(true);
-    expect(gated[0]!.callId).toBe('call_01a199f85a767348bbec7596d82a10c0');
+    expect(gated[0]!.callId).toBe('call_01a1dfd68cd6762cafdb9346b8cffb32');
     const decisions = fake.requests.filter((r) => r.method === 'approval/decide');
     expect(decisions.map((d) => d.params!.choiceId)).toEqual([
       'allow_once',
@@ -217,7 +245,9 @@ describe('MuseSession on the recorded supervised turn', () => {
       'usage',
       'tool_use',
       'tool_result',
-      'text_delta',
+      'usage',
+      'tool_use',
+      'tool_result',
       'text_delta',
       'text',
       'usage',
@@ -226,25 +256,33 @@ describe('MuseSession on the recorded supervised turn', () => {
     const use = done.events.find((e) => e.kind === 'tool_use')!;
     expect(use).toMatchObject({
       toolName: 'bash',
-      callId: 'call_01a199f85a767348bbec7596d82a10c0',
-      toolInput: { command: 'echo probe-ok; curl -sI https://example.com | head -1' },
+      callId: 'call_01a1dfd68cd6762cafdb9346b8cffb32',
+      toolInput: { command: 'echo probe-ok' },
     });
-    const toolResult = done.events.find((e) => e.kind === 'tool_result')!;
-    expect(toolResult.toolError).toBe(false);
-    expect(toolResult.toolOutput).toContain('"exit_code": 0');
-    // Input excludes cache reads; the turn total is the sum of both requests.
+    const uses = done.events.filter((e) => e.kind === 'tool_use');
+    expect(uses[1]).toMatchObject({
+      toolName: 'bash',
+      toolInput: { command: 'curl -sI https://example.com | head -1' },
+    });
+    const results = done.events.filter((e) => e.kind === 'tool_result');
+    expect(results.map((r) => r.toolError)).toEqual([false, false]);
+    expect(results[0]!.toolOutput).toContain('"exit_code": 0');
+    expect(results[1]!.toolOutput).toContain('HTTP/1.1 200');
+    expect(done.events.filter((e) => e.unattributedReason === 'unrecognized-event')).toEqual([]);
+    // Input excludes cache reads; the turn total is the sum of the three requests.
     expect(done.events.filter((e) => e.kind === 'usage').map((e) => e.tokens)).toEqual([
-      expect.objectContaining({ input: 30733, output: 120, cacheRead: 0, thinking: 17 }),
-      expect.objectContaining({ input: 244, output: 27, cacheRead: 30708, thinking: 6 }),
+      expect.objectContaining({ input: 35601, output: 382, cacheRead: 0, thinking: 190 }),
+      expect.objectContaining({ input: 36079, output: 193, cacheRead: 0, thinking: 5 }),
+      expect.objectContaining({ input: 412, output: 38, cacheRead: 35956, thinking: 17 }),
     ]);
     expect(done.tokens).toEqual({
-      input: 30977,
-      output: 147,
-      cacheRead: 30708,
+      input: 72092,
+      output: 613,
+      cacheRead: 35956,
       cacheWrite: 0,
-      thinking: 23,
+      thinking: 212,
     });
-    expect(session.totalTokens).toEqual({ input: 30977, output: 147 });
+    expect(session.totalTokens).toEqual({ input: 72092, output: 613 });
     expect(session.turns).toBe(1);
 
     // usage/changed after the turn: account limits, never part of the admission.
@@ -254,8 +292,8 @@ describe('MuseSession on the recorded supervised turn', () => {
     expect(limit.limits).toMatchObject({
       runtime: 'muse',
       windows: [
-        { id: 'window', usedPercent: 5, windowMinutes: 300 },
-        { id: 'weekly', usedPercent: 1, windowMinutes: 10_080 },
+        { id: 'window', usedPercent: 64, windowMinutes: 300 },
+        { id: 'weekly', usedPercent: 29, windowMinutes: 10_080 },
       ],
     });
     expect(limit.limits?.plan).toBeUndefined();
@@ -298,7 +336,7 @@ describe('MuseSession on the recorded supervised turn', () => {
     expect(await session.readLimits()).toMatchObject({
       runtime: 'muse',
       source: 'poll',
-      windows: [{ id: 'window', usedPercent: 5, resetsAt: 1793601827000 }, { id: 'weekly' }],
+      windows: [{ id: 'window', usedPercent: 64, resetsAt: 1794770152000 }, { id: 'weekly' }],
     });
     fake.handlers['usage/read'] = () => ({});
     expect(await session.readLimits()).toBeUndefined();
