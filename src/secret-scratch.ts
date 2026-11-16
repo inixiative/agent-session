@@ -56,10 +56,14 @@ export interface ScratchPadSummary {
   readonly daggers: readonly ScratchDagger[];
 }
 
-/** Where `pipe` reads its value: a held block, or a key already set in an env file. */
+/**
+ * Where a use reads its value: a held block, a key already set in an env file, or a value the host
+ * already holds (its keychain), which goes through the same writers and the same held-files list.
+ */
 export type ScratchSource =
   | { readonly ref: string }
-  | { readonly envFile: string; readonly key: string };
+  | { readonly envFile: string; readonly key: string }
+  | { readonly value: string };
 
 export interface ScratchUse {
   /** Remove the block from the pad once this use succeeds. */
@@ -319,32 +323,30 @@ export class SecretScratchPad {
 
   /** Write the value into a file: `replace` writes it exactly, `append` adds it on its own line. New files are 0600. */
   write(
-    ref: string,
+    source: ScratchSource,
     from: string,
     path: string,
     options: ScratchUse & { mode?: 'replace' | 'append'; cwd?: string } = {},
   ): void {
-    const target = parseScratchRef(ref, from);
-    const value = this._held(target);
+    const { value, target } = this._source(source, from, options.cwd);
     const file = this._target(options.cwd, path);
     const before = options.mode === 'append' ? readText(file) : '';
     const lead = before && !before.endsWith('\n') ? '\n' : '';
     writeTarget(file, options.mode === 'append' ? `${before}${lead}${value}\n` : value);
     this._hold(file);
-    if (options.consume) this._drop(target);
+    if (options.consume && target) this._drop(target);
   }
 
   /** Set `KEY=value` in an env file: the line for KEY is replaced, or added at the end. */
   env(
-    ref: string,
+    source: ScratchSource,
     from: string,
     path: string,
     key: string,
     options: ScratchUse & { cwd?: string } = {},
   ): void {
     if (!ENV_KEY.test(key)) throw new SecretScratchError(`Not an env key: ${clip(key)}`);
-    const target = parseScratchRef(ref, from);
-    const value = this._held(target);
+    const { value, target } = this._source(source, from, options.cwd);
     const file = this._target(options.cwd, path);
     const text = readText(file);
     const newline = text.includes('\r\n') ? '\r\n' : '\n';
@@ -357,12 +359,12 @@ export class SecretScratchPad {
     else lines.push(line);
     writeTarget(file, `${lines.join(newline)}${newline}`);
     this._hold(file);
-    if (options.consume) this._drop(target);
+    if (options.consume && target) this._drop(target);
   }
 
   /**
    * Run `command` in a shell with the value on its stdin. Its output is thrown away; only the exit
-   * code comes back. The value comes from a held block or a key already in an env file. A failed
+   * code comes back. The value comes from any source (`ScratchSource`). A failed
    * command keeps its block, so it can be tried again.
    */
   async pipe(
@@ -371,22 +373,10 @@ export class SecretScratchPad {
     command: string,
     options: ScratchUse & { cwd?: string; timeoutMs?: number } = {},
   ): Promise<{ exitCode: number }> {
-    if ('ref' in source) {
-      const target = parseScratchRef(source.ref, from);
-      const result = await runWithStdin(command, this._held(target), options);
-      if (options.consume && result.exitCode === 0) this._drop(target);
-      return result;
-    }
-    if (!ENV_KEY.test(source.key))
-      throw new SecretScratchError(`Not an env key: ${clip(source.key)}`);
-    const file = this._target(options.cwd, source.envFile);
-    if (!existsSync(file)) throw new SecretScratchError(`No env file at ${clip(source.envFile)}`);
-    const line = readText(file)
-      .split(/\r?\n/)
-      .findLast((l) => envLineKey(l) === source.key);
-    if (line === undefined)
-      throw new SecretScratchError(`${source.key} is not set in ${clip(source.envFile)}`);
-    return runWithStdin(command, envLineValue(line), options);
+    const { value, target } = this._source(source, from, options.cwd);
+    const result = await runWithStdin(command, value, options);
+    if (options.consume && target && result.exitCode === 0) this._drop(target);
+    return result;
   }
 
   /**
@@ -433,6 +423,29 @@ export class SecretScratchPad {
     const refs = new Map(pairs.map((pair) => [pair.value, pair.ref]));
     const pattern = new RegExp(pairs.map((pair) => RegExp.escape(pair.value)).join('|'), 'g');
     return text.replace(pattern, (value) => refs.get(value) ?? value);
+  }
+
+  /** A use's value, and the block it came from when it is one (only a block is consumed). */
+  private _source(
+    source: ScratchSource,
+    from: string,
+    cwd: string | undefined,
+  ): { value: string; target?: ScratchRef } {
+    if ('ref' in source) {
+      const target = parseScratchRef(source.ref, from);
+      return { value: this._held(target), target };
+    }
+    if ('value' in source) return { value: source.value };
+    if (!ENV_KEY.test(source.key))
+      throw new SecretScratchError(`Not an env key: ${clip(source.key)}`);
+    const file = this._target(cwd, source.envFile);
+    if (!existsSync(file)) throw new SecretScratchError(`No env file at ${clip(source.envFile)}`);
+    const line = readText(file)
+      .split(/\r?\n/)
+      .findLast((l) => envLineKey(l) === source.key);
+    if (line === undefined)
+      throw new SecretScratchError(`${source.key} is not set in ${clip(source.envFile)}`);
+    return { value: envLineValue(line) };
   }
 
   private _held(ref: ScratchRef): string {

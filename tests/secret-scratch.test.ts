@@ -102,7 +102,7 @@ describe('recognised patterns', () => {
       { patterns: [KEY] },
     );
     expect(out.text).toBe('the key:\n†m.1\nthanks');
-    pad.write('m.1', 't', 'id_rsa', { cwd: root });
+    pad.write({ ref: 'm.1' }, 't', 'id_rsa', { cwd: root });
     expect(readFileSync(join(root, 'id_rsa'), 'utf8')).toBe(key);
   });
 
@@ -122,10 +122,10 @@ describe('use', () => {
     const { root, pad } = setup();
     await pad.lift('$$tok-1 $$tok-2', { thread: 't', message: 'm' });
     writeFileSync(join(root, '.env.local'), 'A=1\nTOKEN=old\n');
-    await pad.env('†m.1', 't', '.env.local', 'TOKEN', { cwd: root, consume: true });
+    await pad.env({ ref: '†m.1' }, 't', '.env.local', 'TOKEN', { cwd: root, consume: true });
     expect(readFileSync(join(root, '.env.local'), 'utf8')).toBe('A=1\nTOKEN=tok-1\n');
     expect((await pad.list('t'))[0]?.daggers[0]?.positions).toEqual([2]);
-    await pad.env('m.2', 't', '.env.local', 'MULTI', { cwd: root });
+    await pad.env({ ref: 'm.2' }, 't', '.env.local', 'MULTI', { cwd: root });
     await pad.consume('†m.2', 't');
     expect(await pad.list('t')).toEqual([]);
     expect(await pad.threads()).toEqual([]);
@@ -135,7 +135,7 @@ describe('use', () => {
     const { root, pad } = setup();
     await pad.lift('$$-----BEGIN\\nKEY', { thread: 't', message: 'm' });
     // a value with a real newline, as a pasted key would carry after JSON round-trip
-    await pad.env('m.1', 't', 'keys.env', 'K', { cwd: root });
+    await pad.env({ ref: 'm.1' }, 't', 'keys.env', 'K', { cwd: root });
     const out = join(root, 'out.txt');
     const { exitCode } = await pad.pipe({ envFile: 'keys.env', key: 'K' }, 't', `cat > ${out}`, {
       cwd: root,
@@ -172,13 +172,25 @@ describe('use', () => {
     await expect(pad.use('†m.1', 't', () => undefined)).rejects.toThrow(SecretScratchError);
   });
 
+  test('a value the host holds goes through the same writers, and its files are held', async () => {
+    const { root, pad } = setup();
+    pad.env({ value: 'kept elsewhere' }, 't', '.env.local', 'KEPT', { cwd: root, consume: true });
+    expect(readFileSync(join(root, '.env.local'), 'utf8')).toBe("KEPT='kept elsewhere'\n");
+    expect(pad.heldFiles()).toEqual([join(root, '.env.local')]);
+    const out = join(root, 'piped');
+    await pad.pipe({ value: 'v4lue' }, 't', `cat > ${out}`, { cwd: root });
+    expect(readFileSync(out, 'utf8')).toBe('v4lue');
+    pad.write({ envFile: '.env.local', key: 'KEPT' }, 't', 'copy', { cwd: root });
+    expect(readFileSync(join(root, 'copy'), 'utf8')).toBe('kept elsewhere');
+  });
+
   test('write replaces exactly or appends on its own line; a new file is 0600', async () => {
     const { root, pad } = setup();
     await pad.lift('$$abc-123', { thread: 't', message: 'm' });
-    await pad.write('m.1', 't', 'key.txt', { cwd: root });
+    await pad.write({ ref: 'm.1' }, 't', 'key.txt', { cwd: root });
     expect(readFileSync(join(root, 'key.txt'), 'utf8')).toBe('abc-123');
     expect(statSync(join(root, 'key.txt')).mode & 0o777).toBe(0o600);
-    await pad.write('m.1', 't', 'key.txt', { cwd: root, mode: 'append' });
+    await pad.write({ ref: 'm.1' }, 't', 'key.txt', { cwd: root, mode: 'append' });
     expect(readFileSync(join(root, 'key.txt'), 'utf8')).toBe('abc-123\nabc-123\n');
   });
 
@@ -187,7 +199,7 @@ describe('use', () => {
     await pad.lift('$$abc-123', { thread: 't', message: 'm' });
     writeFileSync(join(root, 'real.env'), '');
     symlinkSync(join(root, 'real.env'), join(root, '.env'));
-    await pad.env('m.1', 't', '.env', 'K', { cwd: root });
+    await pad.env({ ref: 'm.1' }, 't', '.env', 'K', { cwd: root });
     expect(lstatSync(join(root, '.env')).isSymbolicLink()).toBe(true);
     expect(readFileSync(join(root, 'real.env'), 'utf8')).toBe('K=abc-123\n');
   });
@@ -195,7 +207,7 @@ describe('use', () => {
   test('another thread is reached with the full reference', async () => {
     const { root, pad } = setup();
     await pad.lift('$$left-over', { thread: 'old_thread', message: 'm' });
-    await pad.write('†old_thread/m.1', 'new_thread', 'f', { cwd: root, consume: true });
+    await pad.write({ ref: '†old_thread/m.1' }, 'new_thread', 'f', { cwd: root, consume: true });
     expect(readFileSync(join(root, 'f'), 'utf8')).toBe('left-over');
     expect(await pad.threads()).toEqual([]);
   });
@@ -211,10 +223,10 @@ describe('use', () => {
       }
       throw Error('expected a throw');
     };
-    const missing = thrown(() => pad.write('m.9', 't', '/nonexistent/x'));
+    const missing = thrown(() => pad.write({ ref: 'm.9' }, 't', '/nonexistent/x'));
     expect(missing).toBeInstanceOf(SecretScratchError);
     expect(missing.message).toContain('m.9');
-    const failed = thrown(() => pad.write('m.1', 't', '/nonexistent/dir/x'));
+    const failed = thrown(() => pad.write({ ref: 'm.1' }, 't', '/nonexistent/dir/x'));
     expect(failed.message).not.toContain('super-secret-value');
     expect(() => parseScratchRef('../etc/passwd.1', 't')).toThrow(SecretScratchError);
   });
@@ -232,7 +244,7 @@ describe('use', () => {
     const { root, pad } = setup();
     pad.lift('$$abc-123', { thread: 't', message: 'm' });
     writeFileSync(join(root, 'w.env'), 'A=1\r\n');
-    pad.env('m.1', 't', 'w.env', 'B', { cwd: root });
+    pad.env({ ref: 'm.1' }, 't', 'w.env', 'B', { cwd: root });
     expect(readFileSync(join(root, 'w.env'), 'utf8')).toBe('A=1\r\nB=abc-123\r\n');
   });
 
@@ -256,7 +268,7 @@ describe('review fixes', () => {
   test('a file the tool wrote is off limits to read, and is used through pipe', async () => {
     const { root, pad } = setup();
     pad.lift('$$tok-12345', { thread: 't', message: 'm' });
-    pad.env('m.1', 't', '.env.local', 'TOKEN', { cwd: root, consume: true });
+    pad.env({ ref: 'm.1' }, 't', '.env.local', 'TOKEN', { cwd: root, consume: true });
     const heldFiles = pad.heldFiles();
     expect(heldFiles).toEqual([join(root, '.env.local')]);
     const deny = (input: Record<string, unknown>) =>
@@ -273,8 +285,8 @@ describe('review fixes', () => {
   test('a value with $ is single-quoted, and quoted values with comments read back', async () => {
     const { root, pad } = setup();
     pad.lift('$$pa$word $$it\'s"x', { thread: 't', message: 'm' });
-    pad.env('m.1', 't', 'a.env', 'A', { cwd: root });
-    pad.env('m.2', 't', 'a.env', 'B', { cwd: root });
+    pad.env({ ref: 'm.1' }, 't', 'a.env', 'A', { cwd: root });
+    pad.env({ ref: 'm.2' }, 't', 'a.env', 'B', { cwd: root });
     expect(readFileSync(join(root, 'a.env'), 'utf8')).toBe('A=\'pa$word\'\nB="it\'s\\"x"\n');
     writeFileSync(
       join(root, 'a.env'),
@@ -294,7 +306,9 @@ describe('review fixes', () => {
   test('the pad directory is never a target, and an unreadable pad stops instead of being overwritten', () => {
     const { root, pad } = setup();
     pad.lift('$$abc-123', { thread: 't', message: 'm' });
-    expect(() => pad.write('m.1', 't', join(pad.dir, 'other.pad'))).toThrow(SecretScratchError);
+    expect(() => pad.write({ ref: 'm.1' }, 't', join(pad.dir, 'other.pad'))).toThrow(
+      SecretScratchError,
+    );
     writeFileSync(join(pad.dir, 'bad.pad'), '†m (x, "e")\n[1] "unterminated\n');
     expect(() => pad.list('bad')).toThrow('unreadable');
     expect(root).toBeTruthy();

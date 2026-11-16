@@ -294,7 +294,8 @@ tokens the person forgot to mark, and counts them as `recognised`.
 
 The agent uses a value without reading it. `env` sets `KEY=value` in an env file,
 `write` puts it in a file, and `pipe` runs a command with the value on its stdin,
-from a reference or a key already in an env file; only the exit code comes back, and
+from a reference, a key already in an env file, or `{ value }` the host already holds
+(its keychain), whose files are held the same way; only the exit code comes back, and
 a timeout kills the whole process group. `use(ref, from, fn)` hands the value to
 the host's own code (a keychain that stores it), consuming only when `fn` succeeds. `consume` (or `consume: true` on a use)
 removes a block, `list` shows what is pending without values, `scrub` swaps held
