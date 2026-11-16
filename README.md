@@ -135,7 +135,10 @@ session.onToolRequest(async (call) => {
   the control protocol; one the session cannot read is denied. An allow may
   carry `updatedInput`: the call runs with that input (the next gate sees it as
   `toolInput`), and the runtime's own mode still decides whether it runs.
-  Foundry uses it to add the chorus's brief to a subagent's prompt.
+  Foundry uses it to add the chorus's brief to a subagent's prompt. An allow may
+  also carry `context`: text the model reads beside the call before it runs
+  (PreToolUse `additionalContext`), the call unchanged; several gates' context
+  joins in order. Foundry uses it for the chorus's notes at a milestone.
 - `permission` is an ask the runtime's mode raised; the answer is final (no gate:
   denied). Claude: `--permission-prompt-tool stdio`; `decisionReason` says why it
   asked, `agentId` marks a subagent's call. Codex app-server: command and

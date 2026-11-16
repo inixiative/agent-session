@@ -436,6 +436,11 @@ export type ToolDecision =
        * whether the call runs. Later gates see it as their `toolInput`.
        */
       readonly updatedInput?: Readonly<Record<string, unknown>>;
+      /**
+       * `pre-use` only (Claude): text the model reads beside the call before it runs (PreToolUse
+       * `additionalContext`), the call itself unchanged. Several gates' context joins in order.
+       */
+      readonly context?: string;
     }
   | { readonly behavior: 'deny'; readonly message: string };
 /** Gates compose in registration order: the first deny wins; a thrown or rejected gate denies. */

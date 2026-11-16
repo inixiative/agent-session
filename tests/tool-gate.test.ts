@@ -203,6 +203,31 @@ describe('Claude tool gate (claude-cli)', () => {
     });
   });
 
+  test('a pre-use allow may carry context: gates join it in order, the hook returns it as additionalContext', async () => {
+    const h = claude();
+    const session = claudeSession(h, { permissionMode: 'default' });
+    session.onToolRequest(() => ({ behavior: 'allow', context: 'first note' }));
+    session.onToolRequest(() => ({ behavior: 'allow', context: '  ' }));
+    session.onToolRequest((request) =>
+      request.stage === 'pre-use'
+        ? { behavior: 'allow', context: 'second note', updatedInput: { command: 'ls' } }
+        : { behavior: 'allow' },
+    );
+    await session.start();
+    await session.send('clean up');
+    expect(h.results[0]).toEqual({
+      subtype: 'success',
+      request_id: 'hook-1',
+      response: {
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          updatedInput: { command: 'ls' },
+          additionalContext: 'first note\n\nsecond note',
+        },
+      },
+    });
+  });
+
   test('a later deny wins over an earlier rewrite', async () => {
     const h = claude();
     const session = claudeSession(h);
