@@ -62,6 +62,15 @@ const ROOT_TOKEN = 'root';
 /** How long a decision reserved on a spare still starting waits for it before starting its own member. */
 const RESERVE_START_MS = 2_000;
 
+const noHeldSpare = (admissionId?: string) =>
+  new DecisionError(
+    'No held member for this decision',
+    'busy',
+    'not-dispatched',
+    true,
+    admissionId,
+  );
+
 const STARTER = (token: string) =>
   `You start Foundry's internal agents and never answer anything yourself. Call ${NEXT} with token "${token}". ` +
   'Its result is either lines of the form `<agent type> <token>` or an instruction to stop. ' +
@@ -702,6 +711,7 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
     const name = `d-${hash(composed).slice(0, 16)}`;
     const spare =
       request.standby === undefined ? undefined : this._spareFor(name, hash(request.standby));
+    if (request.heldOnly && !spare?.held) return Promise.reject(noHeldSpare());
     const started = Date.now();
     let settle!: () => void;
     const done = new Promise<void>((r) => {
@@ -1173,6 +1183,10 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
       this._deliver(spare);
       return;
     }
+    if (member.request.heldOnly) {
+      this._fallback(member);
+      return;
+    }
     setTimeout(() => {
       if (spare.member === member && !member.deliveredAt && !member.settled) this._fallback(member);
     }, RESERVE_START_MS);
@@ -1184,7 +1198,8 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
     if (!spare || member.settled || member.deliveredAt) return;
     if (spare.member === member) spare.member = undefined;
     member.spare = undefined;
-    void this._direct(member, this._compose(member.spec));
+    if (member.request.heldOnly) member.reject(noHeldSpare(member.admissionId));
+    else void this._direct(member, this._compose(member.spec));
   }
 
   private _deliver(spare: Spare): void {
