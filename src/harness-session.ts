@@ -109,6 +109,35 @@ export function nativeBindingMissing(error: unknown): NativeBindingMissingError 
   return undefined;
 }
 
+/**
+ * The runtime said the requested model does not exist: Claude's `model_not_found` (404
+ * `not_found_error`), Codex's `modelNotFound`, or Muse's "model `<id>` does not exist". Retired
+ * models answer the same way, so this is the signal to move a thread to its successor. The turn
+ * ran no model work. Plan, access and rate-limit refusals are ordinary failures, never this.
+ * Providers word it with an access caveat ("may not exist or you may not have access", Codex's
+ * "not supported when using Codex with a ChatGPT account"): for the login in use, the model is
+ * not served either way. `model` is the id the session asked for.
+ */
+export class NativeModelMissingError extends Error {
+  constructor(
+    readonly runtime: 'claude-code' | 'codex-app-server' | 'muse',
+    readonly model: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'NativeModelMissingError';
+  }
+}
+
+/** The missing-model error behind a session error, if any (it rides as a turn error's cause). */
+export function nativeModelMissing(error: unknown): NativeModelMissingError | undefined {
+  for (let current = error, depth = 0; current && depth < 5; depth++) {
+    if (current instanceof NativeModelMissingError) return current;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return undefined;
+}
+
 export type SessionEventKind =
   | 'text_delta'
   | 'native_status'

@@ -18,6 +18,7 @@ import {
   type HarnessSession,
   NativeBindingMissingError,
   type NativeInterruptOutcome,
+  NativeModelMissingError,
   type PushOutcome,
   type SessionArtifact,
   type SessionAttempt,
@@ -708,7 +709,13 @@ export class MuseSession implements HarnessSession {
     if (!this._inflight) return;
     this._clearTimer();
     const a = this._inflight.evidence;
-    if (a.localOutcome === 'pending') {
+    const reason = a.nativeOutcome === 'failed' ? (a.terminal?.reason ?? '') : '';
+    const missing = MODEL_MISSING.exec(reason)?.[1];
+    if (a.localOutcome === 'pending' && missing)
+      this._inflight.reject(
+        a.fail(new NativeModelMissingError('muse', this._model ?? missing, reason), undefined),
+      );
+    else if (a.localOutcome === 'pending') {
       a.localOutcome = 'resolved';
       this._inflight.resolve(a.result(this._externalSessionId));
     }
@@ -1971,6 +1978,8 @@ function triggerDescription(item: Record<string, unknown>): string | undefined {
       return str(item.fallbackText);
   }
 }
+/** Muse's terminal reason for a model the provider does not serve (its `modelError` kind also covers quota). */
+const MODEL_MISSING = /^model `([^`]+)` does not exist\b/;
 const TERMINAL_ITEM = new Set(['completed', 'failed', 'cancelled', 'rejected', 'timedOut']);
 const KNOWN_KINDS = new Set([
   'userMessage',

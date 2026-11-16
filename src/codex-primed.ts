@@ -31,7 +31,7 @@
 // ---------------------------------------------------------------------------
 
 import type { PipedSubprocess } from './codex-session';
-import type { SessionTokens } from './harness-session';
+import { NativeModelMissingError, type SessionTokens } from './harness-session';
 import { JsonRpcConnection, JsonRpcError } from './json-rpc';
 import { codexLimitSnapshot, type LimitSnapshot, mergeLimits } from './limits';
 import {
@@ -255,13 +255,30 @@ export function codexTokens(last: Record<string, unknown> | undefined): SessionT
 
 function failureReason(
   error: Record<string, unknown> | undefined,
-): 'rate-limited' | 'auth' | 'native-failed' {
+): 'rate-limited' | 'auth' | 'model-missing' | 'native-failed' {
   const info = error?.codexErrorInfo;
+  if (info === 'modelNotFound') return 'model-missing';
   if (info === 'usageLimitExceeded' || info === 'rateLimitExceeded') return 'rate-limited';
   if (info === 'unauthorized') return 'auth';
   return /rate.?limit|usage.?limit|too many requests|\b429\b/i.test(String(error?.message ?? ''))
     ? 'rate-limited'
     : 'native-failed';
+}
+
+/** A `modelNotFound` terminal's cause, so nativeModelMissing() finds it behind the DecisionError. */
+function modelMissingCause(
+  error: Record<string, unknown> | undefined,
+  model: string,
+): ErrorOptions | undefined {
+  return error?.codexErrorInfo === 'modelNotFound'
+    ? {
+        cause: new NativeModelMissingError(
+          'codex-app-server',
+          model,
+          String(error.message ?? `Model ${model} not found`),
+        ),
+      }
+    : undefined;
 }
 
 export class CodexPrimedSessions implements PrimedSessions {
@@ -1121,6 +1138,8 @@ export class CodexPrimedSessions implements PrimedSessions {
           reason === 'native-failed' ? 'prime-failed' : reason,
           'not-dispatched',
           outcome.settled,
+          undefined,
+          modelMissingCause(branch.terminal?.error, this._config.model),
         );
       }
     } finally {
@@ -1447,6 +1466,7 @@ export class CodexPrimedSessions implements PrimedSessions {
           'attempted',
           !!terminal || outcome.settled,
           admissionId,
+          modelMissingCause(terminal?.error, this._config.model),
         );
       }
       const tokens = codexTokens(branch.usage);

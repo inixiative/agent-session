@@ -32,7 +32,7 @@ import {
   type ClaudeCodeSessionConfig,
   type PipedSubprocess,
 } from './claude-code-session';
-import { type SessionResult, SessionTurnError } from './harness-session';
+import { nativeModelMissing, type SessionResult, SessionTurnError } from './harness-session';
 import { type LimitSnapshot, mergeLimits } from './limits';
 import {
   DecisionError,
@@ -682,7 +682,11 @@ export class ClaudePrimedSessions implements PrimedSessions {
         const exited = await this._dispose(branch);
         throw new DecisionError(
           `Claude decision ${attempt.localFailure ?? 'failed'}: ${(error as Error).message}`,
-          attempt.localFailure === 'timeout' ? 'timeout' : 'transport',
+          attempt.localFailure === 'timeout'
+            ? 'timeout'
+            : nativeModelMissing(error)
+              ? 'model-missing'
+              : 'transport',
           'attempted',
           settled || exited,
           admissionId,

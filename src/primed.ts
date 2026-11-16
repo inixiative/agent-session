@@ -89,7 +89,9 @@ export type DecisionFailure =
   | 'violation'
   | 'transport'
   | 'native-failed'
-  | 'prime-failed';
+  | 'prime-failed'
+  /** The runtime does not serve the model; the cause is a NativeModelMissingError. */
+  | 'model-missing';
 
 /**
  * `dispatch: "not-dispatched"`: no model input was written for this decision.

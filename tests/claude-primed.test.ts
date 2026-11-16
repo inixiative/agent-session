@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
-import { CLAUDE_TEXT_ONLY_ARGS, ClaudePrimedSessions, type PrimedEvent } from '../src';
+import {
+  CLAUDE_TEXT_ONLY_ARGS,
+  ClaudePrimedSessions,
+  nativeModelMissing,
+  type PrimedEvent,
+} from '../src';
 import { type FakeIo, fakeProcess, tick } from './helpers/fake-process';
 
 const cleanup: Array<() => Promise<void> | void> = [];
@@ -11,7 +16,7 @@ afterEach(async () => {
 /** Claude CLI double: each process is one conversation; forks get new session ids. */
 function claudeCli(
   opts: {
-    behavior?: (input: string) => 'answer' | 'tool' | 'hold' | 'limited';
+    behavior?: (input: string) => 'answer' | 'tool' | 'hold' | 'limited' | 'missing';
     usage?: () => number;
     /** The primer turn answers after this long. */
     primeDelayMs?: number;
@@ -94,6 +99,38 @@ function claudeCli(
             content: [{ type: 'tool_use', id: 'tu', name: 'Bash', input: {} }],
           },
         });
+      if (behavior === 'missing') {
+        // Recorded from Claude Code 2.1.325 for a retired model.
+        const text =
+          "There's an issue with the selected model (claude-3-opus-20240229). It may not exist or you may not have access to it. Run --model to pick a different model.";
+        io.emit({
+          type: 'assistant',
+          session_id: sid,
+          error: 'model_not_found',
+          is_api_error_message: true,
+          api_error_status: 404,
+          api_error_type: 'not_found_error',
+          message: {
+            id: `m-${sid}`,
+            model: '<synthetic>',
+            role: 'assistant',
+            content: [{ type: 'text', text }],
+            usage: { input_tokens: 0, output_tokens: 0 },
+          },
+        });
+        io.emit({
+          type: 'result',
+          subtype: 'success',
+          is_error: true,
+          terminal_reason: 'api_error',
+          api_error_status: 404,
+          api_error_type: 'not_found_error',
+          uuid: `r-${sid}`,
+          session_id: sid,
+          result: text,
+        });
+        return;
+      }
       if (behavior === 'limited') {
         io.emit({
           type: 'rate_limit_event',
@@ -280,6 +317,17 @@ describe('ClaudePrimedSessions', () => {
         (argv) => argv.includes('--no-session-persistence') && !argv.includes('--resume'),
       ),
     ).toBe(true); // the poll
+  });
+
+  test('a model the runtime does not serve fails as model-missing with a typed cause', async () => {
+    const cli = claudeCli({ behavior: (input) => (input === 'missing' ? 'missing' : 'answer') });
+    const { h } = host(cli);
+    const error = await h.decide(spec, { input: 'missing' }).catch((e) => e);
+    expect(error).toMatchObject({ reason: 'model-missing', dispatch: 'attempted' });
+    expect(nativeModelMissing(error)).toMatchObject({
+      name: 'NativeModelMissingError',
+      runtime: 'claude-code',
+    });
   });
 
   test('a rejection without utilization still carries its reset and never blocks forever', async () => {

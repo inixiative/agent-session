@@ -59,6 +59,11 @@ session.kill();
   raise `NativeBindingMissingError` (`nativeBindingMissing(error)` finds it behind a turn error,
   with the `cwd` the lookup ran in). No turn ran, so the attempt settles as a no-send instead of
   uncertain native work, and the caller can start fresh from its own record.
+- **A model the runtime does not serve is typed.** Claude's `model_not_found`, Codex's
+  `modelNotFound` and Muse's "model `<id>` does not exist" (what a retired model answers) reject
+  the turn with `NativeModelMissingError` (`nativeModelMissing(error)` finds it, with the
+  `model` the session asked for), so the caller can move the conversation to a successor. Plan,
+  access and rate-limit refusals stay ordinary failed turns.
 - **Transports with declared capabilities.** How a model is reached is a
   pluggable transport; switching it is a routing change.
 - **Two dependencies.** `@inixiative/json-rules` and Meta's `@muse-code/sdk`

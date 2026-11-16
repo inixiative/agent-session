@@ -3,6 +3,7 @@ import {
   CodexPrimedSessions,
   codexDecisionLaunchArgs,
   DecisionError,
+  nativeModelMissing,
   type PrimedEvent,
 } from '../src';
 import { fakeProcess, tick } from './helpers/fake-process';
@@ -15,6 +16,7 @@ afterEach(async () => {
 type Behavior =
   | 'answer'
   | 'slow-answer'
+  | 'model-missing'
   | 'hold'
   | 'hold-ignore'
   | 'tool'
@@ -136,6 +138,22 @@ function appServer(opts: DoubleOptions = {}) {
               id: 'srv-1',
               method: 'item/commandExecution/requestApproval',
               params: { threadId, turnId },
+            });
+            return;
+          }
+          if (behavior === 'model-missing') {
+            // Recorded from codex-cli 0.169.0 app-server for a retired model.
+            emit('turn/completed', {
+              turn: {
+                id: turnId,
+                status: 'failed',
+                items: [],
+                error: {
+                  message:
+                    "The 'gpt-5-codex' model is not supported when using Codex with a ChatGPT account.",
+                  codexErrorInfo: 'modelNotFound',
+                },
+              },
             });
             return;
           }
@@ -432,6 +450,25 @@ describe('CodexPrimedSessions', () => {
       reason: 'rate-limited',
       dispatch: 'not-dispatched',
     });
+  });
+
+  test('a model the runtime does not serve fails as model-missing with a typed cause', async () => {
+    const d = appServer({
+      behavior: (input) =>
+        input === 'missing' ? 'model-missing' : input === 'limited' ? 'rate-limit' : 'answer',
+    });
+    const { h } = host(d);
+    const error = await h.decide(spec, { input: 'missing' }).catch((e) => e);
+    expect(error).toBeInstanceOf(DecisionError);
+    expect(error).toMatchObject({ reason: 'model-missing', dispatch: 'attempted', settled: true });
+    expect(nativeModelMissing(error)).toMatchObject({
+      name: 'NativeModelMissingError',
+      runtime: 'codex-app-server',
+    });
+    // A rate limit is not a missing model.
+    const limited = await h.decide(spec, { input: 'limited' }).catch((e) => e);
+    expect(limited).toMatchObject({ reason: 'rate-limited' });
+    expect(nativeModelMissing(limited)).toBeUndefined();
   });
 
   test('a lost primed thread fails the branch before dispatch and is retired', async () => {
