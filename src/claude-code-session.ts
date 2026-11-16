@@ -1765,12 +1765,15 @@ export class ClaudeCodeSession implements HarnessSession {
               permissionDecisionReason: decision.message,
             },
           }
-        : decision?.updatedInput
-          ? // No permission decision: the call runs with the new input under the session's own mode.
+        : decision?.updatedInput || decision?.context
+          ? // No permission decision: the call runs (with any new input) under the session's own mode.
             {
               hookSpecificOutput: {
                 hookEventName: 'PreToolUse',
-                updatedInput: structuredClone(decision.updatedInput),
+                ...(decision.updatedInput
+                  ? { updatedInput: structuredClone(decision.updatedInput) }
+                  : {}),
+                ...(decision.context ? { additionalContext: decision.context } : {}),
               },
             }
           : {};
