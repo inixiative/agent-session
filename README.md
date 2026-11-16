@@ -228,6 +228,12 @@ const result = await decisions.decide(spec, { input, standby });
   own subagents go to the tool gate untouched.
 - **Fresh per call.** Each member serves one decision. A used one is replaced
   at once; a role with no held spare starts a member with its input inline.
+- **Held only.** A decision with `heldOnly` never starts a member: with no
+  spare holding its standby, or if the held one is lost before delivery, it
+  is refused unsent (`DecisionError`, `busy`, `not-dispatched`). A caller that
+  would rather skip a decision than wait for a cold start (Foundry's
+  per-project Warden host) gets the refusal at once. Only
+  `ClaudeInSessionDecisions` reads it.
 - **Slices.** `dispatchers` (default 1) splits the roles into fixed slices,
   each started by its own dispatcher, so refills are written at once. A
   dispatcher writes one Agent call per member as output tokens: one

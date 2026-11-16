@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import {
   ClaudeCodeSession,
   ClaudeInSessionDecisions,
+  DecisionError,
   type InSessionSetup,
   type PrimedEvent,
   type PrimeSpec,
@@ -453,6 +454,78 @@ describe('ClaudeInSessionDecisions', () => {
     const result = await host.decide(spec('z'), { input: 'MSG', standby: 'S' });
     expect(result.prime).toBe('cold');
     expect(result.content).toBe('ANS:SMSG');
+  });
+
+  test('a held-only decision is served by a held spare, and refused unsent with none', async () => {
+    const { cli, host } = await setup();
+    host.prestart('t', [{ spec: spec('a'), standby: 'S' }]);
+    await host.ready(3_000);
+    const r = await host.decide(spec('a'), { input: 'M', standby: 'S', heldOnly: true });
+    expect(r).toMatchObject({ prime: 'warm', content: 'ANS:M' });
+    const members = () => cli.hookOutputs.filter((h) => h.type === 'foundry-warden').length;
+    await until(() => host.holding().held === 1);
+    const before = members();
+    // No spare for this role, and one held for another standby: both refused, nothing started.
+    for (const [role, standby] of [
+      ['z', 'S'],
+      ['a', 'other'],
+    ] as const) {
+      const error = await host
+        .decide(spec(role), { input: 'M', standby, heldOnly: true })
+        .catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(DecisionError);
+      expect(error).toMatchObject({ reason: 'busy', dispatch: 'not-dispatched', settled: true });
+    }
+    await tick(20);
+    expect(members()).toBe(before);
+  });
+
+  test('a held-only decision for a role whose spare the CLI refused is refused at once, not started cold', async () => {
+    const { cli, host } = await setup({ limit: 4 });
+    host.prestart(
+      't',
+      ['a', 'b', 'c'].map((r) => ({ spec: spec(r), standby: 'S' })),
+    );
+    await until(() => host.holding().held === 2);
+    // Spawned in order: the third member is the one the CLI refused.
+    const unheld = 'c';
+    const members = cli.hookOutputs.filter((h) => h.type === 'foundry-warden').length;
+    const started = Date.now();
+    const error = await host
+      .decide(spec(unheld), { input: 'M', standby: 'S', heldOnly: true })
+      .catch((e: unknown) => e);
+    expect(error).toMatchObject({ reason: 'busy', dispatch: 'not-dispatched' });
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(cli.hookOutputs.filter((h) => h.type === 'foundry-warden').length).toBe(members);
+    // The spare stays free for its role: still expected, and served once it holds.
+    expect(host.holding().expected).toBe(3);
+  });
+
+  test('a held-only decision whose held spare is lost before delivery is refused, not started cold', async () => {
+    const { cli, host } = await setup();
+    host.prestart('t', [{ spec: spec('a'), standby: 'S' }]);
+    await host.ready(3_000);
+    const member = [...cli.tasks.values()].find((t) => t.type === 'foundry-warden')!;
+    const before = cli.hookOutputs.filter((h) => h.type === 'foundry-warden').length;
+    // The spare's task ends while the decision is being admitted, before its input is delivered.
+    const error = await host
+      .decide(spec('a'), {
+        input: 'M',
+        standby: 'S',
+        heldOnly: true,
+        onAdmission: async () => {
+          cli.endTask(member.token);
+          await tick(20);
+        },
+      })
+      .catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(DecisionError);
+    expect(error).toMatchObject({ reason: 'busy', dispatch: 'not-dispatched', settled: true });
+    // Only the replacement spare starts; no member is started for the refused decision.
+    await tick(50);
+    expect(cli.hookOutputs.filter((h) => h.type === 'foundry-warden').length).toBeLessThanOrEqual(
+      before + 1,
+    );
   });
 
   test('a stale standby is replaced, and the old spare retired once the new one holds', async () => {

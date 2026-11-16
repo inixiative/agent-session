@@ -53,6 +53,12 @@ export interface DecisionRequest {
    * pre-started with exactly this context receives only `input`; otherwise both are sent.
    */
   readonly standby?: string;
+  /**
+   * Served only by a member already holding this exact standby (ClaudeInSessionDecisions):
+   * with none held, or if the held one cannot serve it, the decision is refused unsent
+   * (`busy`, `not-dispatched`) instead of starting a member cold.
+   */
+  readonly heldOnly?: boolean;
 }
 
 export interface DecisionResult {
