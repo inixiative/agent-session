@@ -65,7 +65,11 @@ import type {
   ToolGate,
   ToolRequest,
 } from './harness-session';
-import { NativeBindingMissingError, sendableImages } from './harness-session';
+import {
+  NativeBindingMissingError,
+  NativeModelMissingError,
+  sendableImages,
+} from './harness-session';
 
 // Re-export types so existing import paths keep working
 export type {
@@ -226,6 +230,8 @@ interface QueuedTurn {
   steers?: Map<string, SteerState>;
   /** The turn reached a result while a steer was still waiting: it settles on the next result. */
   held?: { nativeOutcome: 'completed'; tokens?: SessionTokens };
+  /** The CLI's text when it answered this turn with `model_not_found`: the model is not served. */
+  modelMissing?: string;
 }
 
 /** `written` until the CLI's `command_lifecycle` names it; `unconfirmed` after push() gave up waiting. */
@@ -1179,7 +1185,12 @@ export class ClaudeCodeSession implements HarnessSession {
     const a = this._inflight.evidence;
     if (a.nativeOutcome === 'unknown') return;
     this._turns++;
-    if (a.localOutcome === 'pending') {
+    const missing = a.nativeOutcome === 'failed' ? this._inflight.modelMissing : undefined;
+    if (a.localOutcome === 'pending' && missing)
+      this._inflight.reject(
+        a.fail(new NativeModelMissingError('claude-code', this._model, missing), undefined),
+      );
+    else if (a.localOutcome === 'pending') {
       a.localOutcome = 'resolved';
       this._inflight.resolve(a.result(this._externalSessionId));
     }
@@ -1522,6 +1533,14 @@ export class ClaudeCodeSession implements HarnessSession {
         typeof raw.session_id === 'string' ? raw.session_id : a.identity.nativeSessionId,
       correlation: 'ordered-stream',
     };
+    if (raw.type === 'assistant' && raw.error === 'model_not_found') {
+      const content = (raw.message as { content?: unknown } | undefined)?.content;
+      const block = Array.isArray(content) ? (content[0] as { text?: unknown }) : undefined;
+      turn.modelMissing =
+        typeof block?.text === 'string' && block.text
+          ? block.text
+          : `Model ${this._model} not found`;
+    }
     const terminal = raw.type === 'result';
     let holding = false;
     if (terminal) {

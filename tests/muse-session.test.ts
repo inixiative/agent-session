@@ -8,7 +8,9 @@ import {
   museLimitSnapshot,
   musePermissions,
   NativeBindingMissingError,
+  NativeModelMissingError,
   nativeBindingMissing,
+  nativeModelMissing,
   type SessionEvent,
   type ToolRequest,
   TRANSPORTS,
@@ -945,5 +947,89 @@ describe('MuseSession surfaces Muse-initiated work', () => {
       },
     ]);
     expect(tasks.every((e) => e.unattributedReason === 'task')).toBe(true);
+  });
+});
+
+// Recorded 2026-11-15 from Muse Code 1.4.20 (`muse serve`, turn/completed params). muse-spark-1.0 is
+// a retired catalog id; a made-up one (muse-nonexistent-9) answers the same. `muse exec --model`
+// prints it as "agent loop failed: model failed: model `muse-spark-1.0` does not exist or you lack
+// access [request_id=…]". Muse's `modelError` kind also carries quota, so the wording decides.
+const MUSE_MODEL_MISSING = {
+  terminal: 'failed',
+  reason:
+    'model `muse-spark-1.0` does not exist or you lack access [request_id=0871f245-3653-4d78-b132-b3526708c6b9]',
+  durationMs: 1584,
+  error: {
+    kind: 'modelError',
+    message:
+      'model `muse-spark-1.0` does not exist or you lack access [request_id=0871f245-3653-4d78-b132-b3526708c6b9]',
+    retryable: false,
+  },
+};
+const MUSE_QUOTA_EXHAUSTED = {
+  terminal: 'failed',
+  reason:
+    'API error 429 [request_id=113a2962-4b08-4d8a-aa08-d2f7181b3314]: Subscription quota exhausted. Your usage window resets at 2026-11-16T01:42:17Z. (rate_limit_error)',
+  durationMs: 1632,
+  error: {
+    kind: 'modelError',
+    message:
+      'API error 429 [request_id=113a2962-4b08-4d8a-aa08-d2f7181b3314]: Subscription quota exhausted. Your usage window resets at 2026-11-16T01:42:17Z. (rate_limit_error)',
+    retryable: false,
+    quota: { limitKind: 'tierLimit', resetsAtMs: 1794793337000 },
+  },
+};
+
+describe('a model Muse does not serve', () => {
+  const failingHost = (terminal: Params) => {
+    const fake = fakeMuse();
+    fake.handlers['turn/start'] = (p) => {
+      void (async () => {
+        await Bun.sleep(0);
+        fake.notify('turn/started', { turnId: TURN_ID });
+        fake.notify('turn/completed', { turnId: TURN_ID, ...terminal });
+      })();
+      return {
+        commandId: p.commandId,
+        disposition: 'started',
+        startedNewTurn: true,
+        status: 'accepted',
+        turnId: TURN_ID,
+      };
+    };
+    return fake;
+  };
+
+  test('"does not exist" rejects the turn with a typed missing-model error', async () => {
+    const session = open(failingHost(MUSE_MODEL_MISSING), { model: 'muse-spark-1.0' });
+    await session.start();
+    const error = await session.send('hi').catch((e: unknown) => e);
+    const missing = nativeModelMissing(error);
+    expect(missing).toBeInstanceOf(NativeModelMissingError);
+    expect(missing).toMatchObject({
+      runtime: 'muse',
+      model: 'muse-spark-1.0',
+      message: MUSE_MODEL_MISSING.reason,
+    });
+    expect(session.attempts[0]).toMatchObject({
+      nativeOutcome: 'failed',
+      localOutcome: 'rejected',
+    });
+    expect(session.alive).toBe(true);
+  });
+
+  test('on Muse’s default model the id comes from the answer', async () => {
+    const session = open(failingHost(MUSE_MODEL_MISSING));
+    await session.start();
+    const error = await session.send('hi').catch((e: unknown) => e);
+    expect(nativeModelMissing(error)?.model).toBe('muse-spark-1.0');
+  });
+
+  test('an exhausted subscription quota is an ordinary failed turn', async () => {
+    const session = open(failingHost(MUSE_QUOTA_EXHAUSTED), { model: 'muse-spark-1.3' });
+    await session.start();
+    const done = await session.send('hi');
+    expect(done.nativeOutcome).toBe('failed');
+    expect(nativeModelMissing(done)).toBeUndefined();
   });
 });

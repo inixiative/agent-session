@@ -1,5 +1,11 @@
 import { afterEach, expect, test } from 'bun:test';
-import { CodexAppServerSession, NativeBindingMissingError, nativeBindingMissing } from '../src';
+import {
+  CodexAppServerSession,
+  NativeBindingMissingError,
+  NativeModelMissingError,
+  nativeBindingMissing,
+  nativeModelMissing,
+} from '../src';
 
 // Synthetic installed-0.153.4 schema cases, never a recorded native success.
 const closes: Array<() => void> = [];
@@ -705,4 +711,63 @@ test('a resume that times out and is then answered "no rollout" still settles as
   // Released: a later send asks Codex again instead of refusing on an unresolved outcome.
   const again = await f.session.send('again').catch((e) => e);
   expect(again.message).not.toMatch(/unresolved/);
+});
+
+// Recorded 2026-11-15 from codex-cli 0.169.0 app-server on a ChatGPT login (turn/completed
+// `turn.error`). Codex tags a made-up id (gpt-nonexistent-9), a retired one (gpt-5-codex) and an
+// API-only one (gpt-4o) alike: the login will never serve it. `codex exec` prints the same message.
+const CODEX_MODEL_NOT_FOUND = {
+  message: "The 'gpt-5-codex' model is not supported when using Codex with a ChatGPT account.",
+  codexErrorInfo: 'modelNotFound',
+  additionalDetails: null,
+  misalignment: null,
+};
+
+test('a turn Codex fails with modelNotFound rejects with a typed missing-model error', async () => {
+  const f = fixture();
+  await f.session.start();
+  const pending = f.session.send('hi');
+  await tick();
+  f.rpc();
+  f.begin();
+  f.notify('error', { error: CODEX_MODEL_NOT_FOUND, willRetry: false, turnId: 'turn-one' });
+  f.terminal('turn-one', 'failed', CODEX_MODEL_NOT_FOUND);
+  const error = await pending.catch((e) => e);
+  const missing = nativeModelMissing(error);
+  expect(missing).toBeInstanceOf(NativeModelMissingError);
+  expect(missing).toMatchObject({
+    runtime: 'codex-app-server',
+    model: 'requested-model',
+    message: CODEX_MODEL_NOT_FOUND.message,
+  });
+  expect(error.attempt).toMatchObject({ nativeOutcome: 'failed', localOutcome: 'rejected' });
+  expect(error.attempt.terminal.reason).toBe(CODEX_MODEL_NOT_FOUND.message);
+  // A settled native failure: the next send is dispatched, not refused as unresolved.
+  const next = f.session.send('again');
+  await tick();
+  expect(f.calls()).toHaveLength(2);
+  f.rpc('turn-two');
+  f.begin('turn-two');
+  f.terminal('turn-two');
+  expect((await next).nativeOutcome).toBe('completed');
+});
+
+// Synthetic: a plan refusal could not be reproduced on this login; the shapes follow Codex's taxonomy.
+test('usage limits and other failures naming the model stay ordinary failed turns', async () => {
+  for (const error of [
+    { message: "You've hit your usage limit.", codexErrorInfo: 'usageLimitExceeded' },
+    { message: 'The model gpt-5.6-luna is overloaded', codexErrorInfo: 'serverOverloaded' },
+    { message: "The 'gpt-5.6-luna' model is not supported on your plan.", codexErrorInfo: null },
+  ]) {
+    const f = fixture();
+    await f.session.start();
+    const pending = f.session.send('hi');
+    await tick();
+    f.rpc();
+    f.begin();
+    f.terminal('turn-one', 'failed', error);
+    const result = await pending;
+    expect(result.nativeOutcome).toBe('failed');
+    expect(nativeModelMissing(result)).toBeUndefined();
+  }
 });

@@ -28,7 +28,11 @@ import type {
   SessionResult,
   ToolGate,
 } from './harness-session';
-import { NativeBindingMissingError, sendableImages } from './harness-session';
+import {
+  NativeBindingMissingError,
+  NativeModelMissingError,
+  sendableImages,
+} from './harness-session';
 
 // Re-export types so importers can stay on one path (mirrors claude-code-session).
 export type {
@@ -160,6 +164,8 @@ interface QueuedTurn {
   timeout: number;
   resolve: (result: SessionResult) => void;
   reject: (error: Error) => void;
+  /** The turn's error message when Codex tagged it `modelNotFound`: the model is not served. */
+  modelMissing?: string;
 }
 
 // codex reasoning-effort levels (model_reasoning_effort), low→high.
@@ -582,7 +588,12 @@ export class CodexAppServerSession implements HarnessSession {
     const a = this._inflight.evidence;
     a.content = this._resultText;
     a.tokens = tokens ?? a.tokens;
-    if (a.localOutcome === 'pending') {
+    const missing = a.nativeOutcome === 'failed' ? this._inflight.modelMissing : undefined;
+    if (a.localOutcome === 'pending' && missing)
+      this._inflight.reject(
+        a.fail(new NativeModelMissingError('codex-app-server', this._model, missing), undefined),
+      );
+    else if (a.localOutcome === 'pending') {
       a.localOutcome = 'resolved';
       this._inflight.resolve(a.result(this._externalSessionId));
     }
@@ -1491,6 +1502,8 @@ export class CodexAppServerSession implements HarnessSession {
       if (turn.error != null && typeof error?.message !== 'string')
         return unowned('unrecognized-event');
       this._seenTerminals.add(turnId);
+      if (error?.codexErrorInfo === 'modelNotFound' && this._inflight)
+        this._inflight.modelMissing = error.message as string;
       this._fileChanges.clear();
       this._turnDone?.();
       this._turnDone = undefined;

@@ -17,7 +17,9 @@ import {
 } from '../src/claude-code-session';
 import {
   NativeBindingMissingError,
+  NativeModelMissingError,
   nativeBindingMissing,
+  nativeModelMissing,
   type SessionEvent,
 } from '../src/harness-session';
 
@@ -910,5 +912,135 @@ describe('resume of a transcript that is gone', () => {
     await new Promise((r) => setTimeout(r, 5));
     fake.exit(1);
     expect(nativeBindingMissing(await pending.catch((e) => e))).toBeUndefined();
+  });
+});
+
+// Recorded 2026-11-15 from Claude Code 2.1.325 over --input-format/--output-format stream-json on a
+// subscription login (ids and usage trimmed). claude-3-opus-20240229 is a retired model; a made-up
+// id (claude-nonexistent-9) answers the same frames, plus `[claude-code:unrecognized_model]` on stderr.
+const RETIRED_MODEL = 'claude-3-opus-20240229';
+const MODEL_NOT_FOUND_TEXT = `There's an issue with the selected model (${RETIRED_MODEL}). It may not exist or you may not have access to it. Run --model to pick a different model.`;
+const modelNotFoundFrames = (sessionId: string) => [
+  {
+    type: 'assistant',
+    message: {
+      id: 'aeef6351-399e-420f-ab3c-6ef9b0f6ff42',
+      model: '<synthetic>',
+      role: 'assistant',
+      stop_reason: 'stop_sequence',
+      type: 'message',
+      usage: { input_tokens: 0, output_tokens: 0 },
+      content: [{ type: 'text', text: MODEL_NOT_FOUND_TEXT }],
+    },
+    parent_tool_use_id: null,
+    session_id: sessionId,
+    error: 'model_not_found',
+    is_api_error_message: true,
+    api_error_status: 404,
+    api_error_type: 'not_found_error',
+  },
+  {
+    type: 'result',
+    subtype: 'success',
+    is_error: true,
+    num_turns: 1,
+    stop_reason: 'stop_sequence',
+    terminal_reason: 'api_error',
+    api_error_status: 404,
+    api_error_type: 'not_found_error',
+    result: MODEL_NOT_FOUND_TEXT,
+    session_id: sessionId,
+    usage: { input_tokens: 0, output_tokens: 0 },
+  },
+];
+// Recorded the same way for claude-haiku-4-5[1m]: a plan refusal, not a missing model.
+const SUBSCRIPTION_REFUSAL_TEXT =
+  'API Error: 400 The long context beta is not yet available for this subscription.';
+const subscriptionRefusalFrames = (sessionId: string) => [
+  {
+    type: 'assistant',
+    message: {
+      model: '<synthetic>',
+      role: 'assistant',
+      content: [{ type: 'text', text: SUBSCRIPTION_REFUSAL_TEXT }],
+    },
+    parent_tool_use_id: null,
+    session_id: sessionId,
+    error: 'unknown',
+    is_api_error_message: true,
+    api_error_status: 400,
+    api_error_type: 'invalid_request_error',
+  },
+  {
+    type: 'result',
+    subtype: 'success',
+    is_error: true,
+    terminal_reason: 'api_error',
+    api_error_status: 400,
+    api_error_type: 'invalid_request_error',
+    result: SUBSCRIPTION_REFUSAL_TEXT,
+    session_id: sessionId,
+  },
+];
+
+describe('a model the provider does not serve', () => {
+  const answer = (
+    fake: ReturnType<typeof makeFakeProc>,
+    frames: (sessionId: string) => Record<string, unknown>[],
+  ) =>
+    fake.onStdin((line) => {
+      if (JSON.parse(line).type !== 'user') return;
+      queueMicrotask(() => {
+        fake.emit({ type: 'system', subtype: 'init', session_id: 'm1' });
+        for (const frame of frames('m1')) fake.emit(frame);
+      });
+    });
+
+  test('model_not_found rejects the turn with a typed missing-model error', async () => {
+    const fake = makeFakeProc({ autoReplyOnSend: false });
+    answer(fake, modelNotFoundFrames);
+    const session = makeSession(fake, { bin: 'claude', cwd: '/tmp', model: RETIRED_MODEL });
+    await session.start();
+    const error = await session.send('hi').catch((e) => e);
+    const missing = nativeModelMissing(error);
+    expect(missing).toBeInstanceOf(NativeModelMissingError);
+    expect(missing).toMatchObject({
+      runtime: 'claude-code',
+      model: RETIRED_MODEL,
+      message: MODEL_NOT_FOUND_TEXT,
+    });
+    expect(nativeBindingMissing(error)).toBeUndefined();
+    // The native terminal is still evidence on the attempt; the session takes the next turn.
+    expect(error.attempt).toMatchObject({
+      nativeOutcome: 'failed',
+      localOutcome: 'rejected',
+      terminal: { type: 'result', apiErrorStatus: 404, reason: 'api_error' },
+    });
+    expect(error.attempt.localFailure).toBeUndefined();
+    expect(session.alive).toBe(true);
+  });
+
+  test('a subscription refusal of a real model stays an ordinary failed turn', async () => {
+    const fake = makeFakeProc({ autoReplyOnSend: false });
+    answer(fake, subscriptionRefusalFrames);
+    const session = makeSession(fake, {
+      bin: 'claude',
+      cwd: '/tmp',
+      model: 'claude-haiku-4-5[1m]',
+    });
+    await session.start();
+    const result = await session.send('hi');
+    expect(result.nativeOutcome).toBe('failed');
+    expect(result.terminal?.apiErrorStatus).toBe(400);
+    expect(nativeModelMissing(result)).toBeUndefined();
+  });
+
+  test('the walker finds the error as a cause and ignores everything else', () => {
+    const missing = new NativeModelMissingError('claude-code', 'm', 'gone');
+    expect(nativeModelMissing(new Error('outer', { cause: missing }))).toBe(missing);
+    expect(
+      nativeModelMissing(new Error('model claude-x not available on your plan')),
+    ).toBeUndefined();
+    expect(nativeModelMissing(undefined)).toBeUndefined();
   });
 });
