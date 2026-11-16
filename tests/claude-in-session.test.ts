@@ -480,7 +480,7 @@ describe('ClaudeInSessionDecisions', () => {
     expect(members()).toBe(before);
   });
 
-  test('a held-only decision on a spare still starting is refused at once, not started cold', async () => {
+  test('a held-only decision for a role whose spare the CLI refused is refused at once, not started cold', async () => {
     const { cli, host } = await setup({ limit: 4 });
     host.prestart(
       't',
@@ -499,6 +499,33 @@ describe('ClaudeInSessionDecisions', () => {
     expect(cli.hookOutputs.filter((h) => h.type === 'foundry-warden').length).toBe(members);
     // The spare stays free for its role: still expected, and served once it holds.
     expect(host.holding().expected).toBe(3);
+  });
+
+  test('a held-only decision whose held spare is lost before delivery is refused, not started cold', async () => {
+    const { cli, host } = await setup();
+    host.prestart('t', [{ spec: spec('a'), standby: 'S' }]);
+    await host.ready(3_000);
+    const member = [...cli.tasks.values()].find((t) => t.type === 'foundry-warden')!;
+    const before = cli.hookOutputs.filter((h) => h.type === 'foundry-warden').length;
+    // The spare's task ends while the decision is being admitted, before its input is delivered.
+    const error = await host
+      .decide(spec('a'), {
+        input: 'M',
+        standby: 'S',
+        heldOnly: true,
+        onAdmission: async () => {
+          cli.endTask(member.token);
+          await tick(20);
+        },
+      })
+      .catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(DecisionError);
+    expect(error).toMatchObject({ reason: 'busy', dispatch: 'not-dispatched', settled: true });
+    // Only the replacement spare starts; no member is started for the refused decision.
+    await tick(50);
+    expect(cli.hookOutputs.filter((h) => h.type === 'foundry-warden').length).toBeLessThanOrEqual(
+      before + 1,
+    );
   });
 
   test('a stale standby is replaced, and the old spare retired once the new one holds', async () => {
