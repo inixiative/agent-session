@@ -389,6 +389,23 @@ export class SecretScratchPad {
     return runWithStdin(command, envLineValue(line), options);
   }
 
+  /**
+   * Hand the value to in-process code (a store that takes it, a client that signs with it) without
+   * a file or a subprocess. `fn` must not return or log it. With `consume`, the block is removed
+   * only when `fn` succeeds, so a failed use can be tried again.
+   */
+  async use<T>(
+    ref: string,
+    from: string,
+    fn: (value: string) => T | Promise<T>,
+    options: ScratchUse = {},
+  ): Promise<T> {
+    const target = parseScratchRef(ref, from);
+    const result = await fn(this._held(target));
+    if (options.consume) this._drop(target);
+    return result;
+  }
+
   /** Remove a block; a dagger with no blocks left goes too, and an empty pad is deleted. */
   consume(ref: string, from: string): void {
     const target = parseScratchRef(ref, from);
