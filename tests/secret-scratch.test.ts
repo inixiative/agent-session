@@ -158,6 +158,20 @@ describe('use', () => {
     expect((await pad.list('t'))[0]?.daggers[0]?.positions).toEqual([1]);
   });
 
+  test('use hands the value to in-process code; consume removes the block only when it succeeds', async () => {
+    const { pad } = setup();
+    await pad.lift('$$in-process-value', { thread: 't', message: 'm' });
+    const seen: string[] = [];
+    await expect(
+      pad.use('†m.1', 't', () => Promise.reject(new Error('store refused')), { consume: true }),
+    ).rejects.toThrow('store refused');
+    expect((await pad.list('t'))[0]?.daggers[0]?.positions).toEqual([1]);
+    expect(await pad.use('†m.1', 't', (value) => seen.push(value), { consume: true })).toBe(1);
+    expect(seen).toEqual(['in-process-value']);
+    expect(await pad.list('t')).toEqual([]);
+    await expect(pad.use('†m.1', 't', () => undefined)).rejects.toThrow(SecretScratchError);
+  });
+
   test('write replaces exactly or appends on its own line; a new file is 0600', async () => {
     const { root, pad } = setup();
     await pad.lift('$$abc-123', { thread: 't', message: 'm' });
