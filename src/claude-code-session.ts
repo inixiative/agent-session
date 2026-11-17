@@ -232,6 +232,12 @@ interface QueuedTurn {
   held?: { nativeOutcome: 'completed'; tokens?: SessionTokens };
   /** The CLI's text when it answered this turn with `model_not_found`: the model is not served. */
   modelMissing?: string;
+  /**
+   * The uuid this turn's own message is written with, and its `command_lifecycle` state. The CLI
+   * runs turns of its own (a background task's notification wakes it); one that runs while this
+   * message is still queued answers with its own result, which is not this turn's.
+   */
+  prompt?: { uuid: string; state: SteerState };
 }
 
 /** `written` until the CLI's `command_lifecycle` names it; `unconfirmed` after push() gave up waiting. */
@@ -385,6 +391,10 @@ export class ClaudeCodeSession implements HarnessSession {
   private _steerAcks = new Map<string, (state: SteerState) => void>();
   /** Steers written and not yet ended natively: a late `completed` after their turn settled is theirs. */
   private _steerUuids = new Set<string>();
+  /** Uuids of turn messages the CLI has not reported completed or cancelled. */
+  private _promptUuids = new Set<string>();
+  /** The CLI has named a turn message by its uuid, so an unnamed one is not started yet. */
+  private _promptLifecycleSeen = false;
   private readonly _hookCallbackId = `agent-session-pre-tool-${Bun.randomUUIDv7()}`;
   private _limits?: LimitSnapshot;
   private _controlSeq = 0;
@@ -622,6 +632,12 @@ export class ClaudeCodeSession implements HarnessSession {
       text: `push_ignored: kind=${kind} — ${reason}`,
       raw: { kind },
     });
+  }
+
+  /** `turn`'s own message is queued behind a turn of the CLI's own, or not yet named by a CLI that names them. */
+  private _promptWaiting(turn: QueuedTurn): boolean {
+    const state = turn.prompt?.state;
+    return state === 'queued' || (state === 'written' && this._promptLifecycleSeen);
   }
 
   /** A steer of `turn` the CLI has not started yet (or not named yet). */
@@ -1137,11 +1153,15 @@ export class ClaudeCodeSession implements HarnessSession {
 
   private _writeTurn(turn: QueuedTurn): void {
     turn.evidence.dispatch = 'attempted';
+    const uuid = Bun.randomUUIDv7();
+    turn.prompt = { uuid, state: 'written' };
+    this._promptUuids.add(uuid);
 
     // Wire format validated empirically against claude 2.1.114:
     // {type:"user", message:{role,content:[{type:"text",text}]}}
     // Alternative shapes ({type:"user_message"}, {role,content}) are silently dropped.
     // Images are Messages API base64 image blocks, ahead of the text they accompany.
+    // The uuid makes the CLI report the message's command_lifecycle (validated against 2.1.326).
     const payload = `${JSON.stringify({
       type: 'user',
       message: {
@@ -1154,6 +1174,8 @@ export class ClaudeCodeSession implements HarnessSession {
           { type: 'text', text: turn.message },
         ],
       },
+      uuid,
+      parent_tool_use_id: null,
     })}\n`;
     try {
       this._proc!.stdin.write(payload);
@@ -1439,6 +1461,21 @@ export class ClaudeCodeSession implements HarnessSession {
     if (raw.type === 'command_lifecycle' && typeof raw.command_uuid === 'string') {
       const turn = this._inflight;
       const state = raw.state;
+      // The turn's own message: the CLI starts it once any turn of its own has ended.
+      if (this._promptUuids.has(raw.command_uuid)) {
+        this._promptLifecycleSeen = true;
+        if (state === 'completed' || state === 'cancelled')
+          this._promptUuids.delete(raw.command_uuid);
+        if (
+          turn?.prompt?.uuid === raw.command_uuid &&
+          (state === 'queued' ||
+            state === 'started' ||
+            state === 'completed' ||
+            state === 'cancelled')
+        )
+          turn.prompt.state = state;
+        return;
+      }
       const ours = this._steerUuids.has(raw.command_uuid);
       if (ours && (state === 'completed' || state === 'cancelled'))
         this._steerUuids.delete(raw.command_uuid);
@@ -1524,6 +1561,13 @@ export class ClaudeCodeSession implements HarnessSession {
     if (!turn) {
       if (terminalKey) this._seenTerminals.add(terminalKey);
       this._unattributed(raw, 'no-admission');
+      return;
+    }
+    // A turn the CLI ran for itself (a task notification) while this turn's message waited: its
+    // frames and its result are not this turn's, which starts when the CLI starts the message.
+    if (this._promptWaiting(turn)) {
+      if (terminalKey) this._seenTerminals.add(terminalKey);
+      this._unattributed(raw, 'foreign-turn');
       return;
     }
     const a = turn.evidence;
