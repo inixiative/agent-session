@@ -237,6 +237,15 @@ const result = await decisions.decide(spec, { input, standby });
   would rather skip a decision than wait for a cold start (Foundry's
   per-project Warden host) gets the refusal at once. Only
   `ClaudeInSessionDecisions` reads it.
+- **Deadline and abort.** An undelivered decision is refused unsent. A
+  delivered one has its member stopped (`stop_task`, 2 s bound) before the
+  `DecisionError` is thrown, and the error is `settled` when nothing of it
+  still runs: the stop was acknowledged, the member had already answered or
+  never started, or the session ended. An unacknowledged stop, or an orphan
+  (which is never stopped), is unsettled. Why: an unsettled failure makes a
+  caller treat native state as unknown (Foundry's scheduler then closed
+  admission for every decision until restart, 2026-11-16), so a stop the CLI
+  acknowledged must say so, as the primed path's acknowledged interrupt does.
 - **Slices.** `dispatchers` (default 1) splits the roles into fixed slices,
   each started by its own dispatcher, so refills are written at once. A
   dispatcher writes one Agent call per member as output tokens: one

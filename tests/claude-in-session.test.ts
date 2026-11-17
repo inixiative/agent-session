@@ -29,6 +29,8 @@ type Behavior = {
   dispatcherContext?: number;
   /** The root skips its first dispatcher line (a model that did not start it). */
   skipFirstDispatch?: boolean;
+  /** `stop_task` is never answered (a CLI that does not acknowledge the stop). */
+  ignoreStop?: boolean;
 };
 
 /**
@@ -264,6 +266,7 @@ function mainCli(behavior: Behavior = {}) {
         }
         if (m.request.subtype === 'stop_task') {
           stopped.push(m.request.task_id);
+          if (behavior.ignoreStop) return;
           ok();
           return end(m.request.task_id, 'stopped');
         }
@@ -560,9 +563,41 @@ describe('ClaudeInSessionDecisions', () => {
       .catch((e) => e);
     expect(error.reason).toBe('timeout');
     expect(error.dispatch).toBe('attempted');
-    await until(() => cli.stopped.length === 1);
+    // Rejected once the stop is acknowledged, so nothing of it runs: settled.
+    expect(error.settled).toBe(true);
     expect(cli.stopped.length).toBe(1);
     expect(cli.results).toEqual(['READY']);
+  });
+
+  test('a deadline whose stop_task is never acknowledged rejects unsettled', async () => {
+    const { cli, host } = await setup({ answer: () => undefined, ignoreStop: true });
+    host.prestart('t', [{ spec: spec('a'), standby: 'S' }]);
+    await host.ready(3_000);
+    const error = await host
+      .decide(spec('a'), { input: 'M', standby: 'S', timeoutMs: 200 })
+      .catch((e) => e);
+    expect(error.reason).toBe('timeout');
+    expect(error.dispatch).toBe('attempted');
+    expect(error.settled).toBe(false);
+    expect(cli.stopped.length).toBe(1);
+  });
+
+  test('an abort after delivery stops the member and rejects settled, once', async () => {
+    const { cli, host } = await setup({ answer: () => undefined });
+    host.prestart('t', [{ spec: spec('a'), standby: 'S' }]);
+    await host.ready(3_000);
+    const controller = new AbortController();
+    const decided = host
+      .decide(spec('a'), { input: 'M', standby: 'S', timeoutMs: 400, signal: controller.signal })
+      .catch((e) => e);
+    await Bun.sleep(100);
+    controller.abort();
+    const error = await decided;
+    expect(error.reason).toBe('aborted');
+    expect(error.settled).toBe(true);
+    // The deadline that follows the abort does not stop it a second time.
+    await Bun.sleep(400);
+    expect(cli.stopped.length).toBe(1);
   });
 
   test('a main model that never starts the root degrades setup; decisions are refused unsent', async () => {

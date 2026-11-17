@@ -179,6 +179,8 @@ interface Member {
   spare?: Spare;
   deliveredAt?: number;
   settled: boolean;
+  /** Past its deadline or aborted after delivery: its subagent is being stopped. */
+  withdrawn?: { message: string; reason: 'timeout' | 'aborted' };
   done: Promise<void>;
   resolve(result: DecisionResult): void;
   reject(error: DecisionError): void;
@@ -522,7 +524,7 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
         if (!spare || spare.answered) return;
         spare.answered = true;
         const member = spare.member;
-        if (member?.deliveredAt && !member.settled)
+        if (member?.deliveredAt && !member.settled && !member.withdrawn)
           this._settle(spare, member, String(args.text ?? ''));
         return;
       }
@@ -1396,7 +1398,17 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
       this._endIfEmpty(spare.gen);
       return;
     }
-    if (!member.deliveredAt && !spare.direct) this._fallback(member);
+    if (member.withdrawn)
+      member.reject(
+        new DecisionError(
+          `${member.withdrawn.message}; subagent stopped`,
+          member.withdrawn.reason,
+          'attempted',
+          true,
+          member.admissionId,
+        ),
+      );
+    else if (!member.deliveredAt && !spare.direct) this._fallback(member);
     else
       member.reject(
         new DecisionError(
@@ -1410,9 +1422,13 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
     this._endIfEmpty(spare.gen);
   }
 
-  /** Past its deadline or aborted: refused unsent, or rejected and its member stopped. */
+  /**
+   * Past its deadline or aborted: refused unsent, or its member stopped and then rejected. The
+   * rejection is settled once nothing of it runs: the stop was acknowledged, it had already
+   * answered, never started, or the session is gone. An orphan cannot be stopped, so it is not.
+   */
   private async _withdraw(member: Member, reason: 'timeout' | 'aborted'): Promise<void> {
-    if (member.settled) return;
+    if (member.settled || member.withdrawn) return;
     const message = reason === 'timeout' ? 'Decision deadline passed' : 'Decision aborted';
     const spare = member.spare;
     if (!member.deliveredAt) {
@@ -1428,28 +1444,32 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
       );
       return;
     }
-    member.reject(
-      new DecisionError(
-        `${message}; subagent being stopped`,
-        reason,
-        'attempted',
-        false,
-        member.admissionId,
-      ),
-    );
-    if (!spare) return;
+    member.withdrawn = { message, reason };
+    const fail = (settled: boolean, how: string) =>
+      member.reject(
+        new DecisionError(`${message}; ${how}`, reason, 'attempted', settled, member.admissionId),
+      );
+    if (!spare) return fail(false, 'subagent state unknown');
     // A direct member not yet started never starts.
     if (!spare.toolUseId) {
       spare.done = true;
       this._spares.delete(spare.token);
       spare.gen.lines = spare.gen.lines.filter((l) => !l.endsWith(` ${spare.token}`));
-      return;
+      return fail(true, 'subagent never started');
     }
+    // Read through a call: the stop below is awaited, and the member may answer or end meanwhile.
+    const finished = () => spare.answered === true || spare.done === true;
+    if (finished()) return fail(true, 'subagent already finished');
+    if (!this._host?.alive()) return fail(true, 'session ended');
     // A member is a leaf: stopping it ends into its dispatcher, never the main thread. An orphan
     // has no dispatcher, so it is left as it is.
-    if (spare.taskId && !spare.orphan && this._host?.alive())
-      await this._host
-        .control({ subtype: 'stop_task', task_id: spare.taskId }, 2_000)
-        .catch(() => undefined);
+    if (!spare.taskId || spare.orphan) return fail(false, 'subagent left running');
+    const stopped = await this._host
+      .control({ subtype: 'stop_task', task_id: spare.taskId }, 2_000)
+      .then(
+        () => true,
+        () => false,
+      );
+    fail(stopped || finished(), stopped ? 'subagent stopped' : 'subagent stop unacknowledged');
   }
 }
