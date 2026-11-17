@@ -15,7 +15,8 @@ const frames = readFileSync(
   .split('\n')
   .map((line) => JSON.parse(line) as Frame);
 
-function replay() {
+/** `manualSecond`: the second message gets no recorded answer; the test emits its frames. */
+function replay({ manualSecond = false } = {}) {
   const secondAt = frames.findIndex((f) => f.__marker === 'prompt-2-written');
   const stdin: Frame[] = [];
   const controls: Frame[] = [];
@@ -48,7 +49,8 @@ function replay() {
           const uuid = message.uuid as string;
           if (stdin.length === 1)
             queueMicrotask(() => emitRange(0, secondAt, '__PROMPT_1__', uuid));
-          else queueMicrotask(() => emitRange(secondAt + 1, frames.length, '__PROMPT_2__', uuid));
+          else if (!manualSecond)
+            queueMicrotask(() => emitRange(secondAt + 1, frames.length, '__PROMPT_2__', uuid));
         }
       },
       flush() {},
@@ -74,7 +76,9 @@ function replay() {
   const emit = (...items: (number | Frame)[]) => {
     for (const item of items) {
       const f = typeof item === 'number' ? frames[item - 1]! : item;
-      const line = JSON.stringify(f).replaceAll('__PROMPT_1__', String(stdin[0]?.uuid));
+      const line = JSON.stringify(f)
+        .replaceAll('__PROMPT_1__', String(stdin[0]?.uuid))
+        .replaceAll('__PROMPT_2__', String(stdin[1]?.uuid));
       out.enqueue(new TextEncoder().encode(`${line}\n`));
     }
   };
@@ -204,5 +208,79 @@ describe('Claude turns of its own (a task notification)', () => {
     );
     expect(ended).toHaveLength(1);
     expect(ended[0]?.task?.status).toBe('killed');
+  });
+  test('two turns the CLI starts in a row are two turns, each with its own cause', async () => {
+    const { session, emit } = replay();
+    await session.start();
+    await session.send('start the background task');
+    emit(11, 13, 15, 18, 20);
+    await settle();
+    emit(
+      { ...frames[6]!, task_id: 'second-task', uuid: 't2' },
+      {
+        ...frames[12]!,
+        task_id: 'second-task',
+        summary: 'Second background command finished',
+        uuid: 'n2',
+      },
+      { ...frames[17]!, uuid: 'a2' },
+      { ...frames[19]!, uuid: 'r2' },
+    );
+    await settle();
+    const started = session.events.filter(
+      (e) => e.task?.taskType === 'claude-wake' && e.task.phase === 'started',
+    );
+    expect(started).toHaveLength(2);
+    expect(started[0]!.turnId).not.toBe(started[1]!.turnId);
+    expect(started[1]!.task?.description).toBe('Second background command finished');
+    const ended = session.events.filter(
+      (e) => e.task?.taskType === 'claude-wake' && e.task.phase === 'ended',
+    );
+    expect(ended.map((e) => e.task?.status)).toEqual(['completed', 'completed']);
+    session.kill();
+  });
+
+  test("the CLI starting one of this session's messages ends its own turn as unknown", async () => {
+    const { session, emit } = replay({ manualSecond: true });
+    await session.start();
+    await session.send('start the background task');
+    emit(11, 13, 15, 18);
+    await settle();
+    const second = session.send('Reply with exactly the word BANANA.');
+    await settle();
+    // Before the CLI takes our message in, the model's frames are still its own turn's.
+    emit(17, 19);
+    await settle();
+    emit(21);
+    await settle();
+    const ended = session.events.filter(
+      (e) => e.task?.taskType === 'claude-wake' && e.task.phase === 'ended',
+    );
+    expect(ended).toHaveLength(1);
+    expect(ended[0]?.task).toMatchObject({ status: 'unknown', reason: 'message started' });
+    const wakeText = session.events.filter(
+      (e) => e.correlation === 'native-turn' && e.kind === 'text',
+    );
+    expect(wakeText.length).toBeGreaterThan(0);
+    emit(22, 23, 24);
+    const answer = await second;
+    expect(answer.content).toContain('BANANA');
+    expect(answer.content).not.toContain('background command');
+    session.kill();
+  });
+
+  test('a result with no success or error ends the turn as unknown, its text as the summary', async () => {
+    const { session, emit } = replay();
+    await session.start();
+    await session.send('start the background task');
+    const { subtype: _subtype, ...noSubtype } = frames[19]!;
+    emit(11, 13, 15, 18, { ...noSubtype, uuid: 'r-unknown' });
+    await settle();
+    const ended = session.events.find(
+      (e) => e.task?.taskType === 'claude-wake' && e.task.phase === 'ended',
+    );
+    expect(ended?.task?.status).toBe('unknown');
+    expect(ended?.task?.summary).toContain('background command');
+    session.kill();
   });
 });

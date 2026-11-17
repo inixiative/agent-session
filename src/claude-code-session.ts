@@ -616,6 +616,7 @@ export class ClaudeCodeSession implements HarnessSession {
       this._proc.stdin.flush();
     } catch (error) {
       steers.delete(uuid);
+      this._steerUuids.delete(uuid);
       this._steerAcks.delete(uuid);
       return ignored(`write failed: ${(error as Error).message.slice(0, 200)}`);
     }
@@ -1019,7 +1020,7 @@ export class ClaudeCodeSession implements HarnessSession {
         return 'unacknowledged';
       }
       while (this._wake === wake && this._alive && Date.now() < deadline) await Bun.sleep(10);
-      return this._wake === wake ? 'unacknowledged' : 'acknowledged';
+      return this._wake === wake || !this._alive ? 'unacknowledged' : 'acknowledged';
     }
     if (turn?.evidence.dispatch !== 'attempted' || turn.evidence.nativeOutcome !== 'unknown')
       return 'no-turn';
@@ -1511,6 +1512,8 @@ export class ClaudeCodeSession implements HarnessSession {
             state === 'cancelled')
         )
           turn.prompt.state = state;
+        // The CLI took our message in before its own turn's result: what follows is ours.
+        if (state === 'started') this._endWake({ status: 'unknown', reason: 'message started' });
         return;
       }
       const ours = this._steerUuids.has(raw.command_uuid);
@@ -1606,7 +1609,7 @@ export class ClaudeCodeSession implements HarnessSession {
     }
     // A turn the CLI ran for itself (a task notification) while this turn's message waited: its
     // frames and its result are not this turn's, which starts when the CLI starts the message.
-    if (this._promptWaiting(turn)) {
+    if (this._promptWaiting(turn) || (this._wake && turn.prompt?.state !== 'started')) {
       if (terminalKey) this._seenTerminals.add(terminalKey);
       if (this._wakeOpens(turn, raw)) this._wakeFrame(raw);
       else this._unattributed(raw, 'foreign-turn');
@@ -2031,9 +2034,11 @@ export class ClaudeCodeSession implements HarnessSession {
     };
     for (const event of this._classify(raw))
       this._emit({ ...event, ...base, messageId, nativeOutcome: outcome, terminal });
+    const text = typeof raw.result === 'string' && raw.result ? raw.result : undefined;
     this._endWake({
-      status: outcome === 'failed' ? 'failed' : 'completed',
+      status: outcome,
       ...(reason ? { reason } : {}),
+      ...(text ? { summary: text } : {}),
     });
   }
 
@@ -2242,6 +2247,7 @@ export class ClaudeCodeSession implements HarnessSession {
     if (event.kind === 'session_end') {
       if (this._endEmitted) return;
       this._endWake({ status: 'killed', reason: 'session ended' });
+      this._wakeCause = undefined;
       this._endEmitted = true;
     }
     this._eventLog.push(event);
