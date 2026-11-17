@@ -41,6 +41,7 @@ import {
   DecisionError,
   type DecisionRequest,
   type DecisionResult,
+  type InSessionCapacity,
   type PrimedEvent,
   type PrimedSessions,
   type PrimedSnapshot,
@@ -67,7 +68,7 @@ const RESERVE_START_MS = 2_000;
 const noHeldSpare = (admissionId?: string) =>
   new DecisionError(
     'No held member for this decision',
-    'busy',
+    'not-held',
     'not-dispatched',
     true,
     admissionId,
@@ -693,6 +694,15 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
       sessions: this._gens.size,
       active: [...this._members].filter((m) => m.deliveredAt && !m.settled).length,
       waiting: [...this._members].filter((m) => !m.deliveredAt && !m.settled).length,
+      capacity: this._capacity(),
+    };
+  }
+
+  private _capacity(): InSessionCapacity {
+    return {
+      awaitingSlot: this._awaitingSlot.length,
+      orphans: [...this._spares.values()].filter((sp) => sp.orphan && !sp.done).length,
+      orphanedOut: this._orphanedOut,
     };
   }
 

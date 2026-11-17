@@ -56,7 +56,7 @@ export interface DecisionRequest {
   /**
    * Served only by a member already holding this exact standby (ClaudeInSessionDecisions):
    * with none held, or if the held one cannot serve it, the decision is refused unsent
-   * (`busy`, `not-dispatched`) instead of starting a member cold.
+   * (`not-held`, `not-dispatched`) instead of starting a member cold.
    */
   readonly heldOnly?: boolean;
 }
@@ -87,6 +87,8 @@ export interface DecisionResult {
 export type DecisionFailure =
   | 'closed'
   | 'busy'
+  /** `heldOnly`: no member held this standby, or the held one was lost before delivery. */
+  | 'not-held'
   | 'admission'
   | 'rate-limited'
   | 'auth'
@@ -159,6 +161,21 @@ export interface PrimedSnapshot {
   readonly active: number;
   readonly waiting: number;
   readonly limits?: LimitSnapshot;
+  /** What an in-session host holds right now (ClaudeInSessionDecisions). */
+  readonly capacity?: InSessionCapacity;
+}
+
+/**
+ * What an in-session host holds that no other reading exposes. Setup status and held roles are
+ * `setup` and `holding()`; decisions in flight are the snapshot's `active` and `waiting`.
+ */
+export interface InSessionCapacity {
+  /** Spawns the CLI refused at its subagent cap, waiting for a slot to go out again. */
+  readonly awaitingSlot: number;
+  /** Spares whose dispatcher ended: they still serve but never end (`maxOrphans` caps them). */
+  readonly orphans: number;
+  /** Past `maxOrphans`: the session no longer serves decisions in-session. */
+  readonly orphanedOut: boolean;
 }
 
 export interface PrimedSessions {

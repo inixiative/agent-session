@@ -483,7 +483,11 @@ describe('ClaudeInSessionDecisions', () => {
         .decide(spec(role), { input: 'M', standby, heldOnly: true })
         .catch((e: unknown) => e);
       expect(error).toBeInstanceOf(DecisionError);
-      expect(error).toMatchObject({ reason: 'busy', dispatch: 'not-dispatched', settled: true });
+      expect(error).toMatchObject({
+        reason: 'not-held',
+        dispatch: 'not-dispatched',
+        settled: true,
+      });
     }
     await tick(20);
     expect(members()).toBe(before);
@@ -503,7 +507,7 @@ describe('ClaudeInSessionDecisions', () => {
     const error = await host
       .decide(spec(unheld), { input: 'M', standby: 'S', heldOnly: true })
       .catch((e: unknown) => e);
-    expect(error).toMatchObject({ reason: 'busy', dispatch: 'not-dispatched' });
+    expect(error).toMatchObject({ reason: 'not-held', dispatch: 'not-dispatched' });
     expect(Date.now() - started).toBeLessThan(1_000);
     expect(cli.hookOutputs.filter((h) => h.type === 'foundry-warden').length).toBe(members);
     // The spare stays free for its role: still expected, and served once it holds.
@@ -529,7 +533,7 @@ describe('ClaudeInSessionDecisions', () => {
       })
       .catch((e: unknown) => e);
     expect(error).toBeInstanceOf(DecisionError);
-    expect(error).toMatchObject({ reason: 'busy', dispatch: 'not-dispatched', settled: true });
+    expect(error).toMatchObject({ reason: 'not-held', dispatch: 'not-dispatched', settled: true });
     // Only the replacement spare starts; no member is started for the refused decision.
     await tick(50);
     expect(cli.hookOutputs.filter((h) => h.type === 'foundry-warden').length).toBeLessThanOrEqual(
@@ -765,6 +769,7 @@ describe('ClaudeInSessionDecisions', () => {
     );
     await until(() => host.holding().held === 2);
     expect(host.holding()).toEqual({ expected: 3, held: 2 });
+    expect(host.snapshot().capacity).toEqual({ awaitingSlot: 1, orphans: 0, orphanedOut: false });
     // Using a spare frees a slot; its replacement and the refused one are both asked for again.
     expect((await host.decide(spec('a'), { input: 'M', standby: 'S' })).content).toBe('ANS:M');
     await until(
@@ -792,6 +797,7 @@ describe('ClaudeInSessionDecisions', () => {
     await until(() => cli.hookOutputs.filter((h) => h.type === 'foundry-dispatch').length === 2);
     await tick(20);
     expect(cli.hookOutputs.filter((h) => h.type === 'foundry-warden').length).toBe(2);
+    expect(host.snapshot().capacity).toMatchObject({ orphans: 2, orphanedOut: false });
     // An orphan serves; its answer call is held, so it never ends.
     const r = await host.decide(spec('a'), { input: 'M', standby: 'S' });
     expect(r.content).toBe('ANS:M');
@@ -822,6 +828,7 @@ describe('ClaudeInSessionDecisions', () => {
     await until(() => !host.serving());
     expect(host.serving()).toBe(false);
     expect(host.setup.status).toBe('degraded');
+    expect(host.snapshot().capacity).toMatchObject({ orphans: 3, orphanedOut: true });
     expect(events.some((e) => e.type === 'process-recycled' && /orphaned/.test(e.reason))).toBe(
       true,
     );

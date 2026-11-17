@@ -113,6 +113,7 @@ export {
   type DecisionFailure,
   type DecisionRequest,
   type DecisionResult,
+  type InSessionCapacity,
   type PrimedEvent,
   type PrimedSessions,
   type PrimedSnapshot,
