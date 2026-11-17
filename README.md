@@ -125,10 +125,13 @@ it, owned by nothing (Foundry showed every such reply empty, 2026-11-17).
 The CLI's own turn is emitted as Muse's are: its frames carry `correlation: "native-turn"`,
 `unattributedReason: "task"` and a minted `turnId`, inside a `task` lifecycle typed
 `claude-wake` (`started` on its first assistant frame, described by the background task or
-subagent that last ended; `ended` at its `result`, `completed` or `failed`, or `killed` when the
-session ends first). It opens only while none of the session's own messages is running, and
-only on the model speaking: a status frame or a lone result opens nothing. `interruptNative()`
-with no message in flight stops it. Why: so a host can show the wake as a turn of its own
+subagent that last ended; `ended` at its `result`, `completed`, `failed` or `unknown` with the
+result's text as `summary`; `unknown` too when the CLI starts one of the session's messages
+before the wake's result; `killed` when the session ends first). It opens only while none of
+the session's own messages is running, and only on the model speaking: a status frame or a lone
+result opens nothing; once open, its frames stay with it until the CLI starts one of the
+session's messages. `interruptNative()` with no message in flight stops it (`acknowledged` once
+the wake ends, never on a kill). Why: so a host can show the wake as a turn of its own
 (Working, then its answer) instead of dropping it.
 
 Full matrix, notes and what is stubbed: [docs/transports-pools-routing.md](docs/transports-pools-routing.md).

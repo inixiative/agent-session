@@ -61,7 +61,8 @@ Optional `HarnessSession` members, present where a transport supports them:
 - `interruptNative()` — asks the runtime to stop the turn and waits for its own
   terminal. Claude uses the CLI control protocol (`control_request: interrupt`),
   app-server uses `turn/interrupt`, the SDK uses `Query.interrupt()`. Unlike
-  `interrupt()`, a confirmed stop settles native ownership.
+  `interrupt()`, a confirmed stop settles native ownership. On Claude with no message in
+  flight, it stops a turn the CLI started itself (`claude-wake`, README).
 - `readLimits()` — account limits without a model turn: Claude `get_usage`
   control request, Codex `account/rateLimits/read`, Muse `usage/read`.
 - `stopTask(taskId)` (Claude Code's `stop_task`), `inspectAttempt(admissionId)` and
