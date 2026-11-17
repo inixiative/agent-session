@@ -165,21 +165,17 @@ export interface PrimedSnapshot {
   readonly capacity?: InSessionCapacity;
 }
 
-/** Read at send time, so each decision's row records the host as it was when the decision went out. */
+/**
+ * What an in-session host holds that no other reading exposes. Setup status and held roles are
+ * `setup` and `holding()`; decisions in flight are the snapshot's `active` and `waiting`.
+ */
 export interface InSessionCapacity {
-  readonly setup: 'starting' | 'ready' | 'degraded';
-  /** Roles kept pre-started, and how many of them hold their standby now (`holding()`). */
-  readonly expected: number;
-  readonly held: number;
-  /** Spawns the CLI refused at its subagent cap, waiting for a slot. */
+  /** Spawns the CLI refused at its subagent cap, waiting for a slot to go out again. */
   readonly awaitingSlot: number;
-  /** Decisions in flight. */
-  readonly members: number;
+  /** Spares whose dispatcher ended: they still serve but never end (`maxOrphans` caps them). */
   readonly orphans: number;
   /** Past `maxOrphans`: the session no longer serves decisions in-session. */
   readonly orphanedOut: boolean;
-  /** Decisions refused or failed since the host started, by reason. */
-  readonly failures: Readonly<Partial<Record<DecisionFailure, number>>>;
 }
 
 export interface PrimedSessions {

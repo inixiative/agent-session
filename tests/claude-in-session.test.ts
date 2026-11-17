@@ -514,25 +514,6 @@ describe('ClaudeInSessionDecisions', () => {
     expect(host.holding().expected).toBe(3);
   });
 
-  test('the snapshot reports what the host holds and counts refusals by reason', async () => {
-    const { host } = await setup();
-    host.prestart('t', [{ spec: spec('a'), standby: 'S' }]);
-    await host.ready(3_000);
-    expect(host.snapshot().capacity).toMatchObject({
-      setup: 'ready',
-      expected: 1,
-      held: 1,
-      awaitingSlot: 0,
-      members: 0,
-      orphans: 0,
-      orphanedOut: false,
-      failures: {},
-    });
-    await host.decide(spec('z'), { input: 'M', standby: 'S', heldOnly: true }).catch(() => {});
-    await host.decide(spec('z'), { input: 'M', standby: 'S', heldOnly: true }).catch(() => {});
-    expect(host.snapshot().capacity?.failures).toEqual({ 'not-held': 2 });
-  });
-
   test('a held-only decision whose held spare is lost before delivery is refused, not started cold', async () => {
     const { cli, host } = await setup();
     host.prestart('t', [{ spec: spec('a'), standby: 'S' }]);
@@ -788,6 +769,7 @@ describe('ClaudeInSessionDecisions', () => {
     );
     await until(() => host.holding().held === 2);
     expect(host.holding()).toEqual({ expected: 3, held: 2 });
+    expect(host.snapshot().capacity).toEqual({ awaitingSlot: 1, orphans: 0, orphanedOut: false });
     // Using a spare frees a slot; its replacement and the refused one are both asked for again.
     expect((await host.decide(spec('a'), { input: 'M', standby: 'S' })).content).toBe('ANS:M');
     await until(
@@ -815,6 +797,7 @@ describe('ClaudeInSessionDecisions', () => {
     await until(() => cli.hookOutputs.filter((h) => h.type === 'foundry-dispatch').length === 2);
     await tick(20);
     expect(cli.hookOutputs.filter((h) => h.type === 'foundry-warden').length).toBe(2);
+    expect(host.snapshot().capacity).toMatchObject({ orphans: 2, orphanedOut: false });
     // An orphan serves; its answer call is held, so it never ends.
     const r = await host.decide(spec('a'), { input: 'M', standby: 'S' });
     expect(r.content).toBe('ANS:M');
@@ -845,6 +828,7 @@ describe('ClaudeInSessionDecisions', () => {
     await until(() => !host.serving());
     expect(host.serving()).toBe(false);
     expect(host.setup.status).toBe('degraded');
+    expect(host.snapshot().capacity).toMatchObject({ orphans: 3, orphanedOut: true });
     expect(events.some((e) => e.type === 'process-recycled' && /orphaned/.test(e.reason))).toBe(
       true,
     );

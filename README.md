@@ -256,6 +256,10 @@ const result = await decisions.decide(spec, { input, standby });
   would rather skip a decision than wait for a cold start (Foundry's
   per-project Warden host) gets the refusal at once. Only
   `ClaudeInSessionDecisions` reads it.
+- **Capacity.** `snapshot().capacity` adds what no other reading exposes: spawns
+  the CLI refused at its subagent cap (`awaitingSlot`), orphaned spares
+  (`orphans`), and whether too many orphans stopped in-session serving
+  (`orphanedOut`). Setup status and held roles are `setup` and `holding()`.
 - **Deadline and abort.** An undelivered decision is refused unsent. A
   delivered one has its member stopped (`stop_task`) before the
   `DecisionError` is thrown, and the error is `settled` when nothing of it

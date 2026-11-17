@@ -39,7 +39,6 @@ import type {
 } from './claude-code-session';
 import {
   DecisionError,
-  type DecisionFailure,
   type DecisionRequest,
   type DecisionResult,
   type InSessionCapacity,
@@ -273,7 +272,6 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
   private _detached = false;
   /** Too many orphans: this session no longer serves decisions in-session. */
   private _orphanedOut = false;
-  private readonly _failures: Partial<Record<DecisionFailure, number>> = {};
   private _rootStartedAt?: number;
   private _ready!: Promise<void>;
   private _markReady!: () => void;
@@ -701,30 +699,16 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
   }
 
   private _capacity(): InSessionCapacity {
-    const { expected, held } = this.holding();
     return {
-      setup: this._setup.status,
-      expected,
-      held,
       awaitingSlot: this._awaitingSlot.length,
-      members: this._members.size,
       orphans: [...this._spares.values()].filter((sp) => sp.orphan && !sp.done).length,
       orphanedOut: this._orphanedOut,
-      failures: { ...this._failures },
     };
   }
 
   async evict(_key: string): Promise<void> {}
 
   decide(spec: PrimeSpec, request: DecisionRequest): Promise<DecisionResult> {
-    return this._decide(spec, request).catch((error: unknown) => {
-      if (error instanceof DecisionError)
-        this._failures[error.reason] = (this._failures[error.reason] ?? 0) + 1;
-      throw error;
-    });
-  }
-
-  private _decide(spec: PrimeSpec, request: DecisionRequest): Promise<DecisionResult> {
     if (this._closed || !this._host?.alive())
       return Promise.reject(
         new DecisionError('In-session decisions unavailable', 'closed', 'not-dispatched', true),
