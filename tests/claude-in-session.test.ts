@@ -483,7 +483,11 @@ describe('ClaudeInSessionDecisions', () => {
         .decide(spec(role), { input: 'M', standby, heldOnly: true })
         .catch((e: unknown) => e);
       expect(error).toBeInstanceOf(DecisionError);
-      expect(error).toMatchObject({ reason: 'busy', dispatch: 'not-dispatched', settled: true });
+      expect(error).toMatchObject({
+        reason: 'not-held',
+        dispatch: 'not-dispatched',
+        settled: true,
+      });
     }
     await tick(20);
     expect(members()).toBe(before);
@@ -503,11 +507,30 @@ describe('ClaudeInSessionDecisions', () => {
     const error = await host
       .decide(spec(unheld), { input: 'M', standby: 'S', heldOnly: true })
       .catch((e: unknown) => e);
-    expect(error).toMatchObject({ reason: 'busy', dispatch: 'not-dispatched' });
+    expect(error).toMatchObject({ reason: 'not-held', dispatch: 'not-dispatched' });
     expect(Date.now() - started).toBeLessThan(1_000);
     expect(cli.hookOutputs.filter((h) => h.type === 'foundry-warden').length).toBe(members);
     // The spare stays free for its role: still expected, and served once it holds.
     expect(host.holding().expected).toBe(3);
+  });
+
+  test('the snapshot reports what the host holds and counts refusals by reason', async () => {
+    const { host } = await setup();
+    host.prestart('t', [{ spec: spec('a'), standby: 'S' }]);
+    await host.ready(3_000);
+    expect(host.snapshot().capacity).toMatchObject({
+      setup: 'ready',
+      expected: 1,
+      held: 1,
+      awaitingSlot: 0,
+      members: 0,
+      orphans: 0,
+      orphanedOut: false,
+      failures: {},
+    });
+    await host.decide(spec('z'), { input: 'M', standby: 'S', heldOnly: true }).catch(() => {});
+    await host.decide(spec('z'), { input: 'M', standby: 'S', heldOnly: true }).catch(() => {});
+    expect(host.snapshot().capacity?.failures).toEqual({ 'not-held': 2 });
   });
 
   test('a held-only decision whose held spare is lost before delivery is refused, not started cold', async () => {
@@ -529,7 +552,7 @@ describe('ClaudeInSessionDecisions', () => {
       })
       .catch((e: unknown) => e);
     expect(error).toBeInstanceOf(DecisionError);
-    expect(error).toMatchObject({ reason: 'busy', dispatch: 'not-dispatched', settled: true });
+    expect(error).toMatchObject({ reason: 'not-held', dispatch: 'not-dispatched', settled: true });
     // Only the replacement spare starts; no member is started for the refused decision.
     await tick(50);
     expect(cli.hookOutputs.filter((h) => h.type === 'foundry-warden').length).toBeLessThanOrEqual(

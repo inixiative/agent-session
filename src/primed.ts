@@ -56,7 +56,7 @@ export interface DecisionRequest {
   /**
    * Served only by a member already holding this exact standby (ClaudeInSessionDecisions):
    * with none held, or if the held one cannot serve it, the decision is refused unsent
-   * (`busy`, `not-dispatched`) instead of starting a member cold.
+   * (`not-held`, `not-dispatched`) instead of starting a member cold.
    */
   readonly heldOnly?: boolean;
 }
@@ -87,6 +87,8 @@ export interface DecisionResult {
 export type DecisionFailure =
   | 'closed'
   | 'busy'
+  /** `heldOnly`: no member held this standby, or the held one was lost before delivery. */
+  | 'not-held'
   | 'admission'
   | 'rate-limited'
   | 'auth'
@@ -159,6 +161,25 @@ export interface PrimedSnapshot {
   readonly active: number;
   readonly waiting: number;
   readonly limits?: LimitSnapshot;
+  /** What an in-session host holds right now (ClaudeInSessionDecisions). */
+  readonly capacity?: InSessionCapacity;
+}
+
+/** Read at send time, so each decision's row records the host as it was when the decision went out. */
+export interface InSessionCapacity {
+  readonly setup: 'starting' | 'ready' | 'degraded';
+  /** Roles kept pre-started, and how many of them hold their standby now (`holding()`). */
+  readonly expected: number;
+  readonly held: number;
+  /** Spawns the CLI refused at its subagent cap, waiting for a slot. */
+  readonly awaitingSlot: number;
+  /** Decisions in flight. */
+  readonly members: number;
+  readonly orphans: number;
+  /** Past `maxOrphans`: the session no longer serves decisions in-session. */
+  readonly orphanedOut: boolean;
+  /** Decisions refused or failed since the host started, by reason. */
+  readonly failures: Readonly<Partial<Record<DecisionFailure, number>>>;
 }
 
 export interface PrimedSessions {

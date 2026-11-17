@@ -252,7 +252,7 @@ const result = await decisions.decide(spec, { input, standby });
   at once; a role with no held spare starts a member with its input inline.
 - **Held only.** A decision with `heldOnly` never starts a member: with no
   spare holding its standby, or if the held one is lost before delivery, it
-  is refused unsent (`DecisionError`, `busy`, `not-dispatched`). A caller that
+  is refused unsent (`DecisionError`, `not-held`, `not-dispatched`). A caller that
   would rather skip a decision than wait for a cold start (Foundry's
   per-project Warden host) gets the refusal at once. Only
   `ClaudeInSessionDecisions` reads it.
