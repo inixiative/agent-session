@@ -354,6 +354,28 @@ export const CLAUDE_TEXT_ONLY_ARGS: readonly string[] = [
   '--no-chrome',
 ];
 
+/** A Claude `result` frame's native outcome, by Foundry's provider precedence. */
+function claudeResultOutcome(raw: Record<string, unknown>) {
+  const subtype = typeof raw.subtype === 'string' ? raw.subtype : undefined;
+  const reason = typeof raw.terminal_reason === 'string' ? raw.terminal_reason : undefined;
+  const status =
+    typeof raw.api_error_status === 'number' && Number.isFinite(raw.api_error_status)
+      ? raw.api_error_status
+      : undefined;
+  // An optimistic subtype cannot erase an explicit native error; local transport/RPC errors do not enter here.
+  const failed =
+    raw.is_error === true ||
+    subtype?.startsWith('error_') ||
+    (status !== undefined && status >= 400) ||
+    reason === 'api_error';
+  const outcome: 'failed' | 'completed' | 'unknown' = failed
+    ? 'failed'
+    : subtype === 'success'
+      ? 'completed'
+      : 'unknown';
+  return { outcome, subtype, reason, status };
+}
+
 export class ClaudeCodeSession implements HarnessSession {
   get transport() {
     return TRANSPORTS['claude-cli'];
@@ -441,6 +463,10 @@ export class ClaudeCodeSession implements HarnessSession {
   private _agentTasks = new Set<string>();
   /** Task ids whose task_started was another task type (a background shell, a monitor): id → type. */
   private _otherTasks = new Map<string, string>();
+  /** A turn the CLI started itself (a background task's notification wake), open until its result. */
+  private _wake: { id: string; nativeSessionId?: string } | null = null;
+  /** What last ended in the background, the likely cause of the next wake. */
+  private _wakeCause: string | undefined;
 
   // -- Turn queue --
   private _queue: QueuedTurn[] = [];
@@ -983,9 +1009,20 @@ export class ClaudeCodeSession implements HarnessSession {
    */
   async interruptNative(opts?: { timeoutMs?: number }): Promise<NativeInterruptOutcome> {
     const turn = this._inflight;
+    const deadline = Date.now() + (opts?.timeoutMs ?? 5_000);
+    // A turn the CLI started itself, with no message of ours in flight: the stop is for it.
+    const wake = this._wake;
+    if (!turn && wake) {
+      try {
+        await this._controlRequest({ subtype: 'interrupt' }, Math.max(1, deadline - Date.now()));
+      } catch {
+        return 'unacknowledged';
+      }
+      while (this._wake === wake && this._alive && Date.now() < deadline) await Bun.sleep(10);
+      return this._wake === wake ? 'unacknowledged' : 'acknowledged';
+    }
     if (turn?.evidence.dispatch !== 'attempted' || turn.evidence.nativeOutcome !== 'unknown')
       return 'no-turn';
-    const deadline = Date.now() + (opts?.timeoutMs ?? 5_000);
     // A stop is for the whole turn: a steer still waiting dies with it, never runs after it.
     await this._withdrawSteers(turn, Math.max(1, Math.min(2_000, deadline - Date.now())));
     this._releaseHeld(turn);
@@ -1526,6 +1563,7 @@ export class ClaudeCodeSession implements HarnessSession {
     // A background task (a shell, a monitor) outlives its turn like a subagent: never an admission's.
     const task = lifecycle || parentToolUseId ? undefined : this._taskLifecycle(raw);
     if (task) {
+      if (task.phase === 'ended') this._wakeCause = task.summary ?? task.description;
       this._emit({
         kind: 'task',
         timestamp: Date.now(),
@@ -1537,6 +1575,8 @@ export class ClaudeCodeSession implements HarnessSession {
       });
       return;
     }
+    if (lifecycle?.phase === 'ended' && lifecycle.backgrounded)
+      this._wakeCause = lifecycle.description;
     if (parentToolUseId || lifecycle) {
       const message = raw.message as Record<string, unknown> | undefined;
       const events: SessionEvent[] = lifecycle
@@ -1560,14 +1600,16 @@ export class ClaudeCodeSession implements HarnessSession {
     const turn = this._inflight;
     if (!turn) {
       if (terminalKey) this._seenTerminals.add(terminalKey);
-      this._unattributed(raw, 'no-admission');
+      if (this._wakeOpens(turn, raw)) this._wakeFrame(raw);
+      else this._unattributed(raw, 'no-admission');
       return;
     }
     // A turn the CLI ran for itself (a task notification) while this turn's message waited: its
     // frames and its result are not this turn's, which starts when the CLI starts the message.
     if (this._promptWaiting(turn)) {
       if (terminalKey) this._seenTerminals.add(terminalKey);
-      this._unattributed(raw, 'foreign-turn');
+      if (this._wakeOpens(turn, raw)) this._wakeFrame(raw);
+      else this._unattributed(raw, 'foreign-turn');
       return;
     }
     const a = turn.evidence;
@@ -1589,20 +1631,8 @@ export class ClaudeCodeSession implements HarnessSession {
     let holding = false;
     if (terminal) {
       if (terminalKey) this._seenTerminals.add(terminalKey);
-      const subtype = typeof raw.subtype === 'string' ? raw.subtype : undefined;
-      const reason = typeof raw.terminal_reason === 'string' ? raw.terminal_reason : undefined;
-      const status =
-        typeof raw.api_error_status === 'number' && Number.isFinite(raw.api_error_status)
-          ? raw.api_error_status
-          : undefined;
-      // Match Foundry's provider precedence. An optimistic subtype cannot erase
-      // an explicit native error; local transport/RPC errors do not enter here.
-      const failed =
-        raw.is_error === true ||
-        subtype?.startsWith('error_') ||
-        (status !== undefined && status >= 400) ||
-        reason === 'api_error';
-      a.nativeOutcome = failed ? 'failed' : subtype === 'success' ? 'completed' : 'unknown';
+      const { outcome, subtype, reason, status } = claudeResultOutcome(raw);
+      a.nativeOutcome = outcome;
       // A steer the CLI has not started yet runs after this result, still in this turn: the turn
       // stays open (and this result reads as an intermediate one) until the steer's own result.
       if (a.nativeOutcome === 'completed' && this._steerWaiting(turn)) {
@@ -1953,6 +1983,89 @@ export class ClaudeCodeSession implements HarnessSession {
   }
 
   /**
+   * Whether a frame no admission owns is (or opens) a turn the CLI started itself: none of this
+   * session's messages is running (`turn`'s own may wait), and only the model speaking opens one
+   * (a lone result or a session's status frame opens nothing).
+   */
+  private _wakeOpens(turn: QueuedTurn | null, raw: Record<string, unknown>): boolean {
+    if (this._wake) return true;
+    if (!this._promptLifecycleSeen || this._steerUuids.size || raw.type !== 'assistant')
+      return false;
+    for (const uuid of this._promptUuids) if (uuid !== turn?.prompt?.uuid) return false;
+    return true;
+  }
+
+  /**
+   * A frame of a turn the CLI started itself. Its events fold as an admission's would, but belong
+   * to none (`unattributedReason: 'task'`); the turn is a `task` lifecycle (`claude-wake`) keyed by
+   * a minted id, described by what last ended in the background, and ended by its result.
+   */
+  private _wakeFrame(raw: Record<string, unknown>): void {
+    if (!this._wake) {
+      this._wake = {
+        id: Bun.randomUUIDv7(),
+        nativeSessionId:
+          typeof raw.session_id === 'string' ? raw.session_id : this._externalSessionId,
+      };
+      const description = this._wakeCause;
+      this._wakeCause = undefined;
+      this._emit(this._wakeLifecycle('started', description ? { description } : {}));
+    }
+    const base = this._wakeBase();
+    const message = raw.message as Record<string, unknown> | undefined;
+    const messageId = typeof message?.id === 'string' ? message.id : undefined;
+    if (raw.type !== 'result') {
+      const events = this._classify(raw);
+      if (!events.length)
+        this._emit({ ...base, kind: 'native_status', timestamp: Date.now(), messageId, raw });
+      for (const event of events) this._emit({ ...event, ...base, messageId });
+      return;
+    }
+    const { outcome, subtype, reason, status } = claudeResultOutcome(raw);
+    const terminal = {
+      type: 'result',
+      eventId: typeof raw.uuid === 'string' ? raw.uuid : undefined,
+      subtype,
+      reason,
+      apiErrorStatus: status,
+    };
+    for (const event of this._classify(raw))
+      this._emit({ ...event, ...base, messageId, nativeOutcome: outcome, terminal });
+    this._endWake({
+      status: outcome === 'failed' ? 'failed' : 'completed',
+      ...(reason ? { reason } : {}),
+    });
+  }
+
+  private _wakeBase() {
+    return {
+      nativeSessionId: this._wake?.nativeSessionId,
+      turnId: this._wake?.id,
+      correlation: 'native-turn' as const,
+      unattributedReason: 'task' as const,
+    };
+  }
+
+  private _wakeLifecycle(
+    phase: 'started' | 'ended',
+    extra: Partial<TaskLifecycle> = {},
+  ): SessionEvent {
+    return {
+      ...this._wakeBase(),
+      kind: 'task',
+      timestamp: Date.now(),
+      task: { phase, taskId: this._wake!.id, taskType: 'claude-wake', ...extra },
+    };
+  }
+
+  private _endWake(extra: Partial<TaskLifecycle>): void {
+    if (!this._wake) return;
+    const ended = this._wakeLifecycle('ended', extra);
+    this._wake = null;
+    this._emit(ended);
+  }
+
+  /**
    * A Claude Code `system` task frame for a task that is not a subagent (`task_type` other than
    * `local_agent`), as lifecycle. Later phases carry no task type: the session remembers it.
    */
@@ -2128,6 +2241,7 @@ export class ClaudeCodeSession implements HarnessSession {
     event = retainEvidence(event);
     if (event.kind === 'session_end') {
       if (this._endEmitted) return;
+      this._endWake({ status: 'killed', reason: 'session ended' });
       this._endEmitted = true;
     }
     this._eventLog.push(event);

@@ -117,11 +117,19 @@ at its timeout). Work Muse starts itself
 
 Claude Code runs turns of its own too: a background task's notification wakes it into a turn
 that answers with its own `result`. Each turn message is written with a `uuid`, so the CLI
-reports its `command_lifecycle`; while the message is `queued` behind such a turn, that turn's
-frames and result are emitted with `unattributedReason: "foreign-turn"` and the turn settles on
-its own result, after the CLI reports the message `started`. Why: matched by stream order alone,
-the notification's result closed the turn, and the turn's real answer arrived after it, owned by
-nothing (Foundry showed every such reply empty, 2026-11-17).
+reports its `command_lifecycle`; while the message is `queued` behind such a turn, the turn
+settles on its own result, after the CLI reports the message `started`. Why: matched by stream
+order alone, the notification's result closed the turn, and the turn's real answer arrived after
+it, owned by nothing (Foundry showed every such reply empty, 2026-11-17).
+
+The CLI's own turn is emitted as Muse's are: its frames carry `correlation: "native-turn"`,
+`unattributedReason: "task"` and a minted `turnId`, inside a `task` lifecycle typed
+`claude-wake` (`started` on its first assistant frame, described by the background task or
+subagent that last ended; `ended` at its `result`, `completed` or `failed`, or `killed` when the
+session ends first). It opens only while none of the session's own messages is running, and
+only on the model speaking: a status frame or a lone result opens nothing. `interruptNative()`
+with no message in flight stops it. Why: so a host can show the wake as a turn of its own
+(Working, then its answer) instead of dropping it.
 
 Full matrix, notes and what is stubbed: [docs/transports-pools-routing.md](docs/transports-pools-routing.md).
 
