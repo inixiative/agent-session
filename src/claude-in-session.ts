@@ -52,6 +52,8 @@ const tool = (name: string) => `mcp__${IN_SESSION_SERVER}__${name}`;
 const NEXT = tool('next');
 const MOMENT = tool('moment');
 const ANSWER = tool('answer');
+/** How long a withdrawn member's stop may take, its ack and its end together, before it is left unsettled. */
+const STOP_BUDGET_MS = 2_000;
 export const IN_SESSION_AGENTS = {
   root: 'foundry-root',
   dispatch: 'foundry-dispatch',
@@ -1464,12 +1466,23 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
     // A member is a leaf: stopping it ends into its dispatcher, never the main thread. An orphan
     // has no dispatcher, so it is left as it is.
     if (!spare.taskId || spare.orphan) return fail(false, 'subagent left running');
+    const until = Date.now() + STOP_BUDGET_MS;
     const stopped = await this._host
-      .control({ subtype: 'stop_task', task_id: spare.taskId }, 2_000)
+      .control({ subtype: 'stop_task', task_id: spare.taskId }, STOP_BUDGET_MS)
       .then(
         () => true,
         () => false,
       );
-    fail(stopped || finished(), stopped ? 'subagent stopped' : 'subagent stop unacknowledged');
+    if (finished()) return fail(true, 'subagent stopped');
+    if (!stopped) return fail(false, 'subagent stop unacknowledged');
+    // The ack only accepts the stop: the end comes as the task's notification, which `_lost` settles
+    // on. Without it inside the same budget, nothing says the subagent stopped.
+    setTimeout(
+      () =>
+        finished()
+          ? fail(true, 'subagent stopped')
+          : fail(false, 'subagent stop acknowledged, its end never seen'),
+      Math.max(0, until - Date.now()),
+    ).unref?.();
   }
 }
