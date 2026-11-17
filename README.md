@@ -115,6 +115,14 @@ at its timeout). Work Muse starts itself
 (cron firings, monitors, goals, reminder agents) is emitted too, marked
 `unattributedReason: "task"` with a `task` lifecycle typed `muse-cron`, `muse-monitor`, ….
 
+Claude Code runs turns of its own too: a background task's notification wakes it into a turn
+that answers with its own `result`. Each turn message is written with a `uuid`, so the CLI
+reports its `command_lifecycle`; while the message is `queued` behind such a turn, that turn's
+frames and result are emitted with `unattributedReason: "foreign-turn"` and the turn settles on
+its own result, after the CLI reports the message `started`. Why: matched by stream order alone,
+the notification's result closed the turn, and the turn's real answer arrived after it, owned by
+nothing (Foundry showed every such reply empty, 2026-11-17).
+
 Full matrix, notes and what is stubbed: [docs/transports-pools-routing.md](docs/transports-pools-routing.md).
 
 ### Tool gate
