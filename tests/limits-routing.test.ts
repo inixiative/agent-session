@@ -5,6 +5,7 @@ import {
   claudeUsageSnapshot,
   codexLimitSnapshot,
   DEFAULT_STRATEGY,
+  fullWindowsResetAt,
   limitUtilization,
   mergeLimits,
   type OrderBy,
@@ -684,5 +685,25 @@ describe('rank-last never admits capacity it cannot prove', () => {
   test('a strategy name inherited from Object.prototype is a usage error, not a TypeError', () => {
     for (const name of ['constructor', 'hasOwnProperty', 'toString', 'valueOf', '__proto__'])
       expect(() => resolveOrdering(name as RoutingStrategy)).toThrow('Unknown routing strategy');
+  });
+});
+
+describe('fullWindowsResetAt', () => {
+  test('the latest reset among windows at their limit; none when nothing is full', () => {
+    expect(
+      fullWindowsResetAt([
+        { usedPercent: 100, resetsAt: 5 },
+        { usedPercent: 100, resetsAt: 9 },
+        { usedPercent: 80, resetsAt: 20 },
+      ]),
+    ).toBe(9);
+    expect(
+      fullWindowsResetAt([{ usedPercent: 100 }, { usedPercent: 99, resetsAt: 3 }]),
+    ).toBeUndefined();
+    expect(fullWindowsResetAt([])).toBeUndefined();
+    // A full window with no reset: when usage comes back is not knowable from the reading.
+    expect(
+      fullWindowsResetAt([{ usedPercent: 100, resetsAt: 5 }, { usedPercent: 100 }]),
+    ).toBeUndefined();
   });
 });

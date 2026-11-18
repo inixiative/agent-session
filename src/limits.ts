@@ -242,6 +242,23 @@ export function mergeLimits(
   };
 }
 
+/**
+ * When the windows at their limit have all reset (epoch ms): the latest reset among them, since usage
+ * stays blocked until the last one comes back. Undefined when none is at its limit, or when one at its
+ * limit reports no reset (when it comes back is not knowable, so a poll has to say).
+ */
+export function fullWindowsResetAt(
+  windows: Iterable<Pick<LimitWindow, 'usedPercent' | 'resetsAt'>>,
+): number | undefined {
+  let latest: number | undefined;
+  for (const w of windows) {
+    if (w.usedPercent < 100) continue;
+    if (!w.resetsAt) return undefined;
+    if (latest === undefined || w.resetsAt > latest) latest = w.resetsAt;
+  }
+  return latest;
+}
+
 /** Highest used percentage across windows that have not reset by `now`; undefined when nothing is known. */
 export function limitUtilization(
   snapshot: LimitSnapshot | undefined,

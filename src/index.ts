@@ -62,6 +62,7 @@ export {
   claudeRateLimitSnapshot,
   claudeUsageSnapshot,
   codexLimitSnapshot,
+  fullWindowsResetAt,
   type LimitRuntime,
   type LimitSnapshot,
   type LimitWindow,
