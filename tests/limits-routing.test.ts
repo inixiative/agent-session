@@ -701,5 +701,9 @@ describe('fullWindowsResetAt', () => {
       fullWindowsResetAt([{ usedPercent: 100 }, { usedPercent: 99, resetsAt: 3 }]),
     ).toBeUndefined();
     expect(fullWindowsResetAt([])).toBeUndefined();
+    // A full window with no reset: when usage comes back is not knowable from the reading.
+    expect(
+      fullWindowsResetAt([{ usedPercent: 100, resetsAt: 5 }, { usedPercent: 100 }]),
+    ).toBeUndefined();
   });
 });
