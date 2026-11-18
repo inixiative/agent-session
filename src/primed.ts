@@ -22,7 +22,10 @@ export interface PrimeSpec {
   readonly key: string;
   /** Role instructions (developer/system role). */
   readonly instructions: string;
-  /** Stable owned context (layer content), primed as data in the user role. May be empty. */
+  /**
+   * Stable owned context (layer content). May be empty. Codex primes it as data in the user role;
+   * Claude holds it in the system prompt, which is cached apart from each decision's input.
+   */
   readonly context?: string;
   /** Content hash of instructions and context. Re-primes when it changes. Default: sha256 of both. */
   readonly hash?: string;

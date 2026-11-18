@@ -4,29 +4,27 @@
 //
 // The CLI serves one conversation per process, so each key owns:
 //
-//   prime   a text-only session with the role instructions as its appended
-//           system prompt, plus one primer turn carrying the stable context.
-//           That session is persisted; its process exits.
-//   decide  a fork of the primed session (`--resume <primed> --fork-session
-//           --no-session-persistence`) receives the cycle input and exits. The
-//           next fork is spawned right away as a warm spare, so the following
-//           decision pays no process start. Forks send the primed prefix
-//           byte-for-byte, so it is read from the prompt cache.
+//   prime   the key's stable text: base instructions, role instructions and the
+//           stable owned context, all in the appended system prompt. Nothing is
+//           sent; the first decision writes it to the prompt cache.
+//   decide  a fresh text-only session (`--no-session-persistence`) carrying that
+//           system prompt receives the cycle input and exits. The next session is
+//           spawned right away as a warm spare, so the following decision pays
+//           no process start.
 //
-// A key's decisions run concurrently, like Codex forks: priming is
-// single-flight per key, the first decision takes the spare, and an
-// overlapping one starts its own fork (process start, no re-prime). One key
-// therefore serves every phase of a role without one phase queueing behind
+// The system prompt is cached for an hour and the messages for five minutes
+// (CLAUDE_DECISION_CACHE_ENV): what never changes for a key stays warm between
+// sparse decisions, and each decision's input, never read again, is written at
+// the cheaper rate. Verified live on claude 2.1.327: a second decision with a new
+// input reads the whole system prompt from cache and writes only its input, as a
+// 5-minute write.
+//
+// A key's decisions run concurrently: finding a key is single-flight, the first
+// decision takes the spare, and an overlapping one starts its own session. One
+// key therefore serves every phase of a role without one phase queueing behind
 // another, and still holds a single idle spare.
-//
-// Verified live with claude 2.1.281: forks read the full primed prefix from
-// cache (cache_read equal to the primer's cache write) and write nothing to
-// history.
 // ---------------------------------------------------------------------------
 
-import { readdirSync, realpathSync, unlinkSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { join } from 'node:path';
 import {
   ClaudeCodeSession,
   type ClaudeCodeSessionConfig,
@@ -47,8 +45,20 @@ import {
   Slots,
 } from './primed';
 
-const PRIMER_SUFFIX =
-  '\n\nThe above is standing context for the decisions that follow. Reply with OK only.';
+/**
+ * Prompt cache lifetimes for a decision process: an hour for the system prompt, which holds
+ * everything stable for a key, and five minutes for the messages, which hold only the decision's
+ * input. Claude Code otherwise picks one lifetime for both (an hour on a subscription, five minutes
+ * on an API key), so a sparse key loses its prefix on an API key and every input is written at the
+ * hour rate on a subscription.
+ */
+export const CLAUDE_DECISION_CACHE_ENV: Readonly<Record<string, string>> = Object.freeze({
+  CLAUDE_CODE_PROMPT_CACHE_TTL: '1h',
+  CLAUDE_CODE_MESSAGES_PROMPT_CACHE_TTL: '5m',
+});
+
+/** Introduces a key's stable owned context in its system prompt. */
+const STANDING_CONTEXT_HEADING = 'Standing context for the decisions that follow:';
 
 export interface ClaudePrimedConfig {
   bin?: string;
@@ -58,24 +68,21 @@ export interface ClaudePrimedConfig {
   cwd: string;
   /** Prepended to every key's instructions in the appended system prompt. */
   baseInstructions?: string;
-  /** Merged over process.env (e.g. CLAUDE_CONFIG_DIR). API keys are always removed. */
+  /**
+   * Merged over process.env (e.g. CLAUDE_CONFIG_DIR), with CLAUDE_DECISION_CACHE_ENV over it. A
+   * custom `spawn` receives that environment as `options.env`. API keys are always removed.
+   */
   env?: Record<string, string | undefined>;
   spawn?: ClaudeCodeSessionConfig['spawn'];
   /** Concurrent decisions across keys. Default 1 (one refresh owner per profile). */
   maxConcurrent?: number;
-  /** Keys kept primed; least recently used idle keys are evicted beyond this. Default 64. */
+  /** Keys kept; least recently used idle keys are evicted beyond this. Default 64. */
   maxSessions?: number;
   /** Evict keys idle longer than this. Default 30 min. */
   idleMs?: number;
   timeoutMs?: number;
-  /** Pre-spawn the next fork after each decision. Default true. */
+  /** Pre-spawn the next session after each decision. Default true. */
   spare?: boolean;
-  /**
-   * Delete primed transcripts this host persisted when a key is dropped, and
-   * transcripts a crashed host left for `cwd`, on first use. `cwd` must be
-   * dedicated to this host. Default true.
-   */
-  sweepTranscripts?: boolean;
   onEvent?: (event: PrimedEvent) => void;
 }
 
@@ -86,16 +93,16 @@ interface Owned {
 interface Primed {
   readonly key: string;
   readonly hash: string;
+  /** The key's whole system prompt text below the base instructions: role instructions and context. */
   readonly instructions: string;
-  readonly base?: ClaudeCodeSession;
   spare?: Owned;
   /** Disposal of the last branch and start of its spare; the key's next decision waits for it. */
   cleanup?: Promise<void>;
   model?: string;
   lastUsed: number;
-  /** Decisions currently forked from this session. */
+  /** Decisions currently running on this key. */
   inUse: number;
-  /** Replaced or evicted while in use: its transcript is deleted when the last decision finishes. */
+  /** Replaced or evicted while in use: reported evicted when the last decision finishes. */
   stale?: 'idle' | 'capacity' | 'reprime' | 'requested' | 'close';
 }
 
@@ -111,11 +118,10 @@ export class ClaudePrimedSessions implements PrimedSessions {
   private _limits?: LimitSnapshot;
   private _closed = false;
   private _idleTimer?: ReturnType<typeof setInterval>;
-  /** Branches and primers with a live process, so close() can stop them. */
+  /** Sessions with a live process, so close() can stop them. */
   private _live = new Set<Owned>();
-  /** Sessions dropped while decisions still fork from them: retired by the last one, or by close(). */
+  /** Keys dropped while decisions still run on them: retired by the last one, or by close(). */
   private _stale = new Set<Primed>();
-  private _swept = false;
   private _lastPoll = 0;
 
   constructor(config: ClaudePrimedConfig) {
@@ -203,10 +209,9 @@ export class ClaudePrimedSessions implements PrimedSessions {
     this._slots.drain(
       new DecisionError('Primed sessions closed', 'closed', 'not-dispatched', true),
     );
-    // In-flight branches and primers are stopped, not awaited to completion.
+    // In-flight sessions are stopped, not awaited to completion.
     await Promise.all([...this._live].map((owned) => this._dispose(owned)));
     await Promise.all([...this._sessions.values()].map((s) => this._drop(s, 'close')));
-    // Their forks are stopped, so no decision still reads a stale transcript.
     for (const session of [...this._stale]) this._retire(session, session.stale ?? 'close');
   }
 
@@ -247,10 +252,7 @@ export class ClaudePrimedSessions implements PrimedSessions {
   }
 
   /** A session whose process exit is observable, so settlement can be proven. */
-  private _owned(
-    overrides: Partial<ClaudeCodeSessionConfig> & { instructions?: string },
-    from?: ClaudeCodeSession,
-  ): Owned {
+  private _owned(overrides: Partial<ClaudeCodeSessionConfig> & { instructions?: string }): Owned {
     const owned = {} as Owned;
     const spawn: NonNullable<ClaudeCodeSessionConfig['spawn']> = (cmd, options) => {
       const child: PipedSubprocess = this._config.spawn
@@ -265,22 +267,21 @@ export class ClaudePrimedSessions implements PrimedSessions {
       return child;
     };
     const { instructions, ...rest } = overrides;
-    owned.session = from
-      ? from.fork({ persistSession: false, spawn })
-      : new ClaudeCodeSession({
-          bin: this._config.bin,
-          model: this._config.model,
-          effort: this._config.effort,
-          cwd: this._config.cwd,
-          env: this._config.env,
-          textOnly: true,
-          maxTurns: 1,
-          timeout: this._config.timeoutMs,
-          baseContext:
-            [this._config.baseInstructions, instructions].filter(Boolean).join('\n\n') || undefined,
-          ...rest,
-          spawn,
-        });
+    owned.session = new ClaudeCodeSession({
+      bin: this._config.bin,
+      model: this._config.model,
+      effort: this._config.effort,
+      cwd: this._config.cwd,
+      env: { ...this._config.env, ...CLAUDE_DECISION_CACHE_ENV },
+      textOnly: true,
+      maxTurns: 1,
+      persistSession: false,
+      timeout: this._config.timeoutMs,
+      baseContext:
+        [this._config.baseInstructions, instructions].filter(Boolean).join('\n\n') || undefined,
+      ...rest,
+      spawn,
+    });
     this._live.add(owned);
     owned.session.onEvent((event) => {
       if (event.kind === 'rate_limit' && event.limits) {
@@ -306,121 +307,23 @@ export class ClaudePrimedSessions implements PrimedSessions {
     ]);
   }
 
-  /** Where the CLI persists transcripts for this host's cwd. */
-  private _projectDirectory(): string | undefined {
-    try {
-      const configDir =
-        this._config.env?.CLAUDE_CONFIG_DIR ??
-        process.env.CLAUDE_CONFIG_DIR ??
-        join(homedir(), '.claude');
-      return join(
-        configDir,
-        'projects',
-        realpathSync(this._config.cwd).replace(/[^a-zA-Z0-9]/g, '-'),
-      );
-    } catch {
-      return undefined;
-    }
-  }
-
-  private _deleteTranscript(sessionId: string | undefined): void {
-    if (this._config.sweepTranscripts === false || !sessionId || !/^[a-zA-Z0-9-]+$/.test(sessionId))
-      return;
-    const directory = this._projectDirectory();
-    if (directory)
-      try {
-        unlinkSync(join(directory, `${sessionId}.jsonl`));
-      } catch {
-        /* already gone */
-      }
-  }
-
-  private _sweepTranscripts(): void {
-    if (this._swept || this._config.sweepTranscripts === false) return;
-    this._swept = true;
-    const directory = this._projectDirectory();
-    if (!directory) return;
-    let names: string[] = [];
-    try {
-      names = readdirSync(directory);
-    } catch {
-      return;
-    }
-    for (const name of names)
-      if (/^[a-zA-Z0-9-]+\.jsonl$/.test(name))
-        try {
-          unlinkSync(join(directory, name));
-        } catch {
-          /* best effort */
-        }
-  }
-
   private _branch(session: Primed): Owned {
-    return session.base
-      ? this._owned({}, session.base)
-      : this._owned({ persistSession: false, instructions: session.instructions });
+    return this._owned({ instructions: session.instructions });
   }
 
-  private async _prime(spec: PrimeSpec, hash: string, deadline: number): Promise<Primed> {
-    const t0 = performance.now();
-    if (!spec.context) {
-      const primed: Primed = {
-        key: spec.key,
-        hash,
-        instructions: spec.instructions,
-        lastUsed: Date.now(),
-        inUse: 0,
-      };
-      this._sessions.set(spec.key, primed);
-      this._emit({ type: 'primed', key: spec.key, hash, ms: 0 });
-      return primed;
-    }
-    const base = this._owned({ instructions: spec.instructions, persistSession: true });
-    let result: SessionResult | undefined;
-    try {
-      await base.session.start();
-      result = await base.session.send(`${spec.context}${PRIMER_SUFFIX}`, {
-        timeout: Math.max(1, deadline - Date.now()),
-      });
-    } catch (error) {
-      const settled = await this._dispose(base);
-      this._deleteTranscript(base.session.externalSessionId);
-      throw new DecisionError(
-        `Priming ${spec.key} failed: ${(error as Error).message}`,
-        error instanceof SessionTurnError && error.attempt.localFailure === 'timeout'
-          ? 'timeout'
-          : 'prime-failed',
-        'not-dispatched',
-        settled,
-        undefined,
-        { cause: error },
-      );
-    }
-    const settled = await this._dispose(base);
-    if (
-      result.nativeOutcome !== 'completed' ||
-      !base.session.externalSessionId ||
-      result.events.some((e) => e.kind === 'tool_use')
-    ) {
-      this._deleteTranscript(base.session.externalSessionId);
-      throw new DecisionError(
-        `Priming ${spec.key} did not complete`,
-        'prime-failed',
-        'not-dispatched',
-        settled,
-      );
-    }
+  /** Records the key's system prompt; the first decision writes it to the prompt cache. */
+  private _prime(spec: PrimeSpec, hash: string): Primed {
     const primed: Primed = {
       key: spec.key,
       hash,
-      instructions: spec.instructions,
-      base: base.session,
-      model: observedModel(result),
+      instructions: spec.context
+        ? `${spec.instructions}\n\n${STANDING_CONTEXT_HEADING}\n\n${spec.context}`
+        : spec.instructions,
       lastUsed: Date.now(),
       inUse: 0,
     };
     this._sessions.set(spec.key, primed);
-    this._emit({ type: 'primed', key: spec.key, hash, ms: Math.round(performance.now() - t0) });
+    this._emit({ type: 'primed', key: spec.key, hash, ms: 0 });
     return primed;
   }
 
@@ -433,8 +336,8 @@ export class ClaudePrimedSessions implements PrimedSessions {
     const spare = session.spare;
     session.spare = undefined;
     await this._dispose(spare);
-    // Decisions still forking from it keep its transcript until the last one finishes; on close
-    // their processes are already stopped.
+    // A key still in use is reported evicted when its last decision finishes; on close their
+    // processes are already stopped.
     if (session.inUse > 0 && reason !== 'close') {
       session.stale ??= reason;
       this._stale.add(session);
@@ -444,7 +347,6 @@ export class ClaudePrimedSessions implements PrimedSessions {
   private _retire(session: Primed, reason: NonNullable<Primed['stale']>): void {
     this._stale.delete(session);
     session.stale = undefined;
-    this._deleteTranscript(session.base?.externalSessionId);
     this._emit({ type: 'evicted', key: session.key, reason });
   }
 
@@ -528,10 +430,8 @@ export class ClaudePrimedSessions implements PrimedSessions {
         true,
       );
     await this._checkLimits();
-    this._sweepTranscripts();
     const hash = primeHash(spec);
-    let prime: 'warm' | 'cold' = 'warm',
-      primeMs = 0;
+    let prime: 'warm' | 'cold' = 'warm';
     // Only finding or priming the key's session is serialized: priming is single-flight per key,
     // and the decision itself runs beside any other decision on the key. The wait is bounded by
     // this decision's deadline and signal; a prime it started runs on (host timeout) for the next.
@@ -553,15 +453,8 @@ export class ClaudePrimedSessions implements PrimedSessions {
           await this._drop(idle, 'capacity');
         }
         if (this._closed || abandoned) throw closed();
-        const t = performance.now();
-        found = await this._prime(spec, hash, Date.now() + this._config.timeoutMs);
-        primeMs = Math.round(performance.now() - t);
+        found = this._prime(spec, hash);
         prime = 'cold';
-        // Closed while priming: the drop above has run, so this session is dropped here.
-        if (this._closed) {
-          await this._drop(found, 'close');
-          throw closed();
-        }
       }
       if (abandoned) return found;
       found.inUse++;
@@ -739,7 +632,7 @@ export class ClaudePrimedSessions implements PrimedSessions {
         ...(session.model ? { model: session.model } : {}),
         ...(result.externalSessionId ? { threadId: result.externalSessionId } : {}),
         prime,
-        timing: { waitMs, primeMs, branchMs, turnMs },
+        timing: { waitMs, primeMs: 0, branchMs, turnMs },
       };
     } finally {
       this._release(session);

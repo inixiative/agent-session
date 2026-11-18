@@ -754,6 +754,12 @@ describe('ClaudeInSessionDecisions', () => {
     expect(r).toMatchObject({ prime: 'cold', content: 'ANS:SM' });
   });
 
+  test("the host's process caches its members for an hour", () => {
+    expect(new ClaudeInSessionDecisions({ model: 'm' }).env).toMatchObject({
+      CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL: '1h',
+    });
+  });
+
   test('dispatchers must be a positive whole number', () => {
     expect(() => new ClaudeInSessionDecisions({ model: 'm', dispatchers: 0 })).toThrow(
       /Invalid in-session decision bounds/,

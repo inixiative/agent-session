@@ -296,7 +296,11 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
       throw Error('Invalid in-session decision bounds');
     // On top of the user's own cap (Claude Code's default 20), so the main agent keeps its slots.
     const own = Number(process.env.CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS) || 20;
-    this.env = { CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS: String(own + (config.maxSubagents ?? 76)) };
+    this.env = {
+      CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS: String(own + (config.maxSubagents ?? 76)),
+      // why: a spare waits ~8 min for its moment; Claude Code caches subagents for 5 by default.
+      CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL: '1h',
+    };
     const common = {
       model: config.model,
       ...(config.effort ? { effort: config.effort } : {}),
