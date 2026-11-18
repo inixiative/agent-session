@@ -400,7 +400,7 @@ function keeperSubprocess(
       cliStartTime: hello.cliStartTime,
       epoch: hello.epoch,
       waiting: hello.waiting,
-      spooled: hello.spooled,
+      spooled: hello.spooled ?? hello.acked,
     };
     if (target.releaseOnHello !== undefined)
       request({ t: 'release', after: target.releaseOnHello });

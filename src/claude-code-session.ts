@@ -1471,7 +1471,7 @@ export class ClaudeCodeSession implements HarnessSession {
       const timeoutAt = turn.timeoutAt;
       // A result the CLI wrote while detached is read before the remaining time is counted.
       const arm = () => {
-        if (this._inflight !== turn || this._proc !== proc) return;
+        if (this._inflight !== turn || this._proc !== proc || this._detaching) return;
         this._turnTimer = setTimeout(
           () => {
             this._turnTimer = null;

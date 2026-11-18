@@ -534,4 +534,36 @@ describe('a resumed turn keeps its deadline', () => {
     const settled = await r.adoptedTurn;
     expect(settled?.content).toBe('finished while away');
   });
+
+  test('a detach during replay keeps a past-deadline turn instead of timing it out', async () => {
+    const io = kept(running);
+    const s = session(io.proc);
+    await s.start();
+    void s.send('slow', { timeout: 200 }).catch(() => {});
+    await until(() => io.lines.some((l) => l.type === 'user'));
+    const snapshot = await s.detach({ orphanDeadlineMs: 60_000 });
+    await Bun.sleep(300);
+
+    const next = kept();
+    let replayDone!: () => void;
+    next.proc.replayed = () =>
+      new Promise<void>((resolve) => {
+        replayDone = resolve;
+      });
+    const detach = next.proc.detach!.bind(next.proc);
+    next.proc.detach = async (options) => {
+      replayDone();
+      await Bun.sleep(20);
+      return detach(options);
+    };
+    const r = rebuilt(snapshot);
+    r.resume(next.proc);
+    const adopted = r.adoptedTurn?.then(
+      () => 'settled',
+      (error: Error) => error.message,
+    );
+    const again = await r.detach({ orphanDeadlineMs: 60_000 });
+    expect(again.inflight?.admissionId).toBe(snapshot.inflight?.admissionId);
+    expect(await adopted).not.toContain('timed out');
+  });
 });
