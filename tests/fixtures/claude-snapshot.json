@@ -1,0 +1,38 @@
+{
+  "note": "The key sets of ClaudeSessionSnapshot per snapshotVersion. A released version's entry never changes: a new shape is a new version and a new entry (docs/session-snapshot.md).",
+  "versions": {
+    "1": {
+      "top": [
+        "baseContextDir",
+        "cliPid",
+        "externalSessionId",
+        "hookCallbackId",
+        "inflight",
+        "liveTasks",
+        "offset",
+        "pendingControl",
+        "promptLifecycleSeen",
+        "promptUuids",
+        "seenBoundaries",
+        "seenTerminals",
+        "snapshotVersion",
+        "steerUuids",
+        "totalTokens",
+        "turns",
+        "wake",
+        "wakeCause"
+      ],
+      "inflight": [
+        "admissionId",
+        "content",
+        "held",
+        "identity",
+        "modelMissing",
+        "prompt",
+        "steers",
+        "timeout",
+        "tokens"
+      ]
+    }
+  }
+}

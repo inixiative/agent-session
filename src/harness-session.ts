@@ -59,11 +59,39 @@ export interface SessionAttempt extends SessionIdentity {
     | 'blocked'
     | 'killed'
     | 'unrecognized-terminal'
-    | 'registration';
+    | 'registration'
+    /** The session detached to a later process, which settles this turn (`SessionDetached`). */
+    | 'detached'
+    /** Never written: handed back to the caller at detach, to send after the restart (`SessionReturned`). */
+    | 'returned';
   readonly content: string;
   readonly events: readonly SessionEvent[];
   readonly tokens?: SessionTokens;
 }
+/**
+ * The session detached while this was still with the CLI (a turn in flight, a steer written): the
+ * CLI keeps running it, and the session rebuilt from the snapshot settles it. Not a failure.
+ */
+export class SessionDetached extends Error {
+  constructor(
+    message = 'Session detached; the CLI keeps running this and a later session settles it',
+  ) {
+    super(message);
+    this.name = 'SessionDetached';
+  }
+}
+
+/**
+ * The session is detaching or detached, and this send or steer was never written: the caller holds
+ * it and sends it after the restart. Not a failure.
+ */
+export class SessionReturned extends Error {
+  constructor(message = 'Session detaching; this was not written and is handed back') {
+    super(message);
+    this.name = 'SessionReturned';
+  }
+}
+
 /** A rejected local send can still have a later native terminal; read attempt again to reconcile. */
 export class SessionTurnError extends Error {
   constructor(

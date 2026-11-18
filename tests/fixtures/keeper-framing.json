@@ -1,0 +1,22 @@
+{
+  "protocol": 1,
+  "requests": [
+    "{\"t\":\"auth\",\"token\":\"tok\"}\n",
+    "{\"t\":\"release\",\"after\":3}\n",
+    "{\"t\":\"hold\"}\n",
+    "{\"t\":\"ack\",\"through\":4}\n",
+    "{\"t\":\"in\",\"seq\":1,\"data\":\"x\\n\"}\n",
+    "{\"t\":\"inEnd\"}\n",
+    "{\"t\":\"kill\"}\n",
+    "{\"t\":\"deadline\",\"ms\":600000}\n"
+  ],
+  "frames": [
+    "{\"t\":\"hello\",\"protocol\":1,\"keeperPid\":10,\"cliPid\":11,\"cliStartTime\":12,\"epoch\":1,\"acked\":0,\"waiting\":0}\n",
+    "{\"t\":\"out\",\"n\":1,\"data\":\"line\"}\n",
+    "{\"t\":\"err\",\"n\":2,\"data\":\"warn\"}\n",
+    "{\"t\":\"exit\",\"n\":3,\"code\":0}\n",
+    "{\"t\":\"inAck\",\"seq\":1}\n",
+    "{\"t\":\"held\",\"forwarded\":2}\n",
+    "{\"t\":\"refused\",\"reason\":\"unauthenticated\"}\n"
+  ]
+}

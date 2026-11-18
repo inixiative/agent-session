@@ -297,6 +297,16 @@ const result = await decisions.decide(spec, { input, standby });
   session declares `perTaskStopAffordance`, so the user's Stop spares
   background agents.
 
+### Surviving a host restart (Claude)
+
+A `claude-cli` session can outlive the process that started it. Spawn the CLI through the
+keeper (`spawnThroughKeeper`), then `detach()` the session on restart. The CLI keeps working
+unwrapped. The next process calls `attachKeeper`, `ClaudeCodeSession.fromSnapshot(snapshot,
+config)` and `resume(proc)`, and the running turn settles as `adoptedTurn`.
+`TransportCapabilities.survivesHostRestart` says which transports can. A session with an
+extension cannot. Sequence, snapshot fields and the keeper protocol:
+[docs/session-snapshot.md](docs/session-snapshot.md).
+
 ## Pools, routing and continuity
 
 ```ts

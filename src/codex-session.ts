@@ -1,4 +1,5 @@
 import { isDeepStrictEqual } from 'node:util';
+import type { PipedSubprocess } from './claude-code-session';
 import { codexLimitSnapshot, type LimitSnapshot, mergeLimits } from './limits';
 import { retainEvidence } from './retained-evidence';
 import { ToolGates } from './tool-gate';
@@ -34,6 +35,8 @@ import {
   sendableImages,
 } from './harness-session';
 
+// The subprocess shape is the one Claude's sessions take (keeper members included), never a copy.
+export type { PipedSubprocess } from './claude-code-session';
 // Re-export types so importers can stay on one path (mirrors claude-code-session).
 export type {
   SessionArtifact,
@@ -41,19 +44,6 @@ export type {
   SessionEventKind,
   SessionResult,
 } from './harness-session';
-
-// ---------------------------------------------------------------------------
-// Shared subprocess shape (mirrors ClaudeCodeSession.PipedSubprocess)
-// ---------------------------------------------------------------------------
-
-/** Concrete type for Bun.spawn with all pipes — also the shape tests mock. */
-export interface PipedSubprocess {
-  stdin: { write(data: string): void; flush(): void; end(): void };
-  stdout: ReadableStream<Uint8Array>;
-  stderr: ReadableStream<Uint8Array>;
-  exited: Promise<number>;
-  kill(): void;
-}
 
 export type CodexApprovalPolicy = 'never' | 'on-request' | 'untrusted';
 export type CodexSandbox = 'read-only' | 'workspace-write' | 'danger-full-access';

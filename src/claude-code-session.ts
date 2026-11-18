@@ -1,4 +1,4 @@
-import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -53,8 +53,10 @@ import type {
   NativeInterruptOutcome,
   PushOutcome,
   SessionArtifact,
+  SessionAttempt,
   SessionEvent,
   SessionEventHandler,
+  SessionIdentity,
   SessionImage,
   SessionResult,
   SessionSendOptions,
@@ -68,6 +70,8 @@ import type {
 import {
   NativeBindingMissingError,
   NativeModelMissingError,
+  SessionDetached,
+  SessionReturned,
   sendableImages,
 } from './harness-session';
 
@@ -241,7 +245,13 @@ interface QueuedTurn {
 }
 
 /** `written` until the CLI's `command_lifecycle` names it; `unconfirmed` after push() gave up waiting. */
-type SteerState = 'written' | 'queued' | 'started' | 'completed' | 'cancelled' | 'unconfirmed';
+export type SteerState =
+  | 'written'
+  | 'queued'
+  | 'started'
+  | 'completed'
+  | 'cancelled'
+  | 'unconfirmed';
 const STEER_ACK_MS = 10_000;
 
 const TOKEN_KEYS = [
@@ -269,13 +279,73 @@ const addTokens = (
 // Session
 // ---------------------------------------------------------------------------
 
-/** Concrete types for Bun.spawn with all pipes — also the shape tests mock. */
+/**
+ * Concrete types for Bun.spawn with all pipes — also the shape tests mock. The optional members are
+ * a keeper-held process's (`spawnThroughKeeper`, `attachKeeper`): one that can outlive this daemon.
+ */
 export interface PipedSubprocess {
-  stdin: { write(data: string): void; flush(): void; end(): void };
+  stdin: {
+    write(data: string): void;
+    flush(): void;
+    end(): void;
+    /** Resolves once every write so far reached the CLI's pipe. */
+    drained?(): Promise<void>;
+  };
   stdout: ReadableStream<Uint8Array>;
   stderr: ReadableStream<Uint8Array>;
   exited: Promise<number>;
+  readonly pid?: number | undefined;
+  /** Settles the spawn; a rejection is a failed start. */
+  readonly ready?: Promise<void>;
+  /** True once detach began: the streams end without the CLI having exited. */
+  readonly detached?: boolean;
+  /** Leave the CLI running with no daemon attached; returns the last frame handed out. */
+  detach?(options: { readonly orphanDeadlineMs: number }): Promise<{ readonly offset: number }>;
+  /** Forward frames numbered above `after`, then live (a reattached process starts held). */
+  release?(after: number): void;
   kill(): void;
+}
+
+/** Version of `ClaudeSessionSnapshot`; a shape change bumps it and `fromSnapshot` refuses others. */
+export const CLAUDE_SESSION_SNAPSHOT_VERSION = 1;
+
+/**
+ * What a later process needs to carry on a session `detach()` left running under its keeper: the
+ * CLI keeps working, and `ClaudeCodeSession.fromSnapshot` rebuilds the session's own state around
+ * it. Plain JSON. See docs/session-snapshot.md.
+ */
+export interface ClaudeSessionSnapshot {
+  readonly snapshotVersion: typeof CLAUDE_SESSION_SNAPSHOT_VERSION;
+  readonly externalSessionId?: string;
+  readonly hookCallbackId: string;
+  readonly cliPid?: number;
+  /** The last keeper frame this session processed; the next one starts after it. */
+  readonly offset: number;
+  readonly promptUuids: readonly string[];
+  readonly promptLifecycleSeen: boolean;
+  readonly steerUuids: readonly string[];
+  readonly seenTerminals: readonly string[];
+  readonly seenBoundaries: readonly string[];
+  /** The `task_started` frames of tasks still running, replayed so a new owner learns them. */
+  readonly liveTasks: readonly Record<string, unknown>[];
+  /** Control requests (approvals) asked and not answered, raised again on resume. */
+  readonly pendingControl: readonly Record<string, unknown>[];
+  readonly inflight?: {
+    readonly admissionId: string;
+    readonly identity: SessionIdentity;
+    readonly content: string;
+    readonly tokens?: SessionTokens;
+    readonly timeout: number;
+    readonly prompt?: { readonly uuid: string; readonly state: SteerState };
+    readonly steers: readonly (readonly [string, SteerState])[];
+    readonly held?: { readonly nativeOutcome: 'completed'; readonly tokens?: SessionTokens };
+    readonly modelMissing?: string;
+  };
+  readonly wake: { readonly id: string; readonly nativeSessionId?: string } | null;
+  readonly wakeCause?: string;
+  readonly turns: number;
+  readonly totalTokens: SessionTokens;
+  readonly baseContextDir?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -407,17 +477,37 @@ export class ClaudeCodeSession implements HarnessSession {
   private _extension?: ClaudeSessionExtension;
   /** The private directory holding the extension's agent definitions while a process runs. */
   private _agentsDir?: string;
-  /** Inbound control requests awaiting a gate decision, by request id. */
-  private _inbound = new Map<string, AbortController>();
+  /** Inbound control requests awaiting a gate decision, by request id, with the frame that asked. */
+  private _inbound = new Map<
+    string,
+    { controller: AbortController; raw: Record<string, unknown> }
+  >();
   /** push() calls waiting for the CLI to name their message, by uuid. */
-  private _steerAcks = new Map<string, (state: SteerState) => void>();
+  private _steerAcks = new Map<
+    string,
+    { resolve(state: SteerState): void; reject(error: Error): void }
+  >();
+  /** `task_started` frames of tasks not yet ended, by task id: a snapshot carries them. */
+  private _liveTaskStarts = new Map<string, Record<string, unknown>>();
+  /** detach() has begun: nothing new is written, and gate answers wait for the next owner. */
+  private _detaching = false;
+  /** Rebuilt by fromSnapshot: waiting on resume(), and a callback it cannot place is denied. */
+  private _fromSnapshot?: {
+    offset: number;
+    liveTasks: readonly Record<string, unknown>[];
+    pendingControl: readonly Record<string, unknown>[];
+  };
+  private _adoptedTurn?: Promise<SessionResult>;
+  /** Set for good by fromSnapshot: a hook callback or approval nobody here can place is denied. */
+  private _resumedFromSnapshot = false;
   /** Steers written and not yet ended natively: a late `completed` after their turn settled is theirs. */
   private _steerUuids = new Set<string>();
   /** Uuids of turn messages the CLI has not reported completed or cancelled. */
   private _promptUuids = new Set<string>();
   /** The CLI has named a turn message by its uuid, so an unnamed one is not started yet. */
   private _promptLifecycleSeen = false;
-  private readonly _hookCallbackId = `agent-session-pre-tool-${Bun.randomUUIDv7()}`;
+  /** Mutable only so fromSnapshot can keep the id the running CLI was registered with. */
+  private _hookCallbackId = `agent-session-pre-tool-${Bun.randomUUIDv7()}`;
   private _limits?: LimitSnapshot;
   private _controlSeq = 0;
   private _control = new Map<
@@ -432,6 +522,8 @@ export class ClaudeCodeSession implements HarnessSession {
   private _stderr = '';
   /** The stderr reader of the running process; awaited (capped) before stderr is interpreted. */
   private _stderrDone: Promise<void> = Promise.resolve();
+  /** The stdout reader of the running process; detach() waits for it to process every line. */
+  private _stdoutDone: Promise<void> = Promise.resolve();
 
   // -- Session state --
   /**
@@ -594,6 +686,7 @@ export class ClaudeCodeSession implements HarnessSession {
     };
     const turn = this._inflight;
     const a = turn?.evidence;
+    if (this._detaching) throw new SessionReturned();
     if (!turn || !a || a.dispatch !== 'attempted' || a.nativeOutcome !== 'unknown')
       return ignored('no owned in-flight turn');
     if (!this._proc || !this._alive) return ignored('session not running');
@@ -602,7 +695,9 @@ export class ClaudeCodeSession implements HarnessSession {
     const steers = turn.steers;
     steers.set(uuid, 'written');
     this._steerUuids.add(uuid);
-    const acknowledged = new Promise<SteerState>((resolve) => this._steerAcks.set(uuid, resolve));
+    const acknowledged = new Promise<SteerState>((resolve, reject) =>
+      this._steerAcks.set(uuid, { resolve, reject }),
+    );
     try {
       this._proc.stdin.write(
         `${JSON.stringify({
@@ -743,7 +838,10 @@ export class ClaudeCodeSession implements HarnessSession {
           env,
         }) as unknown as PipedSubprocess;
       }
+      // A keeper-held process starts asynchronously: its failure is this start's.
+      await this._proc.ready;
     } catch (error) {
+      this._proc = null;
       this._removeBaseContext();
       this._removeAgents();
       throw error;
@@ -755,29 +853,9 @@ export class ClaudeCodeSession implements HarnessSession {
 
     // Background readers — run for session lifetime (don't await)
     const proc = this._proc;
-    const stdoutDone = this._readStdout(proc);
-    this._stderrDone = this._readStderr();
-
-    // Monitor process exit for cleanup
-    // The process read its base context file at startup; it goes when the process does.
-    const baseDir = this._baseContextDir;
-    const agentsDir = this._agentsDir;
-    proc.exited.then(async (code) => {
-      this._removeBaseContext(baseDir);
-      this._removeAgents(agentsDir);
-      if (this._proc !== proc) return;
-      this._detachExtension('process exited');
-      if (!this._alive) return;
-      this._alive = false;
-      await stdoutDone; // Drain buffered terminal evidence before interpreting process exit.
-      const errMsg = this._stderr.trim()
-        ? `Process exited (code ${code}): ${this._stderr.trim().slice(0, 500)}`
-        : `Process exited with code ${code}`;
-      this._rejectInflight((await this._settleMissing(errMsg)) ?? new Error(errMsg));
-      this._rejectQueue(new Error('Session ended'));
-      this._rejectControl(new Error('Session ended'));
-      this._emit({ kind: 'session_end', timestamp: Date.now(), transportOutcome: 'failed' });
-    });
+    this._stdoutDone = this._readStdout(proc);
+    this._stderrDone = this._readStderr(proc);
+    this._watchExit(proc);
 
     // The PreToolUse callback is registered before any turn is written, so it covers the first call.
     // An extension's agents run their own tools: it claims them through the same callback.
@@ -863,6 +941,33 @@ export class ClaudeCodeSession implements HarnessSession {
     return missing;
   }
 
+  /**
+   * Clean up when the process exits. The process read its base context file at startup; it goes
+   * when the process does. A detached process never exits here: its next owner watches it.
+   */
+  private _watchExit(proc: PipedSubprocess): void {
+    const stdoutDone = this._stdoutDone;
+    const baseDir = this._baseContextDir;
+    const agentsDir = this._agentsDir;
+    proc.exited.then(async (code) => {
+      if (proc.detached) return;
+      this._removeBaseContext(baseDir);
+      this._removeAgents(agentsDir);
+      if (this._proc !== proc) return;
+      this._detachExtension('process exited');
+      if (!this._alive) return;
+      this._alive = false;
+      await stdoutDone; // Drain buffered terminal evidence before interpreting process exit.
+      const errMsg = this._stderr.trim()
+        ? `Process exited (code ${code}): ${this._stderr.trim().slice(0, 500)}`
+        : `Process exited with code ${code}`;
+      this._rejectInflight((await this._settleMissing(errMsg)) ?? new Error(errMsg));
+      this._rejectQueue(new Error('Session ended'));
+      this._rejectControl(new Error('Session ended'));
+      this._emit({ kind: 'session_end', timestamp: Date.now(), transportOutcome: 'failed' });
+    });
+  }
+
   private _detachExtension(reason: string): void {
     try {
       this._extension?.detach(reason);
@@ -875,7 +980,7 @@ export class ClaudeCodeSession implements HarnessSession {
     for (const pending of this._control.values()) pending.reject(error);
     this._control.clear();
     // Decisions still pending have nowhere to go: withdraw them.
-    for (const inbound of this._inbound.values()) inbound.abort();
+    for (const inbound of this._inbound.values()) inbound.controller.abort();
     this._inbound.clear();
   }
 
@@ -884,6 +989,8 @@ export class ClaudeCodeSession implements HarnessSession {
   // ---------------------------------------------------------------------------
 
   async send(message: string, opts?: SessionSendOptions): Promise<SessionResult> {
+    if (this._detaching) throw new SessionReturned();
+    if (this._fromSnapshot) throw new Error('Session rebuilt from a snapshot; call resume() first');
     // Auto-restart after interrupt / process death (crash recovery via --resume).
     // _externalSessionId persists across process lifetimes, so start() will
     // include --resume <id> in spawn args.
@@ -1135,6 +1242,236 @@ export class ClaudeCodeSession implements HarnessSession {
   }
 
   // ---------------------------------------------------------------------------
+  // detach() / fromSnapshot() / resume() — hand a running CLI to a later process
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Leave the CLI running under its keeper and return what a later process needs to carry on
+   * (`fromSnapshot`, then `resume`). Nothing new is written from the moment it starts: queued sends
+   * and later sends or steers reject with `SessionReturned` (never written, the caller sends them
+   * again); a turn in flight and steers already written reject with `SessionDetached` (the CLI
+   * keeps running them and the rebuilt session settles them). Approvals still being decided are
+   * withdrawn here and asked again after resume. Emits no `session_end`: the session goes on.
+   *
+   * Throws, leaving the session running, when it cannot hand over: no keeper-held process, an
+   * extension (its in-process MCP servers cannot outlive this process), or stdin that would not
+   * drain within `drainMs`. The caller then takes its pause path.
+   */
+  async detach(options: {
+    readonly orphanDeadlineMs: number;
+    readonly drainMs?: number;
+  }): Promise<ClaudeSessionSnapshot> {
+    const proc = this._proc;
+    if (!proc || !this._alive) throw new Error('Session not running; nothing to detach');
+    if (!proc.detach || !proc.stdin.drained)
+      throw new Error('Session process is not keeper-held; it cannot outlive this process');
+    if (this._extension)
+      throw new Error('Session has an extension; its MCP servers cannot outlive this process');
+    if (this._detaching) throw new Error('Session already detaching');
+    this._detaching = true;
+
+    const returned = new SessionReturned();
+    this._rejectQueue(returned);
+    const drainMs = options.drainMs ?? 5_000;
+    let drainTimer: ReturnType<typeof setTimeout> | undefined;
+    const drained = await Promise.race([
+      proc.stdin.drained().then(() => true),
+      new Promise<false>((resolve) => {
+        drainTimer = setTimeout(() => resolve(false), drainMs);
+      }),
+    ]).finally(() => clearTimeout(drainTimer));
+    if (!drained) {
+      this._detaching = false;
+      throw new Error(`Session stdin did not drain within ${drainMs} ms; not detached`);
+    }
+
+    const { offset } = await proc.detach({ orphanDeadlineMs: options.orphanDeadlineMs });
+    // Every line handed out is processed before the state is read.
+    await this._stdoutDone;
+
+    const detached = new SessionDetached();
+    for (const ack of this._steerAcks.values()) ack.reject(detached);
+    this._steerAcks.clear();
+    const pendingControl: Record<string, unknown>[] = [];
+    for (const { controller, raw } of this._inbound.values()) {
+      controller.abort();
+      pendingControl.push(raw);
+    }
+    this._inbound.clear();
+    for (const pending of this._control.values()) pending.reject(detached);
+    this._control.clear();
+    if (this._turnTimer) {
+      clearTimeout(this._turnTimer);
+      this._turnTimer = null;
+    }
+
+    // The base context directory is named for this process; the kept CLI still reads it.
+    if (this._baseContextDir && proc.pid)
+      writeFileSync(join(this._baseContextDir, OWNER_FILE), String(proc.pid), { mode: 0o600 });
+
+    const turn = this._inflight;
+    const snapshot: ClaudeSessionSnapshot = {
+      snapshotVersion: CLAUDE_SESSION_SNAPSHOT_VERSION,
+      externalSessionId: this._externalSessionId,
+      hookCallbackId: this._hookCallbackId,
+      cliPid: proc.pid,
+      offset,
+      promptUuids: [...this._promptUuids],
+      promptLifecycleSeen: this._promptLifecycleSeen,
+      steerUuids: [...this._steerUuids],
+      seenTerminals: [...this._seenTerminals],
+      seenBoundaries: [...this._seenBoundaries],
+      liveTasks: [...this._liveTaskStarts.values()],
+      pendingControl,
+      inflight: turn
+        ? {
+            admissionId: turn.evidence.admissionId,
+            identity: { ...turn.evidence.identity },
+            content: turn.evidence.content,
+            tokens: turn.evidence.tokens,
+            timeout: turn.timeout,
+            prompt: turn.prompt && { ...turn.prompt },
+            steers: [...(turn.steers ?? [])],
+            held: turn.held && { ...turn.held },
+            modelMissing: turn.modelMissing,
+          }
+        : undefined,
+      wake: this._wake && { ...this._wake },
+      wakeCause: this._wakeCause,
+      turns: this._turns,
+      totalTokens: { ...this._totalTokens },
+      baseContextDir: this._baseContextDir,
+    };
+
+    this._inflight = null;
+    if (turn && turn.evidence.localOutcome === 'pending')
+      turn.reject(turn.evidence.fail(detached, 'detached'));
+    this._proc = null;
+    this._alive = false;
+    // The directory now belongs to the kept CLI; this session no longer removes it.
+    this._baseContextDir = undefined;
+    this._detaching = false;
+    return JSON.parse(JSON.stringify(snapshot)) as ClaudeSessionSnapshot;
+  }
+
+  /**
+   * Rebuild a session `detach()` handed over, around the same native session. `config` is the
+   * session's own (the snapshot holds state, never configuration). Register tool gates, then call
+   * `resume(proc)` with the reattached keeper process. A turn that was in flight is adopted under
+   * its admission id; `adoptedTurn` settles with it.
+   */
+  static fromSnapshot(
+    snapshot: ClaudeSessionSnapshot,
+    config: ClaudeCodeSessionConfig,
+  ): ClaudeCodeSession {
+    if (snapshot.snapshotVersion !== CLAUDE_SESSION_SNAPSHOT_VERSION)
+      throw new Error(
+        `Session snapshot version ${String(snapshot.snapshotVersion)} unknown (this build reads ${CLAUDE_SESSION_SNAPSHOT_VERSION})`,
+      );
+    const session = new ClaudeCodeSession({
+      ...config,
+      externalSessionId: snapshot.externalSessionId,
+    });
+    session._restore(snapshot);
+    return session;
+  }
+
+  private _restore(snapshot: ClaudeSessionSnapshot): void {
+    this._resumedFromSnapshot = true;
+    this._fromSnapshot = {
+      offset: snapshot.offset,
+      liveTasks: snapshot.liveTasks,
+      pendingControl: snapshot.pendingControl,
+    };
+    this._hookCallbackId = snapshot.hookCallbackId;
+    this._promptUuids = new Set(snapshot.promptUuids);
+    this._promptLifecycleSeen = snapshot.promptLifecycleSeen;
+    this._steerUuids = new Set(snapshot.steerUuids);
+    this._seenTerminals = new Set(snapshot.seenTerminals);
+    this._seenBoundaries = new Set(snapshot.seenBoundaries);
+    this._wake = snapshot.wake && { ...snapshot.wake };
+    this._wakeCause = snapshot.wakeCause;
+    this._turns = snapshot.turns;
+    this._totalTokens = { ...snapshot.totalTokens };
+    this._baseContextDir = snapshot.baseContextDir;
+    const inflight = snapshot.inflight;
+    if (!inflight) return;
+    const evidence = new TurnState(inflight.admissionId);
+    evidence.identity = { ...inflight.identity };
+    evidence.content = inflight.content;
+    evidence.tokens = inflight.tokens;
+    evidence.dispatch = 'attempted';
+    this._attempts.push(evidence);
+    this._adoptedTurn = new Promise<SessionResult>((resolve, reject) => {
+      this._inflight = {
+        evidence,
+        message: '',
+        images: [],
+        timeout: inflight.timeout,
+        resolve,
+        reject,
+        prompt: inflight.prompt && { ...inflight.prompt },
+        steers: new Map(inflight.steers),
+        held: inflight.held && { ...inflight.held },
+        modelMissing: inflight.modelMissing,
+      };
+    });
+    // A caller that never awaits it must not see an unhandled rejection.
+    this._adoptedTurn.catch(() => {});
+  }
+
+  /** The turn that was in flight at detach, adopted by this rebuilt session; settles as send() does. */
+  get adoptedTurn(): Promise<SessionResult> | undefined {
+    return this._adoptedTurn;
+  }
+
+  /**
+   * Take over the reattached keeper process (`attachKeeper`, still held) of a session rebuilt by
+   * `fromSnapshot`: tasks still running and approvals still asked are raised again, then the
+   * keeper is released past the snapshot's offset and the session runs as if it had started it.
+   */
+  resume(proc: PipedSubprocess): void {
+    const pending = this._fromSnapshot;
+    if (!pending) throw new Error('Session was not rebuilt from a snapshot');
+    if (this._proc) throw new Error('Session already running');
+    if (!proc.release) throw new Error('resume() takes a keeper-held process');
+    this._fromSnapshot = undefined;
+    this._proc = proc;
+    this._alive = true;
+    this._endEmitted = false;
+    this._emit({ kind: 'session_start', timestamp: Date.now(), raw: { resumed: true } });
+    for (const raw of pending.liveTasks) this._processLine(JSON.stringify(raw));
+    for (const raw of pending.pendingControl) this._processLine(JSON.stringify(raw));
+    proc.release(pending.offset);
+    this._stdoutDone = this._readStdout(proc);
+    this._stderrDone = this._readStderr(proc);
+    this._watchExit(proc);
+    const turn = this._inflight;
+    if (turn && turn.timeout > 0)
+      this._turnTimer = setTimeout(() => {
+        this._turnTimer = null;
+        this._rejectInflight(new Error(`Turn timed out after ${turn.timeout}ms`), 'timeout');
+      }, turn.timeout);
+  }
+
+  /** The deny a rebuilt session gives a gated request it cannot place (fail closed). */
+  private _deniedAfterResume(
+    request: Record<string, unknown> | undefined,
+  ): Record<string, unknown> | undefined {
+    if (request?.subtype === 'hook_callback')
+      return this._toolResponse(
+        { stage: 'pre-use', toolName: '', toolInput: {} },
+        { behavior: 'deny', message: 'Tool gate: callback from before the restart has no gate' },
+      );
+    if (request?.subtype === 'can_use_tool')
+      return {
+        behavior: 'deny',
+        message: 'Tool gate: approval from before the restart has no gate',
+      };
+    return undefined;
+  }
+
+  // ---------------------------------------------------------------------------
   // artifact() — full session record for Oracle
   // ---------------------------------------------------------------------------
 
@@ -1260,16 +1597,13 @@ export class ClaudeCodeSession implements HarnessSession {
   }
 
   private _processNextTurn(): void {
-    if (!this._inflight && this._queue.length > 0 && this._alive) {
+    if (!this._inflight && this._queue.length > 0 && this._alive && !this._detaching) {
       const next = this._queue.shift()!;
       this._dispatchTurn(next);
     }
   }
 
-  private _rejectInflight(
-    err: Error,
-    reason: import('./harness-session').SessionAttempt['localFailure'] = 'transport',
-  ): void {
+  private _rejectInflight(err: Error, reason: SessionAttempt['localFailure'] = 'transport'): void {
     if (!this._inflight) return;
     if (this._turnTimer) {
       clearTimeout(this._turnTimer);
@@ -1294,9 +1628,14 @@ export class ClaudeCodeSession implements HarnessSession {
     this._emit({ kind: 'session_end', timestamp: Date.now(), transportOutcome: 'failed' });
   }
 
-  private _rejectQueue(err: Error): void {
+  private _rejectQueue(
+    err: Error,
+    reason: SessionAttempt['localFailure'] = err instanceof SessionReturned
+      ? 'returned'
+      : 'blocked',
+  ): void {
     for (const turn of this._queue) {
-      turn.reject(turn.evidence.fail(err, 'blocked'));
+      turn.reject(turn.evidence.fail(err, reason));
     }
     this._queue = [];
   }
@@ -1329,14 +1668,14 @@ export class ClaudeCodeSession implements HarnessSession {
       if (buffer.trim() && (this._proc === proc || !this._proc)) {
         this._processLine(buffer);
       }
-      if (this._proc === proc && this._alive) {
+      if (this._proc === proc && this._alive && !proc.detached) {
         const detail = this._stderr.trim()
           ? `Native stdout closed: ${this._stderr.trim().slice(0, 500)}`
           : 'Native stdout closed';
         this._transportFailure((await this._settleMissing(detail)) ?? new Error(detail));
       }
     } catch (err) {
-      if (this._proc === proc) this._transportFailure(err as Error);
+      if (this._proc === proc && !proc.detached) this._transportFailure(err as Error);
     }
   }
 
@@ -1344,8 +1683,8 @@ export class ClaudeCodeSession implements HarnessSession {
   // Private — stderr reader (accumulates for error context)
   // ---------------------------------------------------------------------------
 
-  private async _readStderr(): Promise<void> {
-    const reader = this._proc!.stderr.getReader();
+  private async _readStderr(proc: PipedSubprocess): Promise<void> {
+    const reader = proc.stderr.getReader();
     const decoder = new TextDecoder();
     try {
       while (true) {
@@ -1394,7 +1733,7 @@ export class ClaudeCodeSession implements HarnessSession {
       const inbound = id ? this._inbound.get(id) : undefined;
       if (inbound && id) {
         this._inbound.delete(id);
-        inbound.abort();
+        inbound.controller.abort();
       }
       return;
     }
@@ -1406,13 +1745,23 @@ export class ClaudeCodeSession implements HarnessSession {
       const toolRequest =
         id && this._toolGate && this._proc ? this._toolRequestFrom(request) : undefined;
       if (id && toolRequest) {
-        this._answerToolRequest(this._proc!, id, toolRequest);
+        this._answerToolRequest(this._proc!, id, toolRequest, raw);
         return;
       }
       // A gated ask or our own callback that cannot be read is denied: an error reply allows.
       const unreadable = id && this._toolGate && this._proc ? this._unreadable(request) : undefined;
       if (id && unreadable) {
         this._writeControlResponse(this._proc!, id, unreadable);
+        this._unattributed(raw, 'unrecognized-event');
+        return;
+      }
+      // A rebuilt session may hear a callback registered by a gate it no longer has: never allow it.
+      const denied =
+        id && this._proc && this._resumedFromSnapshot
+          ? this._deniedAfterResume(request)
+          : undefined;
+      if (id && denied) {
+        this._writeControlResponse(this._proc!, id, denied);
         this._unattributed(raw, 'unrecognized-event');
         return;
       }
@@ -1527,7 +1876,7 @@ export class ClaudeCodeSession implements HarnessSession {
           state === 'cancelled')
       ) {
         turn.steers.set(raw.command_uuid, state);
-        this._steerAcks.get(raw.command_uuid)?.(state);
+        this._steerAcks.get(raw.command_uuid)?.resolve(state);
         if (state === 'cancelled') this._releaseHeld(turn);
         return;
       }
@@ -1542,6 +1891,11 @@ export class ClaudeCodeSession implements HarnessSession {
       if (snapshot) this._observeLimits(snapshot);
       else this._unattributed(raw, 'account-status');
       return;
+    }
+
+    if (raw.type === 'system' && typeof raw.task_id === 'string' && raw.task_id) {
+      if (raw.subtype === 'task_started') this._liveTaskStarts.set(raw.task_id, raw);
+      else if (raw.subtype === 'task_notification') this._liveTaskStarts.delete(raw.task_id);
     }
 
     // An extension's own agents (their frames and task lifecycle) are its alone.
@@ -1813,19 +2167,23 @@ export class ClaudeCodeSession implements HarnessSession {
     proc: PipedSubprocess,
     requestId: string,
     request: Omit<ToolRequest, 'signal'>,
+    raw: Record<string, unknown>,
   ): void {
     const controller = new AbortController();
-    this._inbound.set(requestId, controller);
+    this._inbound.set(requestId, { controller, raw });
     void this._gates
       .decide({ ...request, signal: controller.signal })
       .then((decision) => {
-        // Withdrawn by the runtime, or the process is gone: nothing may be written for it.
-        if (controller.signal.aborted || this._proc !== proc || !this._alive) return;
+        // Withdrawn by the runtime, or the process is gone: nothing may be written for it. While
+        // detaching it stays pending, so the next owner asks it again.
+        if (controller.signal.aborted || this._proc !== proc || !this._alive || this._detaching)
+          return;
         this._inbound.delete(requestId);
         this._writeControlResponse(proc, requestId, this._toolResponse(request, decision));
       })
       .finally(() => {
-        if (this._inbound.get(requestId) === controller) this._inbound.delete(requestId);
+        if (!this._detaching && this._inbound.get(requestId)?.controller === controller)
+          this._inbound.delete(requestId);
       });
   }
 
@@ -2267,6 +2625,8 @@ export class ClaudeCodeSession implements HarnessSession {
 }
 
 const BASE_CONTEXT_PREFIX = 'agent-session-base-';
+/** Written by detach(): the kept CLI's pid, which owns the directory from then on. */
+const OWNER_FILE = 'owner';
 let swept = false;
 
 /**
@@ -2284,7 +2644,21 @@ export function sweepOrphanedBaseContexts(dir = tmpdir()): void {
   for (const entry of entries) {
     const pid = Number(new RegExp(`^${BASE_CONTEXT_PREFIX}(\\d+)-`).exec(entry)?.[1]);
     if (!pid || pid === process.pid || processAlive(pid)) continue;
+    const ownerPid = directoryOwner(join(dir, entry));
+    if (ownerPid && processAlive(ownerPid)) continue;
     rmSync(join(dir, entry), { recursive: true, force: true });
+  }
+}
+
+/** The pid a detached session's kept CLI wrote into its directory; undefined when none. */
+function directoryOwner(path: string): number | undefined {
+  const file = join(path, OWNER_FILE);
+  if (!existsSync(file)) return undefined;
+  try {
+    const pid = Number(readFileSync(file, 'utf8').trim());
+    return Number.isSafeInteger(pid) && pid > 0 ? pid : undefined;
+  } catch {
+    return undefined;
   }
 }
 

@@ -9,7 +9,8 @@ import {
 import { retainEvidence } from './retained-evidence';
 /** Per-admission evidence. Caller settlement never transfers native ownership. */
 export class TurnState {
-  readonly admissionId = Bun.randomUUIDv7();
+  /** An adopted turn (a session rebuilt from a snapshot) keeps the admission id it was given. */
+  constructor(readonly admissionId: string = Bun.randomUUIDv7()) {}
   identity: SessionIdentity = {};
   nativeOutcome: SessionAttempt['nativeOutcome'] = 'unknown';
   localOutcome: SessionAttempt['localOutcome'] = 'pending';
