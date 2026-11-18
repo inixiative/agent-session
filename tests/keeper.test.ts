@@ -290,6 +290,7 @@ test('the framing matches the golden fixture for this protocol number', async ()
       cliStartTime: 12,
       epoch: 1,
       acked: 0,
+      spooled: 0,
       waiting: 0,
     },
     { t: 'out', n: 1, data: 'line' },
@@ -337,7 +338,7 @@ test('an existing keepers directory is made owner-only, and so is each socket', 
   expect(statSync(proc.keeper?.socketPath ?? '').mode & 0o777).toBe(0o600);
 });
 
-test('a hold the keeper never confirms is released again, so the stream resumes', async () => {
+test('a hold the keeper never confirms is released again, and the stream resumes without repeats', async () => {
   const socketPath = join(configDir(), 'fake.sock');
   const seen: KeeperRequest[] = [];
   const server = createServer((socket) => {
@@ -356,9 +357,19 @@ test('a hold the keeper never confirms is released again, so the stream resumes'
               cliStartTime: 0,
               epoch: 1,
               acked: 3,
+              spooled: 3,
               waiting: 0,
             } satisfies KeeperFrame),
           );
+        // Frames sent before the keeper read `hold` land after the release, then the keeper re-sends them.
+        if (frame.t === 'release')
+          for (let copy = 0; copy < 2; copy += 1)
+            for (const [n, data] of [
+              [4, 'a'],
+              [5, 'b'],
+            ] as const)
+              socket.write(encodeFrame({ t: 'out', n, data } satisfies KeeperFrame));
+        if (frame.t === 'release') setTimeout(() => socket.end(), 50);
       }),
     );
   });
@@ -370,6 +381,12 @@ test('a hold the keeper never confirms is released again, so the stream resumes'
     await until(() => seen.some((frame) => frame.t === 'release'));
     expect(seen.map((frame) => frame.t)).toEqual(['auth', 'hold', 'release']);
     expect(seen.at(-1)).toEqual({ t: 'release', after: 3 });
+    const reader = proc.stdout.getReader();
+    const decoder = new TextDecoder();
+    let text = '';
+    for (let chunk = await reader.read(); !chunk.done; chunk = await reader.read())
+      text += decoder.decode(chunk.value);
+    expect(text).toBe('a\nb\n');
   } finally {
     server.close();
   }

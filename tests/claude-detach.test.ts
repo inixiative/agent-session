@@ -509,4 +509,29 @@ describe('a resumed turn keeps its deadline', () => {
     expect(error).toBeInstanceOf(SessionTurnError);
     expect(Date.now() - resumedAt).toBeLessThan(500);
   });
+
+  test('a result spooled while detached settles the turn even past its deadline', async () => {
+    const io = kept(running);
+    const s = session(io.proc);
+    await s.start();
+    void s.send('slow', { timeout: 200 }).catch(() => {});
+    await until(() => io.lines.some((l) => l.type === 'user'));
+    const snapshot = await s.detach({ orphanDeadlineMs: 60_000 });
+    await Bun.sleep(300);
+
+    const next = kept();
+    let replayDone!: () => void;
+    const replay = new Promise<void>((resolve) => {
+      replayDone = resolve;
+    });
+    next.proc.release = () => {
+      setTimeout(() => next.emit(result('finished while away')), 20);
+      setTimeout(replayDone, 40);
+    };
+    next.proc.replayed = () => replay;
+    const r = rebuilt(snapshot);
+    r.resume(next.proc);
+    const settled = await r.adoptedTurn;
+    expect(settled?.content).toBe('finished while away');
+  });
 });

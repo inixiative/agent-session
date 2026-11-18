@@ -61,14 +61,17 @@ export async function runKeeper(launch: KeeperLaunch): Promise<void> {
   const log = (message: string) =>
     process.stderr.write(`${new Date().toISOString()} keeper ${process.pid}: ${message}\n`);
 
-  const shutdown = (why: string) => {
-    log(`exiting: ${why}`);
-    for (const path of [launch.socketPath, ...(launch.cleanup ?? [])])
+  const removeFiles = (paths: readonly string[]) => {
+    for (const path of paths)
       try {
         unlinkSync(path);
       } catch {
         /* already gone */
       }
+  };
+  const shutdown = (why: string) => {
+    log(`exiting: ${why}`);
+    removeFiles([launch.socketPath, ...(launch.cleanup ?? [])]);
     process.exit(0);
   };
 
@@ -295,6 +298,7 @@ export async function runKeeper(launch: KeeperLaunch): Promise<void> {
             cliStartTime,
             epoch,
             acked,
+            spooled: nextN - 1,
             waiting: pendingGates.size,
           });
           return;
@@ -349,6 +353,7 @@ export async function runKeeper(launch: KeeperLaunch): Promise<void> {
   } catch (error) {
     // Nothing can ever attach to this CLI: end it rather than leave it running unowned.
     cli.kill('SIGKILL');
+    removeFiles(launch.cleanup ?? []);
     throw error;
   } finally {
     process.umask(umask);

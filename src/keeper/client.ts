@@ -52,6 +52,8 @@ export interface KeeperHandle {
   readonly epoch: number;
   /** Approval requests the CLI asked while no daemon was attached, unanswered. */
   readonly waiting: number;
+  /** Highest frame number the keeper had spooled when this connection said hello. */
+  readonly spooled: number;
 }
 
 export interface KeeperSubprocess {
@@ -81,6 +83,8 @@ export interface KeeperSubprocess {
   detach(options: { readonly orphanDeadlineMs: number }): Promise<{ readonly offset: number }>;
   /** Forward frames numbered above `after`, then live. Every attachment starts held. */
   release(after: number): void;
+  /** Settles once every frame the keeper had spooled at hello is handed out, or the stream ended. */
+  replayed(): Promise<void>;
 }
 
 /** Start the CLI under a new detached keeper. Returns at once; `ready` settles the start. */
@@ -218,6 +222,13 @@ function keeperSubprocess(
   let ackedThrough = 0;
   let wakeReader: (() => void) | null = null;
   let ackTimer: ReturnType<typeof setTimeout> | undefined;
+  let replayWaiters: Array<() => void> = [];
+  const settleReplay = (all = false) => {
+    if (!all && (!handle || handedOut < handle.spooled)) return;
+    const waiters = replayWaiters;
+    replayWaiters = [];
+    for (const waiter of waiters) waiter();
+  };
   let resolveExited!: (code: number) => void;
   const exited = new Promise<number>((resolve) => {
     resolveExited = resolve;
@@ -239,6 +250,7 @@ function keeperSubprocess(
   };
 
   const endStreams = () => {
+    settleReplay(true);
     try {
       stdoutController?.close();
     } catch {
@@ -255,8 +267,11 @@ function keeperSubprocess(
   const handOut = (controller: ReadableStreamDefaultController<Uint8Array>): boolean => {
     while (queue.length) {
       const frame = queue.shift() as KeeperStreamFrame;
+      // why: after a release, the keeper re-sends frames that may already be queued.
+      if (frame.n <= handedOut) continue;
       handedOut = frame.n;
       scheduleAck();
+      settleReplay();
       if (frame.t === 'err') {
         try {
           stderrController.enqueue(encoder.encode(`${frame.data}\n`));
@@ -385,6 +400,7 @@ function keeperSubprocess(
       cliStartTime: hello.cliStartTime,
       epoch: hello.epoch,
       waiting: hello.waiting,
+      spooled: hello.spooled,
     };
     if (target.releaseOnHello !== undefined)
       request({ t: 'release', after: target.releaseOnHello });
@@ -402,6 +418,7 @@ function keeperSubprocess(
     ackedThrough = Math.max(ackedThrough, after);
     queue.length = 0;
     request({ t: 'release', after });
+    settleReplay();
   };
 
   return {
@@ -428,6 +445,11 @@ function keeperSubprocess(
     },
     get detached() {
       return detached;
+    },
+    async replayed() {
+      await ready;
+      if (closed || detached || (handle && handedOut >= handle.spooled)) return;
+      await new Promise<void>((resolve) => replayWaiters.push(resolve));
     },
     kill() {
       request({ t: 'kill' });

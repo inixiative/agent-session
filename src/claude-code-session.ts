@@ -313,6 +313,8 @@ export interface PipedSubprocess {
   detach?(options: { readonly orphanDeadlineMs: number }): Promise<{ readonly offset: number }>;
   /** Forward frames numbered above `after`, then live (a reattached process starts held). */
   release?(after: number): void;
+  /** Settles once the frames spooled while detached are handed out. */
+  replayed?(): Promise<void>;
   kill(): void;
 }
 
@@ -1466,13 +1468,20 @@ export class ClaudeCodeSession implements HarnessSession {
     const turn = this._inflight;
     if (turn && turn.timeout > 0) {
       turn.timeoutAt ??= Date.now() + turn.timeout;
-      this._turnTimer = setTimeout(
-        () => {
-          this._turnTimer = null;
-          this._rejectInflight(new Error(`Turn timed out after ${turn.timeout}ms`), 'timeout');
-        },
-        Math.max(0, turn.timeoutAt - Date.now()),
-      );
+      const timeoutAt = turn.timeoutAt;
+      // A result the CLI wrote while detached is read before the remaining time is counted.
+      const arm = () => {
+        if (this._inflight !== turn || this._proc !== proc) return;
+        this._turnTimer = setTimeout(
+          () => {
+            this._turnTimer = null;
+            this._rejectInflight(new Error(`Turn timed out after ${turn.timeout}ms`), 'timeout');
+          },
+          Math.max(0, timeoutAt - Date.now()),
+        );
+      };
+      if (proc.replayed) void proc.replayed().then(arm, arm);
+      else arm();
     }
   }
 

@@ -11,7 +11,7 @@
     "{\"t\":\"deadline\",\"ms\":600000}\n"
   ],
   "frames": [
-    "{\"t\":\"hello\",\"protocol\":1,\"keeperPid\":10,\"cliPid\":11,\"cliStartTime\":12,\"epoch\":1,\"acked\":0,\"waiting\":0}\n",
+    "{\"t\":\"hello\",\"protocol\":1,\"keeperPid\":10,\"cliPid\":11,\"cliStartTime\":12,\"epoch\":1,\"acked\":0,\"spooled\":0,\"waiting\":0}\n",
     "{\"t\":\"out\",\"n\":1,\"data\":\"line\"}\n",
     "{\"t\":\"err\",\"n\":2,\"data\":\"warn\"}\n",
     "{\"t\":\"exit\",\"n\":3,\"code\":0}\n",

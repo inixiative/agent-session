@@ -48,6 +48,8 @@ export type KeeperFrame =
       readonly epoch: number;
       /** Highest frame number acked so far. */
       readonly acked: number;
+      /** Highest frame number spooled so far: a release replays through it before going live. */
+      readonly spooled: number;
       /** Approval requests spooled and unanswered (`can_use_tool`, `hook_callback`). */
       readonly waiting: number;
     }
