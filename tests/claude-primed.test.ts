@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import {
+  CLAUDE_DECISION_CACHE_ENV,
   CLAUDE_TEXT_ONLY_ARGS,
   ClaudePrimedSessions,
   nativeModelMissing,
@@ -13,31 +14,24 @@ afterEach(async () => {
   for (const fn of cleanup.splice(0)) await fn();
 });
 
-/** Claude CLI double: each process is one conversation; forks get new session ids. */
+/** Claude CLI double: each process is one conversation with its own session id. */
 function claudeCli(
   opts: {
     behavior?: (input: string) => 'answer' | 'tool' | 'hold' | 'limited' | 'missing';
     usage?: () => number;
-    /** The primer turn answers after this long. */
-    primeDelayMs?: number;
   } = {},
 ) {
   const spawns: string[][] = [];
+  const environments: Record<string, string | undefined>[] = [];
   /** Each spawn's appended system prompt, read while its file exists. */
   const systemPrompts: (string | undefined)[] = [];
   const processes: ReturnType<typeof fakeProcess>[] = [];
-  let forks = 0;
-  const spawn = (argv: string[]) => {
+  const spawn = (argv: string[], options: { env: Record<string, string | undefined> }) => {
     spawns.push(argv);
+    environments.push(options.env);
     const file = argv.indexOf('--append-system-prompt-file');
     systemPrompts.push(file >= 0 ? readFileSync(argv[file + 1]!, 'utf8') : undefined);
-    const resumeAt = argv.indexOf('--resume');
-    const sid =
-      resumeAt >= 0 && argv.includes('--fork-session')
-        ? `fork-${++forks}`
-        : resumeAt >= 0
-          ? argv[resumeAt + 1]!
-          : 'base-sid';
+    const sid = `sid-${spawns.length}`;
     const fake = fakeProcess((m, io) => {
       if (m.type === 'control_request') {
         if (m.request.subtype === 'get_usage')
@@ -74,19 +68,12 @@ function claudeCli(
         return;
       }
       if (m.type !== 'user') return;
-      const input = m.message.content[0].text as string;
-      if (input.includes('standing context') && opts.primeDelayMs && !m.delayed) {
-        setTimeout(() => respond({ ...m, delayed: true }, io), opts.primeDelayMs);
-        return;
-      }
       respond(m, io);
     });
     const respond = (m: any, io: FakeIo) => {
       const input = m.message.content[0].text as string;
       io.emit({ type: 'system', subtype: 'init', session_id: sid, model: 'claude-test' });
-      const behavior = input.includes('standing context')
-        ? 'answer'
-        : (opts.behavior?.(input) ?? 'answer');
+      const behavior = opts.behavior?.(input) ?? 'answer';
       if (behavior === 'hold') return;
       if (behavior === 'tool')
         io.emit({
@@ -153,7 +140,7 @@ function claudeCli(
         });
         return;
       }
-      const text = input.includes('standing context') ? 'OK' : `decided: ${input}`;
+      const text = `decided: ${input}`;
       io.emit({
         type: 'assistant',
         session_id: sid,
@@ -182,7 +169,7 @@ function claudeCli(
     processes.push(fake);
     return fake.proc;
   };
-  return { spawn, spawns, systemPrompts, processes };
+  return { spawn, spawns, environments, systemPrompts, processes };
 }
 
 function host(
@@ -204,9 +191,11 @@ function host(
 }
 
 const spec = { key: 't1:aux:domain:api', instructions: 'ROLE', context: 'DOMAIN CACHE' };
+const specSystemPrompt =
+  'BASE\n\nROLE\n\nStanding context for the decisions that follow:\n\nDOMAIN CACHE';
 
 describe('ClaudePrimedSessions', () => {
-  test('primes a persisted text-only session, then forks it per decision without persistence', async () => {
+  test("holds a key's stable text in the system prompt and runs each decision in a fresh non-persisted session", async () => {
     const cli = claudeCli();
     const { h } = host(cli);
     const first = await h.decide(spec, { input: 'q1' });
@@ -216,23 +205,35 @@ describe('ClaudePrimedSessions', () => {
       model: 'claude-test',
       tokens: { cacheRead: 8000 },
     });
-    const base = cli.spawns[0]!;
-    for (const flag of CLAUDE_TEXT_ONLY_ARGS) expect(base).toContain(flag);
-    expect(base).not.toContain('--no-session-persistence');
-    expect(base).not.toContain('--append-system-prompt');
-    expect(cli.systemPrompts[0]).toBe('BASE\n\nROLE');
-    expect(base).toEqual(expect.arrayContaining(['--max-turns', '1']));
-    const fork = cli.spawns[1]!;
-    expect(fork).toEqual(
-      expect.arrayContaining([
-        '--resume',
-        'base-sid',
-        '--fork-session',
-        '--no-session-persistence',
-      ]),
-    );
-    expect(cli.systemPrompts[1]).toBe('BASE\n\nROLE');
-    expect(cli.processes[0]!.lines[0].message.content[0].text).toStartWith('DOMAIN CACHE');
+    const argv = cli.spawns[0]!;
+    for (const flag of CLAUDE_TEXT_ONLY_ARGS) expect(argv).toContain(flag);
+    expect(argv).toContain('--no-session-persistence');
+    expect(argv).not.toContain('--resume');
+    expect(argv).toEqual(expect.arrayContaining(['--max-turns', '1']));
+    expect(cli.systemPrompts[0]).toBe(specSystemPrompt);
+    // Nothing but the decision's input is sent as a message.
+    const sent = cli.processes[0]!.lines.filter((l) => l.type === 'user');
+    expect(sent.map((l) => l.message.content[0].text)).toEqual(['q1']);
+  });
+
+  test('every decision process caches its system prompt for an hour and its messages for five minutes', async () => {
+    const cli = claudeCli();
+    const { h } = host(cli, {
+      env: { CLAUDE_CODE_PROMPT_CACHE_TTL: '5m', CLAUDE_CONFIG_DIR: '/private/profile' },
+    });
+    await h.decide(spec, { input: 'q1' });
+    await tick(10);
+    expect(cli.environments).toHaveLength(2); // the decision and its spare
+    for (const env of cli.environments) {
+      expect(env).toMatchObject({
+        ...CLAUDE_DECISION_CACHE_ENV,
+        CLAUDE_CONFIG_DIR: '/private/profile',
+      });
+    }
+    expect(CLAUDE_DECISION_CACHE_ENV).toEqual({
+      CLAUDE_CODE_PROMPT_CACHE_TTL: '1h',
+      CLAUDE_CODE_MESSAGES_PROMPT_CACHE_TTL: '5m',
+    });
   });
 
   test('a warm spare is spawned after each decision, so the next decision pays no start', async () => {
@@ -240,27 +241,27 @@ describe('ClaudePrimedSessions', () => {
     const { h } = host(cli);
     await h.decide(spec, { input: 'q1' });
     await tick(10);
-    expect(cli.spawns).toHaveLength(3); // base, first fork, spare
+    expect(cli.spawns).toHaveLength(2); // the first decision, then its spare
     const second = await h.decide(spec, { input: 'q2' });
     expect(second).toMatchObject({ prime: 'warm', content: 'decided: q2' });
-    expect(cli.processes[2]!.lines[0].message.content[0].text).toBe('q2');
-    expect(cli.processes[1]!.killed).toBe(true);
+    expect(cli.processes[1]!.lines[0].message.content[0].text).toBe('q2');
+    expect(cli.systemPrompts[1]).toBe(specSystemPrompt);
+    expect(cli.processes[0]!.killed).toBe(true);
   });
 
-  test('a changed hash re-primes; empty context uses fresh non-persisted sessions', async () => {
+  test('a changed hash starts the key again; a key with no context holds only its instructions', async () => {
     const cli = claudeCli();
     const { h, events } = host(cli, { spare: false });
     await h.decide(spec, { input: 'q1' });
     expect((await h.decide({ ...spec, context: 'NEW' }, { input: 'q2' })).prime).toBe('cold');
     expect(events.some((e) => e.type === 'evicted' && e.reason === 'reprime')).toBe(true);
+    expect(cli.systemPrompts[1]).toEndWith('\n\nNEW');
     const plain = await h.decide(
       { key: 't1:aux:agent:router', instructions: 'ROUTE' },
       { input: 'hi' },
     );
     expect(plain.content).toBe('decided: hi');
-    const argv = cli.spawns.at(-1)!;
-    expect(argv).toContain('--no-session-persistence');
-    expect(argv).not.toContain('--resume');
+    expect(cli.systemPrompts.at(-1)).toBe('BASE\n\nROUTE');
   });
 
   test('admission refusal dispatches nothing; tool activity is a violation', async () => {
@@ -275,12 +276,7 @@ describe('ClaudePrimedSessions', () => {
       })
       .catch((e) => e);
     expect(refused).toMatchObject({ reason: 'admission', dispatch: 'not-dispatched' });
-    expect(
-      cli.processes
-        .slice(1)
-        .flatMap((p) => p.lines)
-        .some((l) => l.type === 'user'),
-    ).toBe(false);
+    expect(cli.processes.flatMap((p) => p.lines).some((l) => l.type === 'user')).toBe(false);
     await expect(h.decide(spec, { input: 'bad' })).rejects.toMatchObject({
       reason: 'violation',
       dispatch: 'attempted',
@@ -313,8 +309,8 @@ describe('ClaudePrimedSessions', () => {
       dispatch: 'not-dispatched',
     });
     expect(
-      cli.spawns.some(
-        (argv) => argv.includes('--no-session-persistence') && !argv.includes('--resume'),
+      cli.processes.some((p) =>
+        p.lines.some((l) => l.type === 'control_request' && l.request.subtype === 'get_usage'),
       ),
     ).toBe(true); // the poll
   });
@@ -358,7 +354,7 @@ describe('ClaudePrimedSessions', () => {
     expect(cli.processes.every((p) => p.killed || p.closed)).toBe(true);
   });
 
-  test('overlapping decisions on one key run beside each other on one prime', async () => {
+  test('overlapping decisions on one key run beside each other on one key', async () => {
     const cli = claudeCli({ behavior: (input) => (input === 'slow' ? 'hold' : 'answer') });
     const { h, events } = host(cli, { maxConcurrent: 4 });
     const order: string[] = [];
@@ -367,15 +363,13 @@ describe('ClaudePrimedSessions', () => {
       .catch((e) => e)
       .finally(() => order.push('slow'));
     await tick(20);
-    // The second phase is not queued behind the first: it forks the same primed session.
+    // The second phase is not queued behind the first: it starts its own session for the key.
     const quick = await h.decide(spec, { input: 'quick' });
     order.push('quick');
     expect(quick).toMatchObject({ content: 'decided: quick', prime: 'warm' });
     expect((await slow).reason).toBe('timeout');
     expect(order).toEqual(['quick', 'slow']);
     expect(events.filter((e) => e.type === 'primed')).toHaveLength(1);
-    const persisted = cli.spawns.filter((argv) => !argv.includes('--no-session-persistence'));
-    expect(persisted).toHaveLength(1);
     await tick(20);
     // One idle spare per key once both have finished.
     const live = cli.processes.filter((p) => !p.killed && !p.closed);
@@ -383,7 +377,7 @@ describe('ClaudePrimedSessions', () => {
     expect(h.snapshot()).toMatchObject({ sessions: 1, active: 0 });
   });
 
-  test('a re-prime while a decision runs keeps the old transcript until it finishes', async () => {
+  test('a key replaced while a decision runs is reported evicted when that decision finishes', async () => {
     const cli = claudeCli({ behavior: (input) => (input === 'slow' ? 'hold' : 'answer') });
     const { h, events } = host(cli, { maxConcurrent: 4, spare: false });
     await h.decide(spec, { input: 'q1' });
@@ -394,28 +388,6 @@ describe('ClaudePrimedSessions', () => {
     expect((await slow).reason).toBe('timeout');
     await tick(20);
     expect(events.filter((e) => e.type === 'evicted' && e.reason === 'reprime')).toHaveLength(1);
-  });
-
-  test('a decision waiting on another phase priming its key gives up at its own deadline, unsent', async () => {
-    const cli = claudeCli({ primeDelayMs: 300 });
-    const { h, events } = host(cli, { maxConcurrent: 4 });
-    const first = h.decide(spec, { input: 'review' });
-    await tick(20);
-    const order: string[] = [];
-    void first.then(() => order.push('prime'));
-    const waiting = await h.decide(spec, { input: 'advice', timeoutMs: 100 }).catch((e) => e);
-    order.push('advice');
-    expect(waiting).toMatchObject({ reason: 'timeout', dispatch: 'not-dispatched', settled: true });
-    expect((await first).prime).toBe('cold');
-    expect(order[0]).toBe('advice');
-    expect(events.filter((e) => e.type === 'primed')).toHaveLength(1);
-    expect((await h.decide(spec, { input: 'advice' })).prime).toBe('warm');
-    expect(
-      cli.processes
-        .flatMap((p) => p.lines)
-        .filter((l) => l.type === 'user' && l.message.content[0].text === 'advice'),
-    ).toHaveLength(1);
-    expect(h.snapshot().active).toBe(0);
   });
 
   test('close retires a re-primed session whose decision is still running', async () => {

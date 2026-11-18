@@ -26,7 +26,11 @@ export {
   IN_SESSION_SERVER,
   type InSessionSetup,
 } from './claude-in-session';
-export { type ClaudePrimedConfig, ClaudePrimedSessions } from './claude-primed';
+export {
+  CLAUDE_DECISION_CACHE_ENV,
+  type ClaudePrimedConfig,
+  ClaudePrimedSessions,
+} from './claude-primed';
 export { type ClaudeSubagentConfig, ClaudeSubagentSessions } from './claude-subagents';
 export { parseClaudeUsage } from './claude-usage';
 export {

@@ -2,11 +2,12 @@
 // Primed decision sessions — one live, warm session per middleware role
 // ---------------------------------------------------------------------------
 //
-// Each key (Foundry: `${threadId}:aux:${role}`) owns one long-lived session,
-// primed once with its stable context: role instructions plus owned content.
-// That primed state is the cached prefix. Every decision runs on a fresh branch
-// of the primed state and is then discarded, so one cycle never sees another's
-// turns. A key is re-primed only when its prime hash changes, after eviction,
+// Each key (Foundry: `${threadId}:aux:${role}`) holds its stable context: role
+// instructions plus owned content. That is the cached prefix: Codex primes it
+// into a persisted thread and forks it per decision; Claude holds it in the
+// system prompt and runs each decision in a fresh session over it. Either way a
+// decision is discarded after it answers, so one cycle never sees another's
+// turns. A key is primed again only when its prime hash changes, after eviction,
 // or after its process is lost; those are the only cold paths.
 //
 // Decisions are text-only: the launch policy removes tool surfaces, and any
@@ -22,7 +23,10 @@ export interface PrimeSpec {
   readonly key: string;
   /** Role instructions (developer/system role). */
   readonly instructions: string;
-  /** Stable owned context (layer content), primed as data in the user role. May be empty. */
+  /**
+   * Stable owned context (layer content). May be empty. Codex primes it as data in the user role;
+   * Claude holds it in the system prompt, which is cached apart from each decision's input.
+   */
   readonly context?: string;
   /** Content hash of instructions and context. Re-primes when it changes. Default: sha256 of both. */
   readonly hash?: string;
@@ -70,7 +74,11 @@ export interface DecisionResult {
   readonly model?: string;
   readonly threadId?: string;
   readonly turnId?: string;
-  /** `warm`: forked from the key's primed state; `cold`: ran inline (no primed session for this context yet). */
+  /**
+   * `warm`: served from the key's primed state (Codex: a fork of its primed thread; Claude: a key whose
+   * system prompt an earlier decision already sent). `cold`: the first decision for this context, which on
+   * Claude writes the system prompt to the prompt cache unless one is still cached.
+   */
   readonly prime: 'warm' | 'cold';
   /** A second branch was started for this slow decision; the result is the first to finish. */
   readonly hedged?: boolean;
