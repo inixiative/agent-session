@@ -219,12 +219,22 @@ export interface ClaudeSessionExtension {
 // Internal turn queue entry
 // ---------------------------------------------------------------------------
 
+/** An inbound control request awaiting its gate decision, with the frame that asked. */
+interface InboundGate {
+  readonly controller: AbortController;
+  readonly raw: Record<string, unknown>;
+  /** The response decided while detaching, written only if the detach rolls back. */
+  decided?: Record<string, unknown>;
+}
+
 interface QueuedTurn {
   onAdmission?: SessionSendOptions['onAdmission'];
   evidence: TurnState;
   message: string;
   images: readonly SessionImage[];
   timeout: number;
+  /** Epoch ms the turn times out at, once its timer is armed; a resumed turn keeps it. */
+  timeoutAt?: number;
   resolve: (result: SessionResult) => void;
   reject: (error: Error) => void;
   /**
@@ -336,6 +346,8 @@ export interface ClaudeSessionSnapshot {
     readonly content: string;
     readonly tokens?: SessionTokens;
     readonly timeout: number;
+    /** Epoch ms the turn times out at; the resumed session keeps what was left. */
+    readonly timeoutAt?: number;
     readonly prompt?: { readonly uuid: string; readonly state: SteerState };
     readonly steers: readonly (readonly [string, SteerState])[];
     readonly held?: { readonly nativeOutcome: 'completed'; readonly tokens?: SessionTokens };
@@ -478,10 +490,7 @@ export class ClaudeCodeSession implements HarnessSession {
   /** The private directory holding the extension's agent definitions while a process runs. */
   private _agentsDir?: string;
   /** Inbound control requests awaiting a gate decision, by request id, with the frame that asked. */
-  private _inbound = new Map<
-    string,
-    { controller: AbortController; raw: Record<string, unknown> }
-  >();
+  private _inbound = new Map<string, InboundGate>();
   /** push() calls waiting for the CLI to name their message, by uuid. */
   private _steerAcks = new Map<
     string,
@@ -1281,11 +1290,17 @@ export class ClaudeCodeSession implements HarnessSession {
       }),
     ]).finally(() => clearTimeout(drainTimer));
     if (!drained) {
-      this._detaching = false;
+      this._rollBackDetach(proc);
       throw new Error(`Session stdin did not drain within ${drainMs} ms; not detached`);
     }
 
-    const { offset } = await proc.detach({ orphanDeadlineMs: options.orphanDeadlineMs });
+    let offset: number;
+    try {
+      ({ offset } = await proc.detach({ orphanDeadlineMs: options.orphanDeadlineMs }));
+    } catch (error) {
+      this._rollBackDetach(proc);
+      throw error;
+    }
     // Every line handed out is processed before the state is read.
     await this._stdoutDone;
 
@@ -1330,6 +1345,7 @@ export class ClaudeCodeSession implements HarnessSession {
             content: turn.evidence.content,
             tokens: turn.evidence.tokens,
             timeout: turn.timeout,
+            timeoutAt: turn.timeoutAt,
             prompt: turn.prompt && { ...turn.prompt },
             steers: [...(turn.steers ?? [])],
             held: turn.held && { ...turn.held },
@@ -1408,6 +1424,7 @@ export class ClaudeCodeSession implements HarnessSession {
         message: '',
         images: [],
         timeout: inflight.timeout,
+        timeoutAt: inflight.timeoutAt,
         resolve,
         reject,
         prompt: inflight.prompt && { ...inflight.prompt },
@@ -1447,11 +1464,30 @@ export class ClaudeCodeSession implements HarnessSession {
     this._stderrDone = this._readStderr(proc);
     this._watchExit(proc);
     const turn = this._inflight;
-    if (turn && turn.timeout > 0)
-      this._turnTimer = setTimeout(() => {
-        this._turnTimer = null;
-        this._rejectInflight(new Error(`Turn timed out after ${turn.timeout}ms`), 'timeout');
-      }, turn.timeout);
+    if (turn && turn.timeout > 0) {
+      turn.timeoutAt ??= Date.now() + turn.timeout;
+      this._turnTimer = setTimeout(
+        () => {
+          this._turnTimer = null;
+          this._rejectInflight(new Error(`Turn timed out after ${turn.timeout}ms`), 'timeout');
+        },
+        Math.max(0, turn.timeoutAt - Date.now()),
+      );
+    }
+  }
+
+  /**
+   * Undo a detach that could not hand over: the session keeps running, and an approval decided
+   * meanwhile is written now. Waiting sends were already returned (`SessionReturned`).
+   */
+  private _rollBackDetach(proc: PipedSubprocess): void {
+    this._detaching = false;
+    for (const [requestId, inbound] of this._inbound) {
+      if (!inbound.decided || inbound.controller.signal.aborted) continue;
+      this._inbound.delete(requestId);
+      if (this._proc === proc && this._alive)
+        this._writeControlResponse(proc, requestId, inbound.decided);
+    }
   }
 
   /** The deny a rebuilt session gives a gated request it cannot place (fail closed). */
@@ -1562,6 +1598,7 @@ export class ClaudeCodeSession implements HarnessSession {
 
     // Timeout guard
     if (turn.timeout > 0) {
+      turn.timeoutAt = Date.now() + turn.timeout;
       this._turnTimer = setTimeout(() => {
         this._turnTimer = null;
         this._rejectInflight(new Error(`Turn timed out after ${turn.timeout}ms`), 'timeout');
@@ -2170,14 +2207,19 @@ export class ClaudeCodeSession implements HarnessSession {
     raw: Record<string, unknown>,
   ): void {
     const controller = new AbortController();
-    this._inbound.set(requestId, { controller, raw });
+    const inbound: InboundGate = { controller, raw };
+    this._inbound.set(requestId, inbound);
     void this._gates
       .decide({ ...request, signal: controller.signal })
       .then((decision) => {
-        // Withdrawn by the runtime, or the process is gone: nothing may be written for it. While
-        // detaching it stays pending, so the next owner asks it again.
-        if (controller.signal.aborted || this._proc !== proc || !this._alive || this._detaching)
+        // Withdrawn by the runtime, or the process is gone: nothing may be written for it.
+        if (controller.signal.aborted || this._proc !== proc || !this._alive) return;
+        // While detaching it stays pending, so the next owner asks it again; a detach that rolls
+        // back writes it then.
+        if (this._detaching) {
+          inbound.decided = this._toolResponse(request, decision);
           return;
+        }
         this._inbound.delete(requestId);
         this._writeControlResponse(proc, requestId, this._toolResponse(request, decision));
       })

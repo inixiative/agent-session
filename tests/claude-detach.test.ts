@@ -28,6 +28,10 @@ interface Kept {
   released?: number;
   /** Set false to make `stdin.drained()` never settle. */
   drains: boolean;
+  /** Set to make `detach()` throw, as a keeper that never confirms the hold does. */
+  failDetach?: Error;
+  /** Set to hold `drained()` until it resolves. */
+  drainGate?: Promise<void>;
 }
 
 /** A keeper-held CLI: answers `initialize`, then hands each other stdin frame to `onMessage`. */
@@ -85,9 +89,11 @@ function kept(onMessage: (message: Frame, io: Kept) => void = () => {}, offset =
         },
         flush() {},
         end() {},
-        drained: () => (io.drains ? Promise.resolve() : new Promise<void>(() => {})),
+        drained: () =>
+          io.drainGate ?? (io.drains ? Promise.resolve() : new Promise<void>(() => {})),
       },
       async detach() {
+        if (io.failDetach) throw io.failDetach;
         detached = true;
         out.close();
         return { offset };
@@ -196,6 +202,68 @@ describe('detach refuses, leaving the session running', () => {
   });
 });
 
+describe('a detach that fails rolls back', () => {
+  const ask = {
+    type: 'control_request',
+    request_id: 'ask-roll',
+    request: {
+      subtype: 'can_use_tool',
+      tool_name: 'Bash',
+      display_name: 'Bash',
+      input: { command: 'ls' },
+      tool_use_id: 'toolu_roll',
+    },
+  };
+
+  test('a hold the keeper never confirms leaves the session running and detachable again', async () => {
+    const io = kept((m, k) => m.type === 'user' && k.emit(result('fine')));
+    const s = session(io.proc);
+    await s.start();
+    io.failDetach = new Error('Keeper did not confirm the hold');
+    await expect(s.detach({ orphanDeadlineMs: 60_000 })).rejects.toThrow(/confirm the hold/);
+    expect(s.alive).toBe(true);
+    expect((await s.send('still here')).content).toBe('fine');
+    io.failDetach = undefined;
+    const snapshot = await s.detach({ orphanDeadlineMs: 60_000 });
+    expect(snapshot.offset).toBe(7);
+  });
+
+  test('an approval decided while a drain was failing is written once the detach gives up', async () => {
+    const io = kept((m, k) => {
+      if (m.type !== 'user') return;
+      running(m, k);
+      k.emit(ask);
+    });
+    const s = session(io.proc, { toolGate: true, permissionMode: 'default' });
+    let answer!: () => void;
+    s.onToolRequest(
+      () =>
+        new Promise((resolve) => {
+          answer = () => resolve({ behavior: 'allow' });
+        }),
+    );
+    await s.start();
+    void s.send('look').catch(() => {});
+    await until(() => answer !== undefined);
+    io.drainGate = new Promise<void>(() => {});
+    const detaching = s.detach({ orphanDeadlineMs: 60_000, drainMs: 60 });
+    await Bun.sleep(10);
+    answer(); // the person answers while the session is detaching
+    await Bun.sleep(10);
+    expect(
+      io.lines.some((l) => l.type === 'control_response' && l.response?.request_id === 'ask-roll'),
+    ).toBe(false);
+    await expect(detaching).rejects.toThrow(/did not drain/);
+    await until(() =>
+      io.lines.some((l) => l.type === 'control_response' && l.response?.request_id === 'ask-roll'),
+    );
+    expect(
+      io.lines.find((l) => l.type === 'control_response' && l.response?.request_id === 'ask-roll')
+        ?.response,
+    ).toMatchObject({ subtype: 'success', response: { behavior: 'allow' } });
+  });
+});
+
 describe('detach hands a running turn to a rebuilt session', () => {
   test('a queued send is returned, the turn in flight is detached, then adopted and settled', async () => {
     const io = kept(running);
@@ -273,6 +341,7 @@ describe('detach hands a running turn to a rebuilt session', () => {
       prompt: true,
       steers: true,
       timeout: true,
+      timeoutAt: true,
       tokens: true,
     } satisfies Record<keyof NonNullable<ClaudeSessionSnapshot['inflight']>, true>;
     const golden = (await Bun.file(
@@ -413,4 +482,31 @@ test('the sweeper keeps a directory whose kept CLI is alive, though its creator 
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+describe('a resumed turn keeps its deadline', () => {
+  test('the timeout counts from the first send, not from resume', async () => {
+    const io = kept(running);
+    const s = session(io.proc);
+    await s.start();
+    const sentAt = Date.now();
+    void s.send('slow', { timeout: 600 }).catch(() => {});
+    await until(() => io.lines.some((l) => l.type === 'user'));
+    await Bun.sleep(350);
+    const snapshot = await s.detach({ orphanDeadlineMs: 60_000 });
+    const at = snapshot.inflight?.timeoutAt ?? 0;
+    expect(at).toBeGreaterThanOrEqual(sentAt + 600);
+    expect(at).toBeLessThan(sentAt + 700);
+
+    const next = kept();
+    const r = rebuilt(snapshot);
+    r.resume(next.proc);
+    const resumedAt = Date.now();
+    const error = await (r.adoptedTurn ?? Promise.resolve()).then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(error).toBeInstanceOf(SessionTurnError);
+    expect(Date.now() - resumedAt).toBeLessThan(500);
+  });
 });

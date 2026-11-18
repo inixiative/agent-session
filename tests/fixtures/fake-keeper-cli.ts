@@ -6,11 +6,13 @@
  *   `gate:<id>`     prints a `can_use_tool` control request with request id <id>
  *   `flood:<n>`     prints n numbered lines
  *   `exit:<code>`   exits with <code>
- * Exits 0 when stdin ends.
+ *   `stubborn`      keeps running after stdin ends, until a signal
+ * Exits 0 when stdin ends, unless `stubborn`.
  */
 const decoder = new TextDecoder();
 let buffer = '';
 const print = (text: string) => process.stdout.write(`${text}\n`);
+let stubborn = false;
 for await (const chunk of Bun.stdin.stream()) {
   buffer += decoder.decode(chunk, { stream: true });
   const lines = buffer.split('\n');
@@ -34,6 +36,8 @@ for await (const chunk of Bun.stdin.stream()) {
     else if (verb === 'flood')
       for (let i = 1; i <= Number(arg); i++) print(`line ${i} ${'x'.repeat(64)}`);
     else if (verb === 'exit') process.exit(Number(arg));
+    else if (verb === 'stubborn') stubborn = true;
   }
 }
-process.exit(0);
+if (stubborn) setInterval(() => {}, 1_000);
+else process.exit(0);

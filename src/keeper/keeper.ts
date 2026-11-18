@@ -99,7 +99,7 @@ export async function runKeeper(launch: KeeperLaunch): Promise<void> {
   };
 
   const append = (frame: KeeperStreamFrame) => {
-    const bytes = 'data' in frame ? frame.data.length : 0;
+    const bytes = 'data' in frame ? Buffer.byteLength(frame.data) : 0;
     spool.push({ ...frame, bytes });
     spooledBytes += bytes;
     void pump();
@@ -276,6 +276,10 @@ export async function runKeeper(launch: KeeperLaunch): Promise<void> {
             send(socket, { t: 'refused', reason: 'another daemon is attached' });
             return socket.end();
           }
+          if (ending) {
+            send(socket, { t: 'refused', reason: 'the cli is ending' });
+            return socket.end();
+          }
           clearTimeout(authTimer);
           authed = true;
           attached = socket;
@@ -335,10 +339,20 @@ export async function runKeeper(launch: KeeperLaunch): Promise<void> {
     );
   });
 
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(launch.socketPath, () => resolve());
-  });
+  // The socket is created owner-only: no window between listen and a chmod.
+  const umask = process.umask(0o177);
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(launch.socketPath, () => resolve());
+    });
+  } catch (error) {
+    // Nothing can ever attach to this CLI: end it rather than leave it running unowned.
+    cli.kill('SIGKILL');
+    throw error;
+  } finally {
+    process.umask(umask);
+  }
   chmodSync(launch.socketPath, 0o600);
   process.on('SIGTERM', () => void endCli('keeper terminated').then(() => shutdown('SIGTERM')));
   armDeadline(deadlineMs);

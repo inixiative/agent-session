@@ -9,7 +9,7 @@
  */
 import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { closeSync, mkdirSync, openSync } from 'node:fs';
+import { chmodSync, closeSync, mkdirSync, openSync } from 'node:fs';
 import { connect, type Socket } from 'node:net';
 import { join } from 'node:path';
 import {
@@ -95,6 +95,8 @@ export function spawnThroughKeeper(
 ): KeeperSubprocess {
   const dir = join(options.configDir, 'k');
   mkdirSync(dir, { recursive: true, mode: 0o700 });
+  // An existing directory keeps its mode; the keepers' sockets and logs are owner-only.
+  chmodSync(dir, 0o700);
   const id = keeperId(randomBytes(16).toString('hex'));
   const socketPath = join(dir, `${id}.sock`);
   const logPath = join(dir, `${id}.log`);
@@ -395,6 +397,13 @@ function keeperSubprocess(
     wake();
   });
 
+  const release = (after: number) => {
+    handedOut = Math.max(handedOut, after);
+    ackedThrough = Math.max(ackedThrough, after);
+    queue.length = 0;
+    request({ t: 'release', after });
+  };
+
   return {
     stdin: {
       write(data: string) {
@@ -434,7 +443,13 @@ function keeperSubprocess(
         held.then(() => true),
         Bun.sleep(HELD_TIMEOUT_MS).then(() => false),
       ]);
-      if (!answered) throw new Error('Keeper did not confirm the hold');
+      if (!answered) {
+        // The hold may still land: release it from what was handed out, so the stream resumes
+        // either way (the keeper re-sends past `handedOut`, and nothing at or below it is kept).
+        heldWaiter = null;
+        release(handedOut);
+        throw new Error('Keeper did not confirm the hold');
+      }
       detached = true;
       endStreams();
       wake();
@@ -450,11 +465,6 @@ function keeperSubprocess(
       });
       return { offset };
     },
-    release(after: number) {
-      handedOut = Math.max(handedOut, after);
-      ackedThrough = Math.max(ackedThrough, after);
-      queue.length = 0;
-      request({ t: 'release', after });
-    },
+    release,
   };
 }

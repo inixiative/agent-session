@@ -1,6 +1,14 @@
 import { afterEach, expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
-import { connect } from 'node:net';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  statSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs';
+import { connect, createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { attachKeeper, type KeeperSubprocess, spawnThroughKeeper } from '../src/keeper/client';
@@ -299,4 +307,70 @@ test('the framing matches the golden fixture for this protocol number', async ()
   read(joined.slice(0, 17));
   read(joined.slice(17));
   expect(parsed).toEqual(frames as unknown as Record<string, unknown>[]);
+});
+
+test('an attach while the deadline is ending the CLI is refused', async () => {
+  const proc = start();
+  await proc.ready;
+  const handle = proc.keeper;
+  proc.stdin.write('stubborn\n');
+  await proc.stdin.drained();
+  await proc.detach({ orphanDeadlineMs: 200 });
+  // The deadline fired and is waiting out the stdin grace on a CLI that ignores it.
+  await Bun.sleep(600);
+  const answer = await new Promise<Record<string, unknown>>((resolve, reject) => {
+    const socket = connect(handle?.socketPath ?? '');
+    socket.on('data', frameReader(resolve));
+    socket.on('error', reject);
+    socket.write(encodeFrame({ t: 'auth', token: handle?.token ?? '' }));
+  });
+  expect(answer).toEqual({ t: 'refused', reason: 'the cli is ending' });
+  await until(() => !existsSync(handle?.socketPath ?? ''), 20_000);
+}, 30_000);
+
+test('an existing keepers directory is made owner-only, and so is each socket', async () => {
+  const dir = configDir();
+  mkdirSync(join(dir, 'k'), { mode: 0o755 });
+  const proc = start({ configDir: dir });
+  await proc.ready;
+  expect(statSync(join(dir, 'k')).mode & 0o777).toBe(0o700);
+  expect(statSync(proc.keeper?.socketPath ?? '').mode & 0o777).toBe(0o600);
+});
+
+test('a hold the keeper never confirms is released again, so the stream resumes', async () => {
+  const socketPath = join(configDir(), 'fake.sock');
+  const seen: KeeperRequest[] = [];
+  const server = createServer((socket) => {
+    socket.on(
+      'data',
+      frameReader((raw) => {
+        const frame = raw as KeeperRequest;
+        seen.push(frame);
+        if (frame.t === 'auth')
+          socket.write(
+            encodeFrame({
+              t: 'hello',
+              protocol: KEEPER_PROTOCOL,
+              keeperPid: 1,
+              cliPid: 2,
+              cliStartTime: 0,
+              epoch: 1,
+              acked: 3,
+              waiting: 0,
+            } satisfies KeeperFrame),
+          );
+      }),
+    );
+  });
+  await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+  try {
+    const proc = await attachKeeper({ socketPath, token: 't' });
+    await expect(proc.detach({ orphanDeadlineMs: 60_000 })).rejects.toThrow(/confirm the hold/);
+    expect(proc.detached).toBe(false);
+    await until(() => seen.some((frame) => frame.t === 'release'));
+    expect(seen.map((frame) => frame.t)).toEqual(['auth', 'hold', 'release']);
+    expect(seen.at(-1)).toEqual({ t: 'release', after: 3 });
+  } finally {
+    server.close();
+  }
 });
