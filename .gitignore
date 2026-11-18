@@ -10,3 +10,6 @@ dist/
 # Worktree slots (per-machine)
 .worktrees/
 /tmp/*
+
+.claude/worktrees/
+.claude/settings.local.json
