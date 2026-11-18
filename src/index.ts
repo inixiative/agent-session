@@ -12,12 +12,16 @@ export {
 } from './claude-agent-sdk-session';
 // Claude Code adapter (persistent stream-json session, subscription auth).
 export {
+  CLAUDE_SESSION_SNAPSHOT_VERSION,
   CLAUDE_TEXT_ONLY_ARGS,
   type ClaudeAgentDefinition,
   ClaudeCodeSession,
   type ClaudeCodeSessionConfig,
   type ClaudeSessionExtension,
   type ClaudeSessionHost,
+  type ClaudeSessionSnapshot,
+  type PipedSubprocess,
+  sweepOrphanedBaseContexts,
 } from './claude-code-session';
 export {
   type ClaudeInSessionConfig,
@@ -41,7 +45,6 @@ export {
   codexDecisionLaunchArgs,
   codexTokens,
 } from './codex-primed';
-
 // Codex CLI adapter: one persistent `codex app-server` JSON-RPC session.
 export {
   type CodexApprovalPolicy,
@@ -61,6 +64,22 @@ export {
   JsonRpcError,
   JsonRpcTimeoutError,
 } from './json-rpc';
+// The keeper: one small process per kept CLI, so a session outlives the process that started it.
+export {
+  attachKeeper,
+  KEEPER_DEFAULT_ATTACH_DEADLINE_MS,
+  KEEPER_DEFAULT_SPOOL_MAX_BYTES,
+  type KeeperHandle,
+  type KeeperSpawnOptions,
+  type KeeperSubprocess,
+  spawnThroughKeeper,
+} from './keeper/client';
+export {
+  KEEPER_PROTOCOL,
+  type KeeperFrame,
+  type KeeperLaunch,
+  type KeeperRequest,
+} from './keeper/protocol';
 // Subscription limits, polling, routing and pools.
 export {
   claudeRateLimitSnapshot,

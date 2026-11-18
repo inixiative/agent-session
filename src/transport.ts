@@ -46,6 +46,11 @@ export interface TransportCapabilities {
   readonly images: boolean;
   /** Primed decision host on this transport and how it returns to its primed state each cycle (see primed.ts). */
   readonly primed: 'fork' | 'none';
+  /**
+   * The CLI outlives this process: spawned through the keeper, the session's `detach()` hands it to
+   * a later process (`fromSnapshot`, `resume`). Never for a session with an extension.
+   */
+  readonly survivesHostRestart: boolean;
   readonly billing: 'subscription' | 'api';
 }
 
@@ -80,6 +85,7 @@ export const TRANSPORTS: Readonly<Record<TransportKind, TransportDescriptor>> = 
       textOnly: true,
       images: true,
       primed: 'fork',
+      survivesHostRestart: true,
       billing: 'subscription',
     },
     notes: [
@@ -91,6 +97,7 @@ export const TRANSPORTS: Readonly<Record<TransportKind, TransportDescriptor>> = 
       'toolGate: true launches with `--permission-prompt-tool stdio` and registers a PreToolUse callback over the control protocol: onToolRequest() gates see every call (`pre-use`, any mode, bypass included; only a deny counts) and the asks the permission mode raises (`permission`, final).',
       'Rollback (`--resume-session-at`) exists natively but is not wired here.',
       'Images ride in the same stream-json user message as base64 `image` content blocks, before the text.',
+      'survivesHostRestart: spawned through the keeper (`spawnThroughKeeper`), detach() leaves the CLI running unwrapped and a later process takes it over (`fromSnapshot`, `resume`, docs/session-snapshot.md). An unanswered approval holds the call meanwhile; `bun run probe:keeper` checks it per CLI version.',
     ],
   },
   'codex-app-server': {
@@ -110,6 +117,7 @@ export const TRANSPORTS: Readonly<Record<TransportKind, TransportDescriptor>> = 
       textOnly: false,
       images: true,
       primed: 'fork',
+      survivesHostRestart: false,
       billing: 'subscription',
     },
     notes: [
@@ -139,6 +147,7 @@ export const TRANSPORTS: Readonly<Record<TransportKind, TransportDescriptor>> = 
       textOnly: false,
       images: true,
       primed: 'none',
+      survivesHostRestart: false,
       billing: 'subscription',
     },
     notes: [
@@ -168,6 +177,7 @@ export const TRANSPORTS: Readonly<Record<TransportKind, TransportDescriptor>> = 
       textOnly: true,
       images: true,
       primed: 'none',
+      survivesHostRestart: false,
       billing: 'subscription',
     },
     notes: [
@@ -193,6 +203,7 @@ export const TRANSPORTS: Readonly<Record<TransportKind, TransportDescriptor>> = 
       textOnly: false,
       images: false,
       primed: 'none',
+      survivesHostRestart: false,
       billing: 'subscription',
     },
     notes: [
@@ -216,6 +227,7 @@ export const TRANSPORTS: Readonly<Record<TransportKind, TransportDescriptor>> = 
       textOnly: false,
       images: false,
       primed: 'none',
+      survivesHostRestart: false,
       billing: 'api',
     },
     notes: ['Direct metered API. Explicit opt-in only; not implemented.'],
