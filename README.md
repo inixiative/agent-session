@@ -77,6 +77,8 @@ session.kill();
 supports them: `transport` (its descriptor), `interruptNative()` (acknowledged
 stop), `readLimits()` (account limits without a model turn). Account limits also
 arrive as `rate_limit` events.
+`fullWindowsResetAt(windows)` says when a blocked login comes back: the latest
+reset among the windows at their limit.
 
 ## Transports
 

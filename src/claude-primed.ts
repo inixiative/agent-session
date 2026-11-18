@@ -33,7 +33,7 @@ import {
   type PipedSubprocess,
 } from './claude-code-session';
 import { nativeModelMissing, type SessionResult, SessionTurnError } from './harness-session';
-import { type LimitSnapshot, mergeLimits } from './limits';
+import { fullWindowsResetAt, type LimitSnapshot, mergeLimits } from './limits';
 import {
   DecisionError,
   type DecisionRequest,
@@ -224,10 +224,8 @@ export class ClaudePrimedSessions implements PrimedSessions {
   private async _checkLimits(): Promise<void> {
     if (!this._limits?.blocked) return;
     const now = Date.now();
-    const resets = this._limits.windows
-      .filter((w) => w.usedPercent >= 100 && w.resetsAt)
-      .map((w) => w.resetsAt!);
-    if (resets.length && now >= Math.max(...resets)) {
+    const resetAt = fullWindowsResetAt(this._limits.windows);
+    if (resetAt !== undefined && now >= resetAt) {
       this._limits = { ...this._limits, blocked: false };
       return;
     }
