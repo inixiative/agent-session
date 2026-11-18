@@ -48,9 +48,9 @@ import {
 /**
  * Prompt cache lifetimes for a decision process: an hour for the system prompt, which holds
  * everything stable for a key, and five minutes for the messages, which hold only the decision's
- * input. Claude Code otherwise picks one lifetime for both (an hour on a subscription, five minutes
- * on an API key), so a sparse key loses its prefix on an API key and every input is written at the
- * hour rate on a subscription.
+ * input. Claude Code otherwise picks one lifetime for both: an hour on a subscription, so every
+ * input is written at the hour rate, and five minutes on an API key or gateway, so a sparse key
+ * loses its prefix between decisions.
  */
 export const CLAUDE_DECISION_CACHE_ENV: Readonly<Record<string, string>> = Object.freeze({
   CLAUDE_CODE_PROMPT_CACHE_TTL: '1h',

@@ -35,7 +35,7 @@ Callers branch on capabilities, not on kinds.
 | Usage per turn | yes | yes | yes | yes | – | – |
 | Limits: stream / poll | yes / yes | yes / yes | yes / yes | yes / no | – | – |
 | Text-only session | yes | no³ | no | yes | – | – |
-| Primed reset | fork | fork | none | none | – | – |
+| Primed reset | system prompt + fresh session | fork | none | none | – | – |
 | Billing | subscription | subscription | subscription | subscription | subscription | api |
 
 Codex has one transport, `codex app-server --listen stdio://`; Codex CLI 0.155 has no
@@ -107,9 +107,11 @@ session identity (`${threadId}:aux:${role}`), optionally extended with a phase
 tag when one role runs under several instructions.
 
 - **Prime** once: role instructions (developer/system role) plus the stable
-  context (layer content, user role, as data). That primed state is the cached prefix.
-- **Per cycle**: branch from the primed state, run the decision, discard the
-  branch. One cycle never sees another's turns.
+  context (layer content). Codex primes the context as data in the user role;
+  Claude holds it in the system prompt after the instructions. That is the cached prefix.
+- **Per cycle**: run the decision on a branch of that prefix (Codex: a fork;
+  Claude: a fresh session over the same system prompt), then discard it. One
+  cycle never sees another's turns.
 - **Re-prime** only when the prime hash changes (default: sha256 of
   instructions and context; callers pass layer content hashes), after idle
   eviction, or after process loss. Those are the only cold paths, and on Codex
@@ -132,10 +134,11 @@ tag when one role runs under several instructions.
 | | Codex (`CodexPrimedSessions`) | Claude (`ClaudePrimedSessions`) |
 |---|---|---|
 | Process | one `codex app-server` per account hosts every key as a thread | one CLI process per conversation |
-| Prime | persisted `thread/start` + primer turn | persisted text-only session + primer turn |
-| Reset | `thread/fork` (ephemeral) through the primer turn, restating the instructions | `--resume <primed> --fork-session --no-session-persistence` |
-| Warm path | fork ≈ 60–90 ms, then the turn | pre-spawned spare fork: no process start |
-| Cleanup | fork unsubscribed; primed thread deleted on eviction/close; orphans in the private cwd swept at start | forks write no history; the primed transcript is deleted on eviction/close, and leftovers for the private cwd are swept on first use |
+| Prime | persisted `thread/start` + primer turn | nothing sent: instructions and context form the appended system prompt |
+| Reset | `thread/fork` (ephemeral) through the primer turn, restating the instructions | a fresh `--no-session-persistence` session with the same system prompt |
+| Warm path | fork ≈ 60–90 ms, then the turn | pre-spawned spare session: no process start |
+| Prompt cache | the provider keys its cache per conversation | `CLAUDE_DECISION_CACHE_ENV`: the system prompt cached for 1 h, the messages (each decision's input) for 5 min |
+| Cleanup | fork unsubscribed; primed thread deleted on eviction/close; orphans in the private cwd swept at start | nothing is persisted |
 | Text-only | features, plugins, notify, project docs, tool instructions disabled; read-only sandbox; approvals never; run on a private `CODEX_HOME` holding only the login (the user's AGENTS.md, memories and MCP servers live in theirs) | `--safe-mode --tools "" --strict-mcp-config …` |
 | Violations | a thread reporting `instructionSources` → refused before any turn; non-text item, MCP startup or server request → interrupt, recycle process | tool activity → decision fails |
 
@@ -151,10 +154,19 @@ each key re-primes on a fresh process.
 
 Decisions on one key run concurrently on both runtimes and are bounded across keys
 (`maxConcurrent`: 8 on Codex, 1 on Claude); only priming is serialized per key. Claude: the first decision
-takes the key's spare fork, an overlapping one starts its own fork (a process
-start, no re-prime), and one spare is kept afterwards. A key replaced or evicted
-while decisions still fork from it keeps its primed transcript until the last one
-finishes.
+takes the key's spare session, an overlapping one starts its own (a process
+start), and one spare is kept afterwards. Overlapping first decisions on a cold
+key each write the system prompt, since the cache fills only when the first
+request lands; at `maxConcurrent` 1 that cannot happen. A key replaced or evicted
+while decisions still run on it is reported evicted when the last one finishes.
+
+Why the system prompt on Claude (2026-11-18): Claude Code caches the system
+prompt and the messages under separate lifetimes, and a primed transcript put
+the stable context in a message, so it could not outlive the five-minute
+message cache without every decision's input also being written for an hour.
+Measured on Foundry's own Warden receipts, cache writes were 85% of decision
+cost; verified live on claude 2.1.327, a second decision reads the whole system
+prompt from cache and writes only its input, as a 5-minute write.
 `DecisionRequest.signal` cancels: a waiting decision is refused before dispatch,
 a running one is interrupted and reports settlement from the acknowledgment or
 the process exit.
@@ -180,10 +192,11 @@ a 150-rule domain context and a one-line question per decision:
 |---|---|---|---|
 | `codex exec --ephemeral` per decision (Foundry today, without its per-call `codex login status`) | 3.9 s (3.6–8.0 s) | 11,299 | 5,888–11,008 |
 | Codex primed (fork per cycle) | 2.45 s (2.4–4.0 s) | 7,416 | 1,792–6,912 |
-| Claude primed, haiku (spare fork per cycle) | 1.95 s (1.8–2.4 s) | 7,110 | 7,100 |
+| Claude primed, haiku (spare fork per cycle; measured before the system-prompt change) | 1.95 s (1.8–2.4 s) | 7,110 | 7,100 |
 
-Cold primes: Codex 2.8–12.8 s, Claude 4.6–6.7 s (one extra model turn; on Codex
-now off the critical path).
+Cold primes: Codex 2.8–12.8 s (one extra model turn, off the critical path).
+Claude no longer has a primer turn: its first decision on a key writes the
+system prompt to the cache inside that decision's turn.
 
 Under a full fan-out (Foundry: classifier, router, Cartographer and six experts
 at once on one process), a warm Codex decision takes p50 3.5 s, p95 5.5 s; a

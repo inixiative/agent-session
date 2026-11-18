@@ -98,7 +98,7 @@ const session = createSession(kind, { cwd, model: "gpt-6-luna", env: { CODEX_HOM
 | Push | steer | steer | steer | – | – | – |
 | Approvals | callback | callback | callback | callback | – | – |
 | Limits stream / poll | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ | ✅ / – | – | – |
-| Primed reset | fork | fork | – | – | – | – |
+| Primed reset | system prompt + fresh session | fork | – | – | – | – |
 
 Codex runs only over `codex app-server --listen stdio://` (`CodexAppServerSession`);
 Codex CLI 0.155 has no `mcp-server` subcommand.
@@ -219,8 +219,10 @@ setting that drops the user's own `AGENTS.md`, and a decision thread that report
 any instruction source is refused.
 
 Codex hosts every key as a thread of one `app-server` process per account and
-forks the primed thread per cycle; Claude forks a persisted primed session with
-a pre-spawned spare. Measured on a ChatGPT login: warm Codex decisions 2.45 s
+forks the primed thread per cycle; Claude holds a key's instructions and context
+in the system prompt and runs each decision in a fresh session over it, with a
+pre-spawned spare. The system prompt is cached for an hour and each decision's
+input for five minutes (`CLAUDE_DECISION_CACHE_ENV`). Measured on a ChatGPT login: warm Codex decisions 2.45 s
 median vs 3.9 s for `codex exec` per decision, with 34% fewer input tokens; warm
 Claude (haiku) decisions 1.95 s with the whole primed prefix read from cache.
 
