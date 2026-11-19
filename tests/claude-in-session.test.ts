@@ -287,7 +287,11 @@ function mainCli(behavior: Behavior = {}) {
       const text = m.message.content[0].text as string;
       void (async () => {
         if (text.includes('internal Foundry setup') && !behavior.noRoot)
-          await spawn(undefined, 'foundry-root', 'root');
+          // One builder per description the setup message lists, as the main model starts them.
+          for (const [, token] of text
+            .slice(text.indexOf('The descriptions:'))
+            .matchAll(/"(root\d*)"/g))
+            await spawn(undefined, 'foundry-root', token!);
         const reply = text.includes('internal Foundry setup') ? 'READY' : `re:${text}`;
         results.push(reply);
         fio.emit({
@@ -478,6 +482,20 @@ describe('ClaudeInSessionDecisions', () => {
     const filled = await cli.preTool(live[0], 'mcp__foundry-wardens__moment', {}, 'toolu_m');
     expect(filled.hookSpecificOutput.updatedInput.token).toBe(live[1].token);
     expect(host.env.CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL).toBe('1h');
+  });
+
+  test('setup fans out: builders are the square root of the dispatchers, each starting its own share', async () => {
+    const { cli, host } = await setup({}, { dispatchers: 9 });
+    host.prestart(
+      't',
+      Array.from({ length: 9 }, (_, i) => ({ spec: spec(`r${i}`), standby: 'S' })),
+    );
+    await host.ready(3_000);
+    expect(host.setup.status).toBe('ready');
+    const roots = [...cli.tasks.values()].filter((t) => t.type === 'foundry-root');
+    expect(roots.map((t) => t.token).sort()).toEqual(['root', 'root2', 'root3']);
+    expect([...cli.tasks.values()].filter((t) => t.type === 'foundry-dispatch')).toHaveLength(9);
+    expect(host.holding()).toEqual({ expected: 9, held: 9 });
   });
 
   test('a decision with no spare starts its own member with the input inline', async () => {
