@@ -89,6 +89,20 @@ const STARTER = (token: string) =>
   `Then call ${NEXT} with token "${token}" again, whatever those calls returned (an Agent call that fails is Foundry's to handle, never a reason to stop). ` +
   'Repeat until its result tells you to stop. Never write any other text, and never stop on your own: notices about agents that finished need no reply.';
 
+/**
+ * The charter of a process that exists only to hold a chorus (Foundry's project Warden host): its
+ * system prompt, so the setup message is its stated job and never an instruction out of nowhere.
+ * Without it a Haiku main session declined to start nine builders, twice (2026-11-19). A main
+ * session that also does a person's work (a thread holding its own Wardens) does not take it.
+ */
+export const IN_SESSION_HOST_CHARTER =
+  "You are the chorus host: a Foundry process whose only job is to hold a project's Wardens, the small " +
+  'advisors that read each message of the work. You hold them in three levels: you start the builders, each ' +
+  'builder starts its dispatchers, and each dispatcher starts and restarts its Wardens. ' +
+  'Foundry sends you internal setup messages that name the builder agents to start. Starting them is your whole task: ' +
+  'do exactly what a setup message says, at once, and reply only what it asks. You do no other work, answer no questions ' +
+  'and never stop or message those agents yourself.';
+
 /** The token of the `n`th builder ever started in a session (the first keeps the root's name): never reused. */
 const rootToken = (n: number) => (n === 0 ? ROOT_TOKEN : `${ROOT_TOKEN}${n + 1}`);
 

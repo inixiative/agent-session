@@ -1,7 +1,7 @@
 // A timeline of one in-session host's setup on this machine's Claude login (makes real calls).
 //
 //   bun scripts/diagnose-setup.ts [--roles 32] [--dispatchers 32] [--builders 6] [--model claude-haiku-5-5]
-//     [--main <model>] [--deadline-ms 120000] [--context-kb 12] [--bin claude]
+//     [--main <model>] [--deadline-ms 120000] [--context-kb 12] [--bin claude] [--charter] [--rounds 0]
 //
 // Records every spawn the host's hook saw (who asked, which agent type, allowed or refused and
 // why), every `next`/`moment`/`answer` call, every task start and end the CLI reported, and when
@@ -9,7 +9,12 @@
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ClaudeCodeSession, ClaudeInSessionDecisions, type PrimeSpec } from '../src';
+import {
+  ClaudeCodeSession,
+  ClaudeInSessionDecisions,
+  IN_SESSION_HOST_CHARTER,
+  type PrimeSpec,
+} from '../src';
 
 const arg = (name: string, fallback: string) => {
   const i = process.argv.indexOf(`--${name}`);
@@ -23,6 +28,8 @@ const main = arg('main', model);
 const deadline = Number(arg('deadline-ms', '120000'));
 const contextKb = Number(arg('context-kb', '12'));
 const bin = arg('bin', 'claude');
+const rounds = Number(arg('rounds', '0'));
+const reloads: Array<Record<string, unknown>> = [];
 
 const filler = (role: number) =>
   Array.from(
@@ -90,6 +97,7 @@ const session = new ClaudeCodeSession({
   maxTurns: null,
   permissionMode: 'bypassPermissions',
   persistSession: false,
+  ...(process.argv.includes('--charter') ? { baseContext: IN_SESSION_HOST_CHARTER } : {}),
 });
 session.onEvent((e) => {
   const raw = e.raw as Record<string, unknown> | undefined;
@@ -116,6 +124,35 @@ try {
     specs.map((spec) => ({ spec, standby: '' })),
   );
   await host.ready(deadline + 5_000);
+  // Reloads: every Warden asked at once, then the time until every one is held again.
+  for (let round = 0; round < rounds && host.setup.status === 'ready'; round++) {
+    const sent = Date.now();
+    const answers = await Promise.allSettled(
+      specs.map((spec) =>
+        host.decide(spec, {
+          input: `\n## Message\nRound ${round}: rename a button.\n`,
+          standby: '',
+        }),
+      ),
+    );
+    const answered = Date.now() - sent;
+    let refilled: number | null = null;
+    while (Date.now() - sent < 120_000) {
+      if (host.holding().held === roles) {
+        refilled = Date.now() - sent;
+        break;
+      }
+      await Bun.sleep(100);
+    }
+    reloads.push({
+      round,
+      ok: answers.filter((a) => a.status === 'fulfilled').length,
+      warm: answers.filter((a) => a.status === 'fulfilled' && a.value.prime === 'warm').length,
+      answeredMs: answered,
+      allHeldAgainMs: refilled,
+    });
+    await Bun.sleep(3_000);
+  }
 } finally {
   clearInterval(sampler);
   const count = (pred: (r: Row) => boolean) => rows.filter(pred).length;
@@ -133,8 +170,16 @@ try {
   console.log(
     JSON.stringify(
       {
-        config: { roles, dispatchers, builders, model, main },
+        config: {
+          roles,
+          dispatchers,
+          builders,
+          model,
+          main,
+          charter: process.argv.includes('--charter'),
+        },
         status: host.setup.status,
+        reloads,
         holding: host.holding(),
         capacity: host.snapshot().capacity,
         builderSpawns: {
