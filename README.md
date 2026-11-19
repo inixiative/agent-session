@@ -241,12 +241,23 @@ await decisions.ready();
 const result = await decisions.decide(spec, { input, standby });
 ```
 
-- **Shape.** The setup turn asks the main model to start `foundry-root` in the
-  background. The root never ends: it starts dispatcher generations
-  (`foundry-dispatch`), which start members (`foundry-warden`), all in the
-  background, through a `next` tool the host holds open. A member holds the
-  host's `moment` tool until a decision answers it, and answers through
-  `answer`. After setup, no member activity needs a main-model turn.
+- **Shape.** The setup turn asks the main model to start the builders
+  (`foundry-root`; `builders`, by default the square root of `dispatchers`) in
+  the background. A builder never ends: it starts its share of the dispatcher
+  generations (`foundry-dispatch`), which start members (`foundry-warden`), all
+  in the background, through a `next` tool the host holds open. A member holds
+  the host's `moment` tool until a decision answers it, and answers through
+  `answer`. Three levels is as deep as Claude Code nests subagents, and each
+  level rebuilds only the one below: a used member by its dispatcher, a
+  dispatcher past its bound by its builder, a builder that ended by one more
+  setup turn for that builder alone. Otherwise no member activity needs a
+  main-model turn.
+- **One cached prompt per role.** A member's prompt holds no token: every
+  spare of a role starts from the same bytes, and subagent caches are kept an
+  hour (`CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL`), so a replacement reads the
+  prompt the first spare wrote. The host fills a member's token into its
+  `moment` and `answer` calls from the calling agent's id, and refuses those
+  tools to any caller it does not know.
 - **Pinned input.** Every spawn passes the session's PreToolUse callback,
   which replaces its prompt with the composed text, so agent definitions are
   generic and an edited role reaches the next spare without a relaunch.

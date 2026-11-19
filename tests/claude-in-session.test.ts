@@ -496,6 +496,37 @@ describe('ClaudeInSessionDecisions', () => {
     expect(roots.map((t) => t.token).sort()).toEqual(['root', 'root2', 'root3']);
     expect([...cli.tasks.values()].filter((t) => t.type === 'foundry-dispatch')).toHaveLength(9);
     expect(host.holding()).toEqual({ expected: 9, held: 9 });
+    // Each builder started its own three dispatchers.
+    const startedBy = new Map<string, number>();
+    for (const h of cli.hookOutputs.filter((o) => o.type === 'foundry-dispatch'))
+      startedBy.set(h.by ?? '', (startedBy.get(h.by ?? '') ?? 0) + 1);
+    expect([...startedBy.values()]).toEqual([3, 3, 3]);
+  });
+
+  test('a builder that ends is rebuilt alone: the other builders, their dispatchers and their Wardens stay', async () => {
+    const { cli, host } = await setup({}, { dispatchers: 4, maxSetups: 3 });
+    host.prestart(
+      't',
+      Array.from({ length: 4 }, (_, i) => ({ spec: spec(`r${i}`), standby: 'S' })),
+    );
+    await host.ready(3_000);
+    const dispatchersBefore = [...cli.tasks.entries()]
+      .filter(([, t]) => t.type === 'foundry-dispatch')
+      .map(([id]) => id);
+    cli.endTask('root2');
+    await until(() => cli.results.length === 2 && host.serving());
+    const roots = [...cli.tasks.values()].filter((t) => t.type === 'foundry-root');
+    // The first builder is the same task; the second was replaced under a new token.
+    expect(roots.map((t) => t.token).sort()).toEqual(['root', 'root3']);
+    const dispatchersAfter = [...cli.tasks.entries()]
+      .filter(([, t]) => t.type === 'foundry-dispatch')
+      .map(([id]) => id);
+    // The surviving builder's two dispatchers were never restarted.
+    expect(
+      dispatchersBefore.filter((id) => dispatchersAfter.includes(id)).length,
+    ).toBeGreaterThanOrEqual(2);
+    await until(() => host.holding().held === 4);
+    expect(host.holding()).toEqual({ expected: 4, held: 4 });
   });
 
   test('a decision with no spare starts its own member with the input inline', async () => {
@@ -884,8 +915,9 @@ describe('ClaudeInSessionDecisions', () => {
     cli.endTask('root');
     await until(() => cli.results.length === 2 && host.serving());
     expect(cli.results).toEqual(['READY', 'READY']);
-    // The second death: no third setup turn; decisions are not served in-session.
-    cli.endTask('root');
+    // The second death (the replacement never takes the first one's token): no third setup turn;
+    // decisions are not served in-session.
+    cli.endTask('root2');
     await tick(100);
     expect(cli.results).toEqual(['READY', 'READY']);
     expect(host.serving()).toBe(false);

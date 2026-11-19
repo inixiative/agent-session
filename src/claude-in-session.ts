@@ -24,12 +24,15 @@
 //              through `answer`. A decision with no spare starts a member with its input inline.
 //              Each member serves one decision (fresh every call); a used one is started again.
 //   slices     the roles are split into `dispatchers` fixed slices, each started by its own
-//              dispatcher generation under the root, so their refills are written at once: a
+//              dispatcher generation under its builder, so their refills are written at once: a
 //              dispatcher writes one Agent call per member as output tokens, so one dispatcher for a
 //              large roster is slow to refill (75 members took ~20 s; 2026-11-02).
-//   recycle    a dispatcher's context grows with every member it starts. Past a bound the root
+//   recycle    a dispatcher's context grows with every member it starts. Past a bound its builder
 //              starts a new generation of that slice; the old one's held spares are retired as
-//              their replacements hold, and it ends into the root once empty.
+//              their replacements hold, and it ends into its builder once empty.
+//   members    hold no token: every spare of a role starts from the same bytes, so a replacement
+//              reads the prompt cache the first one wrote (kept an hour). The host fills a
+//              member's token into its `moment` and `answer` calls from the caller's agent id.
 //
 // Agent definitions are generic (no prompt of their own): every member's composed text rides in
 // its pinned prompt, so an edit reaches the next spare without relaunching the session.
@@ -86,8 +89,8 @@ const STARTER = (token: string) =>
   `Then call ${NEXT} with token "${token}" again, whatever those calls returned (an Agent call that fails is Foundry's to handle, never a reason to stop). ` +
   'Repeat until its result tells you to stop. Never write any other text, and never stop on your own: notices about agents that finished need no reply.';
 
-/** The token of builder `i` (the first keeps the root's name). */
-const rootToken = (i: number) => (i === 0 ? ROOT_TOKEN : `${ROOT_TOKEN}${i + 1}`);
+/** The token of the `n`th builder ever started in a session (the first keeps the root's name): never reused. */
+const rootToken = (n: number) => (n === 0 ? ROOT_TOKEN : `${ROOT_TOKEN}${n + 1}`);
 
 const SETUP = (tokens: readonly string[]) =>
   "This is an internal Foundry setup message, not a message from the user. Start Foundry's builder agents in the background now: " +
@@ -290,6 +293,8 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
   private _rostered = false;
   /** Setup turns run so far (each one costs a main-model turn). */
   private _setups = 0;
+  /** Builders created so far in this session: a replacement never takes an old one's token. */
+  private _rootSeq = 0;
   private _setupAgain = false;
   /** Its session ended: a restarted process (`--resume`) is not set up again. */
   private _detached = false;
@@ -610,6 +615,10 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
       spare.toolUseId = String(input.tool_use_id ?? '');
       return pin(spare.prompt);
     }
+    // The host's own tools answer only its own agents: a caller it does not know (anyone else, or a
+    // member whose start it has not seen yet) is refused, never let through without its token.
+    if (!ours && [NEXT, MOMENT, ANSWER].includes(String(name)))
+      return deny('Not ready for this call yet: call it again.');
     // The main agent (or the user's own subagents) never stops or messages Foundry's agents.
     if (!ours) {
       const ids = this._taskIds();
@@ -925,46 +934,83 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
   /** The setup turn: the main model starts the root, which then serves everything else. */
   private _startSetup(): void {
     if (this._closed || this._detached || !this._host) return;
-    // A root that died while its setup turn is still running is set up again once that turn ends.
+    this._setup = this._setupStatus('starting', Date.now());
+    this._resetReady();
+    this._publishSetup('starting');
+    const builders = Math.min(this._config.builders, this._config.dispatchers);
+    this._roots = Array.from({ length: builders }, () => this._newRoot());
+    this._current = [];
+    for (let slice = 0; slice < this._config.dispatchers; slice++) this._newGeneration(slice);
+    this._armSetupDeadline();
+    this._askForBuilders();
+  }
+
+  private _newRoot(): Starter {
+    const token = rootToken(this._rootSeq++);
+    return { token, kind: 'root', prompt: STARTER(token), lines: [], context: 0 };
+  }
+
+  private _armSetupDeadline(): void {
+    clearTimeout(this._setupTimer);
+    this._setupTimer = setTimeout(() => {
+      if (this._setup.status === 'starting') this._publishSetup('degraded');
+    }, this._config.setupDeadlineMs);
+  }
+
+  /**
+   * One main-model turn that starts every builder not started yet: all of them at setup, the
+   * replacement of one that ended, or the ones the main model skipped. Each turn counts toward
+   * `maxSetups`, so builders that keep dying stop being restarted.
+   */
+  private _askForBuilders(): void {
+    if (this._closed || this._detached || !this._host) return;
+    // Asked while a setup turn runs: asked again once that turn ends.
     if (this._settingUp) {
       this._setupAgain = true;
       return;
     }
-    // Each setup is a main-model turn: a root that keeps dying stops being restarted.
+    const missing = this._roots.filter((root) => !root.toolUseId && !root.ended);
+    if (!missing.length) return;
     if (this._setups >= this._config.maxSetups) {
       this._publishSetup('degraded');
       return;
     }
     this._setups++;
     this._settingUp = true;
-    this._setup = this._setupStatus('starting', Date.now());
-    this._resetReady();
-    this._publishSetup('starting');
-    const builders = Math.min(this._config.builders, this._config.dispatchers);
-    this._roots = Array.from({ length: builders }, (_, i): Starter => {
-      const token = rootToken(i);
-      return { token, kind: 'root', prompt: STARTER(token), lines: [], context: 0 };
-    });
-    this._current = [];
-    for (let slice = 0; slice < this._config.dispatchers; slice++) this._newGeneration(slice);
-    clearTimeout(this._setupTimer);
-    this._setupTimer = setTimeout(() => {
-      if (this._setup.status === 'starting') this._publishSetup('degraded');
-    }, this._config.setupDeadlineMs);
     void this._host
-      .sendInternal(SETUP(this._roots.map((root) => root.token)))
+      .sendInternal(SETUP(missing.map((root) => root.token)))
       .catch(() => undefined)
       .finally(() => {
         this._settingUp = false;
-        if (this._setupAgain) {
-          this._setupAgain = false;
-          this._startSetup();
-          return;
-        }
-        // The main model did not start every builder: its dispatchers never run.
-        if (!this._roots.every((root) => root.toolUseId) && this._setup.status === 'starting')
-          this._publishSetup('degraded');
+        this._setupAgain = false;
+        // Builders the main model skipped, or one that ended meanwhile, are asked for again.
+        this._askForBuilders();
       });
+  }
+
+  /**
+   * A builder ended unasked (that end reached the main thread once). Only its own share is
+   * rebuilt: its dispatchers stay blocked in `next` for good and their members are orphans; a new
+   * builder takes its slices. The other builders, their dispatchers and their members are untouched.
+   */
+  private _rebuildBuilder(ended: Starter): void {
+    const at = this._roots.indexOf(ended);
+    if (at < 0) return;
+    const lost = new Set([...this._gens.values()].filter((gen) => gen.root === ended));
+    const orphaned = [...this._spares.values()].filter((sp) => !sp.done && lost.has(sp.gen));
+    for (const gen of lost) this._gens.delete(gen.token);
+    this._roots[at] = this._newRoot();
+    this._setup = this._setupStatus('starting', Date.now());
+    this._resetReady();
+    this._publishSetup('starting');
+    for (let slice = 0; slice < this._current.length; slice++) {
+      const current = this._current[slice];
+      if (current && lost.has(current)) this._newGeneration(slice);
+    }
+    this._armSetupDeadline();
+    this._askForBuilders();
+    for (const spare of orphaned) this._orphan(spare);
+    this._replenish();
   }
 
   private _checkSetup(): void {
@@ -1353,17 +1399,8 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
       owner.ended = true;
       owner.next = undefined;
       if (owner.kind === 'root') {
-        // The root ended unasked (that end reached the main thread once). Its dispatchers stay
-        // blocked in `next` for good; their members are orphans; setup runs again.
         if (this._closed) return;
-        const orphaned = [...this._spares.values()].filter((sp) => !sp.done);
-        this._gens.clear();
-        this._current = [];
-        this._roots = [];
-        this._publishSetup('degraded');
-        this._startSetup();
-        for (const spare of orphaned) this._orphan(spare);
-        this._replenish();
+        this._rebuildBuilder(owner);
         return;
       }
       // Its members outlive it (nested background agents are not stopped with their parent).
