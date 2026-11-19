@@ -36,7 +36,8 @@
 //   backoff    a spare that ends before it ever held its `moment` call is a failed start of its
 //              role. From the 3rd in a row the role waits before its next start (1 s, doubling to
 //              60 s) and is reported down (`capacity.rolesDown`, a `role-down` event) until one of
-//              its members holds; other roles are untouched. A member that dies on arrival is
+//              its members holds; other roles are untouched, and setup counts it settled
+//              (`degraded`) rather than waiting for its deadline. Orphans' ends never count. A member that dies on arrival is
 //              otherwise replaced without bound (a test stand-in looped on it, 23 GB, 2026-11-19).
 //
 // Agent definitions are generic (no prompt of their own): every member's composed text rides in
@@ -271,6 +272,8 @@ interface Spare {
   superseded?: boolean;
   retired?: boolean;
   answered?: boolean;
+  /** Its role's failed starts in a row when it was started: spares started together fail as one step. */
+  failedStartsAtStart?: number;
   done: boolean;
   model?: string;
   standby: Usage;
@@ -1084,12 +1087,15 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
     const held = new Set(
       [...this._spares.values()].filter((s) => s.held && !s.done && !s.retired).map((s) => s.name),
     );
-    const all = [...this._desired.keys()].every((name) => held.has(name));
+    // A role that is down never holds by itself: it is settled for setup, and setup is degraded,
+    // so it does not hold every other role back until the deadline.
+    const down = [...this._desired.keys()].filter((name) => this._isDown(name));
+    const all = [...this._desired.keys()].every((name) => held.has(name) || this._isDown(name));
     // Every slice's dispatcher has taken its lines (it waits in `next` again).
     const dispatching = this._current.length > 0 && this._current.every((gen) => !!gen?.next);
     if (this._rostered && all && dispatching) {
       clearTimeout(this._setupTimer);
-      this._publishSetup('ready');
+      this._publishSetup(down.length ? 'degraded' : 'ready');
     } else this._publishSetup('starting');
   }
 
@@ -1262,6 +1268,7 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
           prompt: standbyPrompt(desired.composed),
           direct: false,
           gen,
+          failedStartsAtStart: this._failedStarts.get(name)?.count ?? 0,
           done: false,
           standby: zero(),
           usage: zero(),
@@ -1542,9 +1549,18 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
 
   private _lost(spare: Spare, status: string): void {
     // A spare that never held its moment, and was not retired first, failed to start. A direct
-    // member's end is its own decision's failure, never its role's.
-    if (!spare.direct && spare.heldAt === undefined && !spare.retired && !this._closed)
-      this._failedStart(spare.name);
+    // member's end is its own decision's failure, never its role's, and an orphan's (its dispatcher
+    // or builder ended) is the host's.
+    if (
+      !spare.direct &&
+      spare.heldAt === undefined &&
+      !spare.retired &&
+      !spare.orphan &&
+      !spare.gen.ended &&
+      !this._closed &&
+      this._desired.has(spare.name)
+    )
+      this._failedStart(spare.name, spare.failedStartsAtStart ?? 0);
     spare.done = true;
     spare.held = undefined;
     this._spares.delete(spare.token);
@@ -1582,8 +1598,10 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
    * doubling, capped), so a member that dies on arrival is never replaced in a tight loop; the
    * role is down from the threshold until one of its members holds.
    */
-  private _failedStart(role: string): void {
+  private _failedStart(role: string, countAtStart: number): void {
     const failed = this._failedStarts.get(role) ?? { count: 0 };
+    // Started in a round that already failed (sparesPerRole > 1): one step per round, not per spare.
+    if (countAtStart < failed.count) return;
     this._failedStarts.set(role, failed);
     failed.count++;
     if (failed.count < FAILED_STARTS_BEFORE_BACKOFF) return;
@@ -1595,7 +1613,8 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
       failed.timer = undefined;
       this._replenish();
     }, waitMs);
-    if (failed.count === FAILED_STARTS_BEFORE_BACKOFF)
+    failed.timer.unref?.();
+    if (failed.count === FAILED_STARTS_BEFORE_BACKOFF) {
       this._emit({
         type: 'role-down',
         key: this._desired.get(role)?.key ?? role,
@@ -1603,6 +1622,12 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
         failedStarts: failed.count,
         retryAt: failed.retryAt,
       });
+      this._checkSetup();
+    }
+  }
+
+  private _isDown(role: string): boolean {
+    return (this._failedStarts.get(role)?.count ?? 0) >= FAILED_STARTS_BEFORE_BACKOFF;
   }
 
   /** A member of this role held its moment: its failed starts are forgotten, and a down role is up. */

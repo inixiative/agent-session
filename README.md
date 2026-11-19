@@ -266,13 +266,18 @@ const result = await decisions.decide(spec, { input, standby });
 - **Fresh per call.** Each member serves one decision. A used one is replaced
   at once; a role with no held spare starts a member with its input inline.
 - **Failed starts back off.** A spare that ends before it ever held its
-  `moment` call (and was not retired first) is a failed start of its role.
+  `moment` call (and was not retired first) is a failed start of its role;
+  one orphaned by a dispatcher or builder that ended is the host's failure and
+  does not count, and spares of a role started together (`sparesPerRole` > 1)
+  that die together count as one step.
   The first two in a row are replaced at once; from the third the role waits
   before its next start, 1 s doubling to 60 s (`failedStartBackoffMs`), and is
   reported down until a member of it holds: in `capacity.rolesDown` (its key,
   definition name, failed starts and `retryAt`) and as one `role-down` event,
-  then one `role-recovered`. Other roles are untouched. Setup does not wait on
-  a down role: it goes `degraded` at its deadline, as for any role not held.
+  then one `role-recovered`. Other roles are untouched. A down role counts as
+  settled for setup: setup goes `degraded` (listing it as failed) as soon as
+  every other role holds and every dispatcher waits, instead of holding the
+  chorus back until the setup deadline.
   A direct (cold) member that ends without answering is its decision's
   failure, never its role's. Why: a member that died on arrival was replaced
   with no bound (a test stand-in looped on it and took 23 GB, 2026-11-19).

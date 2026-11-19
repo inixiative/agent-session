@@ -35,6 +35,8 @@ type Behavior = {
   stopEndsAfterMs?: number | 'never';
   /** A member whose prompt this matches ends at once, before its first call (one that dies on arrival). */
   endsAtOnce?: (prompt: string) => boolean;
+  /** A member waits for this before its `moment` call (one that has started but not held yet). */
+  beforeMoment?: (prompt: string) => Promise<void> | undefined;
 };
 
 /**
@@ -184,6 +186,8 @@ function mainCli(behavior: Behavior = {}) {
         },
       });
       if (behavior.endsAtOnce?.(prompt)) return end(taskId, 'completed');
+      await behavior.beforeMoment?.(prompt);
+      if (!tasks.has(taskId)) return;
       if (behavior.memberTool) {
         const r = await preTool(taskId, behavior.memberTool, {}, `toolu_${++seq}`);
         if (r?.hookSpecificOutput?.permissionDecision === 'deny') return end(taskId, 'completed');
@@ -901,29 +905,100 @@ describe('ClaudeInSessionDecisions', () => {
     expect(badStarts()).toBe(6);
   });
 
-  test('a role that is down leaves setup to its deadline (degraded), and close clears its wait', async () => {
+  test('a role that is down settles setup at once (degraded) instead of holding the chorus to its deadline', async () => {
     const { cli, host, setups } = await setup(
       { endsAtOnce: (prompt) => prompt.includes('be the bad warden') },
-      { setupDeadlineMs: 600, failedStartBackoffMs: { initial: 5_000, max: 5_000 } },
+      { setupDeadlineMs: 10_000, failedStartBackoffMs: { initial: 5_000, max: 5_000 } },
+    );
+    const at = Date.now();
+    host.prestart(
+      't',
+      ['good', 'other', 'bad'].map((r) => ({ spec: spec(r), standby: 'S' })),
+    );
+    await host.ready(10_000);
+    // Degraded as soon as the others hold and the role is down: far inside the 10 s deadline.
+    expect(Date.now() - at).toBeLessThan(2_000);
+    expect(host.setup.status).toBe('degraded');
+    const bad = host.snapshot().capacity!.rolesDown[0]!.role;
+    expect(host.setup.wardens).toEqual({ expected: 3, held: 2, failed: [bad] });
+    expect(setups.some((s) => s.status === 'ready')).toBe(false);
+    // The others serve, warm.
+    expect((await host.decide(spec('other'), { input: 'M', standby: 'S' })).prime).toBe('warm');
+    const starts = cli.hookOutputs.filter((h) => h.type === 'foundry-warden').length;
+    // Waiting does not spin the dispatcher: the down role starts nothing during its wait.
+    await tick(200);
+    expect(
+      cli.hookOutputs.filter(
+        (h) =>
+          h.type === 'foundry-warden' &&
+          String(h.output?.updatedInput?.prompt).includes('be the bad warden'),
+      ).length,
+    ).toBe(3);
+    expect(cli.hookOutputs.filter((h) => h.type === 'foundry-warden').length).toBeLessThanOrEqual(
+      starts + 1,
+    );
+    await host.close();
+    expect(host.snapshot().capacity!.rolesDown).toEqual([]);
+  });
+
+  test('a spare orphaned by its dispatcher that ends before holding is not a failed start of its role', async () => {
+    const gate = new Promise<void>(() => {});
+    const { cli, host, events } = await setup({
+      beforeMoment: (prompt) => (prompt.includes('be the slow warden') ? gate : undefined),
+    });
+    host.prestart(
+      't',
+      ['good', 'slow'].map((r) => ({ spec: spec(r), standby: 'S' })),
+    );
+    const slowTokens = () =>
+      cli.hookOutputs
+        .filter(
+          (h) =>
+            h.type === 'foundry-warden' &&
+            String(h.output?.updatedInput?.prompt).includes('be the slow warden'),
+        )
+        .map((h) => h.description);
+    const dispatchers = () =>
+      cli.hookOutputs
+        .filter((h) => h.type === 'foundry-dispatch' && h.output?.permissionDecision === 'allow')
+        .map((h) => h.description);
+    await until(() => host.holding().held === 1 && slowTokens().length === 1);
+    // Three times over: its dispatcher dies (the spare is orphaned), then the spare ends unheld.
+    for (let round = 1; round <= 3; round++) {
+      cli.endTask(dispatchers().at(-1)!);
+      await until(() => dispatchers().length === round + 1);
+      cli.endTask(slowTokens().at(-1)!);
+      await until(() => slowTokens().length === round + 1);
+    }
+    await tick(20);
+    expect(host.snapshot().capacity!.rolesDown).toEqual([]);
+    expect(events.some((e) => e.type === 'role-down')).toBe(false);
+  });
+
+  test('with two spares per role, spares that die together count as one failed start', async () => {
+    const { cli, host, events } = await setup(
+      { endsAtOnce: (prompt) => prompt.includes('be the bad warden') },
+      { sparesPerRole: 2, failedStartBackoffMs: { initial: 5_000, max: 5_000 } },
     );
     host.prestart(
       't',
       ['good', 'bad'].map((r) => ({ spec: spec(r), standby: 'S' })),
     );
-    await host.ready(2_000);
-    expect(host.setup.status).toBe('degraded');
-    expect(host.setup.wardens).toMatchObject({
-      expected: 2,
-      held: 1,
-      failed: [expect.any(String)],
-    });
-    expect(setups.some((s) => s.status === 'ready')).toBe(false);
-    const starts = cli.hookOutputs.filter((h) => h.type === 'foundry-warden').length;
-    // Waiting out the deadline did not spin the dispatcher: nothing more was started.
+    const badStarts = () =>
+      cli.hookOutputs.filter(
+        (h) =>
+          h.type === 'foundry-warden' &&
+          String(h.output?.updatedInput?.prompt).includes('be the bad warden'),
+      ).length;
+    await until(() => events.some((e) => e.type === 'role-down'));
+    await tick(50);
+    // Three rounds of two: down after its third round, not its third death.
+    expect(host.snapshot().capacity!.rolesDown[0]).toMatchObject({ failedStarts: 3 });
+    expect(badStarts()).toBeGreaterThanOrEqual(5);
+    const atDown = badStarts();
     await tick(200);
-    expect(cli.hookOutputs.filter((h) => h.type === 'foundry-warden').length).toBe(starts);
-    await host.close();
-    expect(host.snapshot().capacity!.rolesDown).toEqual([]);
+    expect(badStarts()).toBe(atDown);
+    expect(host.holding()).toEqual({ expected: 2, held: 1 });
   });
 
   test('a direct member that ends without answering fails its decision, not its role', async () => {
