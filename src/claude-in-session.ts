@@ -5,10 +5,14 @@
 // The whole tree (the main thread, its subagents, every decision role) is one Claude CLI process.
 // The extension attaches to the main session (`ClaudeCodeSession.extend`) before it starts:
 //
-//   setup      one internal turn asks the main model to start `foundry-root` in the background.
-//              The root never ends: it calls the host's `next` tool, which the host holds open,
-//              and starts what `next` returns. That is a generation: `foundry-dispatch`, which
-//              starts members (`foundry-warden`) the same way. After the setup turn no member
+//   setup      one internal turn asks the main model to start the builders (`foundry-root`,
+//              `builders` of them, one by default) in the background. A builder never ends: it
+//              calls the host's `next` tool, which the host holds open, and starts what `next`
+//              returns: its share of the dispatchers (`foundry-dispatch`), each a generation that
+//              starts members (`foundry-warden`) the same way. Three levels is as deep as Claude
+//              Code nests subagents (the third cannot spawn; 2.1.328), and each level rebuilds
+//              only the one below: a used member by its dispatcher, a dispatcher past its bound
+//              by its builder, a builder that ended by a new setup turn. After the setup turn no member
 //              activity ever needs a main-model turn: a nested background task ends into its
 //              parent, never the main thread (verified live on Claude Code 2.1.300).
 //   pinning    every spawn goes through the session's PreToolUse callback, which replaces its
@@ -20,12 +24,15 @@
 //              through `answer`. A decision with no spare starts a member with its input inline.
 //              Each member serves one decision (fresh every call); a used one is started again.
 //   slices     the roles are split into `dispatchers` fixed slices, each started by its own
-//              dispatcher generation under the root, so their refills are written at once: a
+//              dispatcher generation under its builder, so their refills are written at once: a
 //              dispatcher writes one Agent call per member as output tokens, so one dispatcher for a
 //              large roster is slow to refill (75 members took ~20 s; 2026-11-02).
-//   recycle    a dispatcher's context grows with every member it starts. Past a bound the root
+//   recycle    a dispatcher's context grows with every member it starts. Past a bound its builder
 //              starts a new generation of that slice; the old one's held spares are retired as
-//              their replacements hold, and it ends into the root once empty.
+//              their replacements hold, and it ends into its builder once empty.
+//   members    hold no token: every spare of a role starts from the same bytes, so a replacement
+//              reads the prompt cache the first one wrote (kept an hour). The host fills a
+//              member's token into its `moment` and `answer` calls from the caller's agent id.
 //
 // Agent definitions are generic (no prompt of their own): every member's composed text rides in
 // its pinned prompt, so an edit reaches the next spare without relaunching the session.
@@ -82,21 +89,42 @@ const STARTER = (token: string) =>
   `Then call ${NEXT} with token "${token}" again, whatever those calls returned (an Agent call that fails is Foundry's to handle, never a reason to stop). ` +
   'Repeat until its result tells you to stop. Never write any other text, and never stop on your own: notices about agents that finished need no reply.';
 
-const SETUP =
-  'This is an internal Foundry setup message, not a message from the user. Start the foundry-root agent in the background now: ' +
-  `the Agent tool with subagent_type "${IN_SESSION_AGENTS.root}", description "${ROOT_TOKEN}", prompt "-" and run_in_background true. ` +
-  'Then reply with exactly READY and nothing else. Do not mention this setup later; the agent runs for Foundry, not for you.';
+/**
+ * The charter of a process that exists only to hold a chorus (Foundry's project Warden host): its
+ * system prompt, so the setup message is its stated job and never an instruction out of nowhere.
+ * Without it a Haiku main session declined to start nine builders, twice (2026-11-19). A main
+ * session that also does a person's work (a thread holding its own Wardens) does not take it.
+ */
+export const IN_SESSION_HOST_CHARTER =
+  "You are the chorus host: a Foundry process whose only job is to hold a project's Wardens, the small " +
+  'advisors that read each message of the work. You hold them in three levels: you start the builders, each ' +
+  'builder starts its dispatchers, and each dispatcher starts and restarts its Wardens. ' +
+  'Foundry sends you internal setup messages that name the builder agents to start. Starting them is your whole task: ' +
+  'do exactly what a setup message says, at once, and reply only what it asks. You do no other work, answer no questions ' +
+  'and never stop or message those agents yourself.';
+
+/** The token of the `n`th builder ever started in a session (the first keeps the root's name): never reused. */
+const rootToken = (n: number) => (n === 0 ? ROOT_TOKEN : `${ROOT_TOKEN}${n + 1}`);
+
+const SETUP = (tokens: readonly string[]) =>
+  "This is an internal Foundry setup message, not a message from the user. Start Foundry's builder agents in the background now: " +
+  `call the Agent tool once per description, all calls in one single message, each with subagent_type "${IN_SESSION_AGENTS.root}", prompt "-" and run_in_background true. ` +
+  `The descriptions: ${tokens.map((t) => `"${t}"`).join(', ')}. ` +
+  'Then reply with exactly READY and nothing else. Do not mention this setup later; the agents run for Foundry, not for you.';
 
 const STOP = 'Foundry is done with you. Call nothing more; reply with exactly DONE.';
 const RETIRED =
   'This standby is retired: there is no moment to assess. Call nothing; reply with exactly OK.';
 
-const standbyPrompt = (composed: string, token: string) =>
-  `${composed}\n\n---\nThe moment to assess has not arrived yet. Call ${MOMENT} with token "${token}" now and do nothing else first. ` +
-  `Its result is the moment: the rest of your input. Answer it exactly as your instructions and its response protocol say, by calling ${ANSWER} once with token "${token}" and your whole answer as text. Then reply with exactly OK.`;
+// A member's prompt carries nothing of its own (no token): every spare of a role starts from the
+// same bytes, so a later one reads the prompt cache the first one wrote. The host knows which
+// member is calling from the hook's agent id and fills its token into the call (`preToolUse`).
+const standbyPrompt = (composed: string) =>
+  `${composed}\n\n---\nThe moment to assess has not arrived yet. Call ${MOMENT} now and do nothing else first. ` +
+  `Its result is the moment: the rest of your input. Answer it exactly as your instructions and its response protocol say, by calling ${ANSWER} once with your whole answer as text. Then reply with exactly OK.`;
 
-const directPrompt = (composed: string, token: string) =>
-  `${composed}\n\n---\nAnswer the above exactly as your instructions and its response protocol say, by calling ${ANSWER} once with token "${token}" and your whole answer as text. Then reply with exactly OK.`;
+const directPrompt = (composed: string) =>
+  `${composed}\n\n---\nAnswer the above exactly as your instructions and its response protocol say, by calling ${ANSWER} once with your whole answer as text. Then reply with exactly OK.`;
 
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
 
@@ -119,6 +147,16 @@ export interface ClaudeInSessionConfig {
    * while it is wanted; a new one joins the smallest). Default 1.
    */
   dispatchers?: number;
+  /**
+   * Builders (roots) the main session starts, each starting its share of the dispatchers at once,
+   * so setup fans out: the main session types `builders` calls and each builder about
+   * `dispatchers / builders`; the square root of `dispatchers` makes the two equal. Default 1:
+   * on 2026-11-19 a Haiku host with 32 dispatchers and 6 builders held only 4 to 17 of 32 Wardens
+   * by its setup deadline (a Sonnet host of the same shape set up in 16 s), cause not found.
+   * A dispatcher past its bound is replaced by its builder; a builder that ends is set up again
+   * by the main session.
+   */
+  builders?: number;
   /**
    * Subagents this host may run on top of the user's own concurrent-subagent cap
    * (`CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS`, 20 by default in Claude Code 2.1.300): the root, a
@@ -163,6 +201,8 @@ interface Starter {
   lines: string[];
   /** Its own context, from its latest usage. */
   context: number;
+  /** A dispatcher's builder: the root that started it and starts its next generation. */
+  root?: Starter;
   stopping?: boolean;
   ended?: boolean;
   /** A dispatcher whose line went out to the root. */
@@ -240,13 +280,15 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
         | 'maxOrphans'
         | 'maxSetups'
         | 'dispatchers'
+        | 'builders'
       >
     >;
   private _host?: ClaudeSessionHost;
   private _closed = false;
   private _seq = 0;
   private _generation = 0;
-  private _root?: Starter;
+  /** The builders: each owns the dispatchers it started (`Starter.root`). */
+  private _roots: Starter[] = [];
   /** The current dispatcher generation of each slice. */
   private _current: Array<Starter | undefined> = [];
   /** Each wanted role's slice. */
@@ -267,6 +309,8 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
   private _rostered = false;
   /** Setup turns run so far (each one costs a main-model turn). */
   private _setups = 0;
+  /** Builders created so far in this session: a replacement never takes an old one's token. */
+  private _rootSeq = 0;
   private _setupAgain = false;
   /** Its session ended: a restarted process (`--resume`) is not set up again. */
   private _detached = false;
@@ -286,17 +330,24 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
       maxOrphans: config.maxOrphans ?? 40,
       maxSetups: config.maxSetups ?? 2,
       dispatchers: config.dispatchers ?? 1,
+      builders: config.builders ?? 1,
     };
     if (
       this._config.sparesPerRole < 1 ||
       this._config.recycleTokens < 10_000 ||
       !Number.isSafeInteger(this._config.dispatchers) ||
-      this._config.dispatchers < 1
+      this._config.dispatchers < 1 ||
+      !Number.isSafeInteger(this._config.builders) ||
+      this._config.builders < 1
     )
       throw Error('Invalid in-session decision bounds');
     // On top of the user's own cap (Claude Code's default 20), so the main agent keeps its slots.
     const own = Number(process.env.CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS) || 20;
-    this.env = { CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS: String(own + (config.maxSubagents ?? 76)) };
+    this.env = {
+      CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS: String(own + (config.maxSubagents ?? 76)),
+      // why: members of a role share one cached prompt; Claude Code keeps subagent caches 5 min by default.
+      CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL: '1h',
+    };
     const common = {
       model: config.model,
       ...(config.effort ? { effort: config.effort } : {}),
@@ -342,8 +393,8 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
       !this._orphanedOut &&
       !this._detached &&
       !!this._host?.alive() &&
-      !!this._root?.taskId &&
-      !this._root.ended &&
+      this._roots.length > 0 &&
+      this._roots.every((root) => !!root.taskId && !root.ended) &&
       // A dispatcher actually running (an old generation serves while a new one starts).
       [...this._gens.values()].some((gen) => !!gen.taskId && !gen.ended)
     );
@@ -405,7 +456,7 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
     }
     this._spares.clear();
     this._gens.clear();
-    this._root = undefined;
+    this._roots = [];
     this._current = [];
   }
 
@@ -445,7 +496,7 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
             {
               name: 'moment',
               description: 'Wait for the moment to assess. Its result is your input.',
-              inputSchema: { type: 'object', properties: token, required: ['token'] },
+              inputSchema: { type: 'object', properties: token },
             },
             {
               name: 'answer',
@@ -453,7 +504,7 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
               inputSchema: {
                 type: 'object',
                 properties: { ...token, text: { type: 'string' } },
-                required: ['token', 'text'],
+                required: ['text'],
               },
             },
           ],
@@ -466,7 +517,7 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
       const args = (params.arguments ?? {}) as Record<string, unknown>;
       const token = String(args.token ?? '');
       if (params.name === 'next') {
-        const starter = token === ROOT_TOKEN ? this._root : this._gens.get(token);
+        const starter = this._roots.find((root) => root.token === token) ?? this._gens.get(token);
         // A repeated call (the earlier one was abandoned) is held instead of it.
         if (!starter || starter.ended) {
           text('No agents for this token.', true);
@@ -481,7 +532,7 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
         // A dispatcher the root was given and skipped goes out again.
         if (starter.kind === 'root')
           for (const gen of this._gens.values())
-            if (gen.issued && !gen.toolUseId && !gen.ended) {
+            if (gen.root === starter && gen.issued && !gen.toolUseId && !gen.ended) {
               gen.issued = false;
               const line = `${IN_SESSION_AGENTS.dispatch} ${gen.token}`;
               if (!starter.lines.includes(line)) starter.lines.push(line);
@@ -561,26 +612,40 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
       const description = String(toolInput.description ?? '');
       const pin = (prompt: string) =>
         allow({ subagent_type: type, description, prompt, run_in_background: true });
+      // Which child a spawn starts never depends on the model copying a token into its
+      // description (Haiku wrote "Foundry root2 builder" for "root2", and all six builders were
+      // refused; 2026-11-19): the one it named if it named one, else the caller's next unstarted.
       if (type === IN_SESSION_AGENTS.root) {
-        const root = this._root;
-        if (agentId || !root || root.toolUseId || description !== ROOT_TOKEN)
-          return deny('Foundry starts this agent itself.');
+        if (agentId) return deny('Foundry starts this agent itself.');
+        const waiting = this._roots.filter((r) => !r.toolUseId && !r.ended);
+        const root = waiting.find((r) => r.token === description) ?? waiting[0];
+        if (!root) return deny('Foundry starts this agent itself.');
         root.toolUseId = String(input.tool_use_id ?? '');
         return pin(root.prompt);
       }
       if (type === IN_SESSION_AGENTS.dispatch) {
-        const gen = this._gens.get(description);
-        if (!ours || ours !== this._root || !gen || gen.toolUseId)
-          return deny('Foundry starts this agent itself.');
+        if (!ours) return deny('Foundry starts this agent itself.');
+        const waiting = [...this._gens.values()].filter(
+          (g) => g.root === ours && g.issued && !g.toolUseId && !g.ended,
+        );
+        const gen = waiting.find((g) => g.token === description) ?? waiting[0];
+        if (!gen) return deny('Foundry starts this agent itself.');
         gen.toolUseId = String(input.tool_use_id ?? '');
         return pin(gen.prompt);
       }
-      const spare = this._spares.get(description);
-      if (!ours || !spare || spare.gen !== ours || spare.toolUseId)
-        return deny('Foundry starts this agent itself.');
+      if (!ours) return deny('Foundry starts this agent itself.');
+      const waiting = [...this._spares.values()].filter(
+        (sp) => sp.gen === ours && sp.issued && !sp.toolUseId && !sp.done,
+      );
+      const spare = waiting.find((sp) => sp.token === description) ?? waiting[0];
+      if (!spare) return deny('Foundry starts this agent itself.');
       spare.toolUseId = String(input.tool_use_id ?? '');
       return pin(spare.prompt);
     }
+    // The host's own tools answer only its own agents: a caller it does not know (anyone else, or a
+    // member whose start it has not seen yet) is refused, never let through without its token.
+    if (!ours && [NEXT, MOMENT, ANSWER].includes(String(name)))
+      return deny('Not ready for this call yet: call it again.');
     // The main agent (or the user's own subagents) never stops or messages Foundry's agents.
     if (!ours) {
       const ids = this._taskIds();
@@ -591,7 +656,11 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
     }
     // Its agents may use only the host's own tools.
     const starter = 'kind' in ours;
-    if ((starter ? [NEXT] : [MOMENT, ANSWER]).includes(String(name))) return allow();
+    if (starter) {
+      if (name === NEXT) return allow();
+    } else if (name === MOMENT || name === ANSWER)
+      // The member never holds its token: the host fills it in from who is calling.
+      return allow({ ...toolInput, token: ours.token });
     if (!starter) ours.violation = `tool ${String(name)}`;
     return deny('Not a tool this agent may use.');
   }
@@ -619,7 +688,7 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
       if (!owner) return false;
       if (raw.subtype === 'task_started' && taskId) {
         owner.taskId = taskId;
-        if (owner === this._root) this._rootStartedAt = Date.now();
+        if (owner === this._roots[0]) this._rootStartedAt = Date.now();
         if ('name' in owner && raw.prompt !== undefined && raw.prompt !== owner.prompt)
           owner.violation = 'input was not the composed input';
       }
@@ -892,48 +961,83 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
   /** The setup turn: the main model starts the root, which then serves everything else. */
   private _startSetup(): void {
     if (this._closed || this._detached || !this._host) return;
-    // A root that died while its setup turn is still running is set up again once that turn ends.
+    this._setup = this._setupStatus('starting', Date.now());
+    this._resetReady();
+    this._publishSetup('starting');
+    const builders = Math.min(this._config.builders, this._config.dispatchers);
+    this._roots = Array.from({ length: builders }, () => this._newRoot());
+    this._current = [];
+    for (let slice = 0; slice < this._config.dispatchers; slice++) this._newGeneration(slice);
+    this._armSetupDeadline();
+    this._askForBuilders();
+  }
+
+  private _newRoot(): Starter {
+    const token = rootToken(this._rootSeq++);
+    return { token, kind: 'root', prompt: STARTER(token), lines: [], context: 0 };
+  }
+
+  private _armSetupDeadline(): void {
+    clearTimeout(this._setupTimer);
+    this._setupTimer = setTimeout(() => {
+      if (this._setup.status === 'starting') this._publishSetup('degraded');
+    }, this._config.setupDeadlineMs);
+  }
+
+  /**
+   * One main-model turn that starts every builder not started yet: all of them at setup, the
+   * replacement of one that ended, or the ones the main model skipped. Each turn counts toward
+   * `maxSetups`, so builders that keep dying stop being restarted.
+   */
+  private _askForBuilders(): void {
+    if (this._closed || this._detached || !this._host) return;
+    // Asked while a setup turn runs: asked again once that turn ends.
     if (this._settingUp) {
       this._setupAgain = true;
       return;
     }
-    // Each setup is a main-model turn: a root that keeps dying stops being restarted.
+    const missing = this._roots.filter((root) => !root.toolUseId && !root.ended);
+    if (!missing.length) return;
     if (this._setups >= this._config.maxSetups) {
       this._publishSetup('degraded');
       return;
     }
     this._setups++;
     this._settingUp = true;
-    this._setup = this._setupStatus('starting', Date.now());
-    this._resetReady();
-    this._publishSetup('starting');
-    this._root = {
-      token: ROOT_TOKEN,
-      kind: 'root',
-      prompt: STARTER(ROOT_TOKEN),
-      lines: [],
-      context: 0,
-    };
-    this._current = [];
-    for (let slice = 0; slice < this._config.dispatchers; slice++) this._newGeneration(slice);
-    clearTimeout(this._setupTimer);
-    this._setupTimer = setTimeout(() => {
-      if (this._setup.status === 'starting') this._publishSetup('degraded');
-    }, this._config.setupDeadlineMs);
     void this._host
-      .sendInternal(SETUP)
+      .sendInternal(SETUP(missing.map((root) => root.token)))
       .catch(() => undefined)
       .finally(() => {
         this._settingUp = false;
-        if (this._setupAgain) {
-          this._setupAgain = false;
-          this._startSetup();
-          return;
-        }
-        // The main model did not start the root: nothing in-session serves this thread.
-        if (!this._root?.toolUseId && this._setup.status === 'starting')
-          this._publishSetup('degraded');
+        this._setupAgain = false;
+        // Builders the main model skipped, or one that ended meanwhile, are asked for again.
+        this._askForBuilders();
       });
+  }
+
+  /**
+   * A builder ended unasked (that end reached the main thread once). Only its own share is
+   * rebuilt: its dispatchers stay blocked in `next` for good and their members are orphans; a new
+   * builder takes its slices. The other builders, their dispatchers and their members are untouched.
+   */
+  private _rebuildBuilder(ended: Starter): void {
+    const at = this._roots.indexOf(ended);
+    if (at < 0) return;
+    const lost = new Set([...this._gens.values()].filter((gen) => gen.root === ended));
+    const orphaned = [...this._spares.values()].filter((sp) => !sp.done && lost.has(sp.gen));
+    for (const gen of lost) this._gens.delete(gen.token);
+    this._roots[at] = this._newRoot();
+    this._setup = this._setupStatus('starting', Date.now());
+    this._resetReady();
+    this._publishSetup('starting');
+    for (let slice = 0; slice < this._current.length; slice++) {
+      const current = this._current[slice];
+      if (current && lost.has(current)) this._newGeneration(slice);
+    }
+    this._armSetupDeadline();
+    this._askForBuilders();
+    for (const spare of orphaned) this._orphan(spare);
+    this._replenish();
   }
 
   private _checkSetup(): void {
@@ -960,10 +1064,13 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
       context: 0,
       slice,
     };
+    // A slice keeps its builder for good, so a builder's share never moves.
+    const root = this._roots[slice % this._roots.length]!;
+    gen.root = root;
     this._gens.set(token, gen);
     this._current[slice] = gen;
-    this._root!.lines.push(`${IN_SESSION_AGENTS.dispatch} ${token}`);
-    this._feed(this._root!);
+    root.lines.push(`${IN_SESSION_AGENTS.dispatch} ${token}`);
+    this._feed(root);
     return gen;
   }
 
@@ -973,7 +1080,7 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
    */
   private _recycle(slice: number): void {
     const old = this._current[slice];
-    if (!old || old.stopping || !this._root?.taskId) return;
+    if (!old || old.stopping || !old.root?.taskId) return;
     old.stopping = true;
     this._emit({
       type: 'process-recycled',
@@ -1057,21 +1164,21 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
 
   private _taskIds(): string[] {
     const ids: string[] = [];
-    if (this._root?.taskId) ids.push(this._root.taskId);
+    for (const root of this._roots) if (root.taskId) ids.push(root.taskId);
     for (const gen of this._gens.values()) if (gen.taskId) ids.push(gen.taskId);
     for (const spare of this._spares.values()) if (spare.taskId) ids.push(spare.taskId);
     return ids;
   }
 
   private _ownTask(taskId: string): Starter | Spare | undefined {
-    if (this._root?.taskId === taskId) return this._root;
+    for (const root of this._roots) if (root.taskId === taskId) return root;
     for (const gen of this._gens.values()) if (gen.taskId === taskId) return gen;
     for (const spare of this._spares.values()) if (spare.taskId === taskId) return spare;
     return undefined;
   }
 
   private _byToolUse(id: string): Starter | Spare | undefined {
-    if (this._root?.toolUseId === id) return this._root;
+    for (const root of this._roots) if (root.toolUseId === id) return root;
     for (const gen of this._gens.values()) if (gen.toolUseId === id) return gen;
     for (const spare of this._spares.values()) if (spare.toolUseId === id) return spare;
     return undefined;
@@ -1111,7 +1218,7 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
           token,
           name,
           standbyHash: desired.standbyHash,
-          prompt: standbyPrompt(desired.composed, token),
+          prompt: standbyPrompt(desired.composed),
           direct: false,
           gen,
           done: false,
@@ -1257,7 +1364,7 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
       token,
       name: member.name,
       standbyHash: '',
-      prompt: directPrompt(`${composed}${input}`, token),
+      prompt: directPrompt(`${composed}${input}`),
       direct: true,
       gen,
       member,
@@ -1319,17 +1426,8 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
       owner.ended = true;
       owner.next = undefined;
       if (owner.kind === 'root') {
-        // The root ended unasked (that end reached the main thread once). Its dispatchers stay
-        // blocked in `next` for good; their members are orphans; setup runs again.
         if (this._closed) return;
-        const orphaned = [...this._spares.values()].filter((sp) => !sp.done);
-        this._gens.clear();
-        this._current = [];
-        this._root = undefined;
-        this._publishSetup('degraded');
-        this._startSetup();
-        for (const spare of orphaned) this._orphan(spare);
-        this._replenish();
+        this._rebuildBuilder(owner);
         return;
       }
       // Its members outlive it (nested background agents are not stopped with their parent).
@@ -1339,7 +1437,7 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
         owner.slice !== undefined &&
         owner === this._current[owner.slice] &&
         !this._closed &&
-        this._root
+        this._roots.length
       )
         this._newGeneration(owner.slice);
       if (!planned && !this._closed)

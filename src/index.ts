@@ -27,6 +27,7 @@ export {
   type ClaudeInSessionConfig,
   ClaudeInSessionDecisions,
   IN_SESSION_AGENTS,
+  IN_SESSION_HOST_CHARTER,
   IN_SESSION_SERVER,
   type InSessionSetup,
 } from './claude-in-session';

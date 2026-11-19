@@ -161,6 +161,11 @@ function mainCli(behavior: Behavior = {}) {
     });
     void run(taskId, type, prompt);
   };
+  /** A member's tool call as the CLI makes it: the PreToolUse hook first, then the input it returned. */
+  const memberTool = async (taskId: string, name: string, args: Record<string, unknown>) => {
+    const r = await preTool(taskId, `mcp__foundry-wardens__${name}`, args, `toolu_${++seq}`);
+    return tool(taskId, name, r?.hookSpecificOutput?.updatedInput ?? args);
+  };
   const run = async (taskId: string, type: string, prompt: string) => {
     const token = /token "([^"]+)"/.exec(prompt)?.[1] ?? '';
     if (type === 'foundry-warden') {
@@ -182,7 +187,7 @@ function mainCli(behavior: Behavior = {}) {
       }
       let input: string;
       if (prompt.includes('Call mcp__foundry-wardens__moment')) {
-        const moment = await tool(taskId, 'moment', { token });
+        const moment = await memberTool(taskId, 'moment', {});
         if (!tasks.has(taskId)) return;
         if (moment?.startsWith('This standby is retired')) return end(taskId, 'completed');
         input = moment;
@@ -207,7 +212,7 @@ function mainCli(behavior: Behavior = {}) {
           usage: { input_tokens: 2, output_tokens: 7, cache_read_input_tokens: 300 },
         },
       });
-      await tool(taskId, 'answer', { token, text });
+      await memberTool(taskId, 'answer', { text });
       return end(taskId, 'completed');
     }
     // A starter: next → spawn every line → next …
@@ -282,7 +287,11 @@ function mainCli(behavior: Behavior = {}) {
       const text = m.message.content[0].text as string;
       void (async () => {
         if (text.includes('internal Foundry setup') && !behavior.noRoot)
-          await spawn(undefined, 'foundry-root', 'root');
+          // One builder per description the setup message lists, as the main model starts them.
+          for (const [, token] of text
+            .slice(text.indexOf('The descriptions:'))
+            .matchAll(/"(root\d*)"/g))
+            await spawn(undefined, 'foundry-root', token!);
         const reply = text.includes('internal Foundry setup') ? 'READY' : `re:${text}`;
         results.push(reply);
         fio.emit({
@@ -454,6 +463,70 @@ describe('ClaudeInSessionDecisions', () => {
       'toolu_y',
     );
     expect(own.hookSpecificOutput).toBeUndefined();
+  });
+
+  test('every spare of a role starts from the same bytes: no token in its prompt, the hook fills it into its calls', async () => {
+    const { cli, host } = await setup();
+    host.prestart('t', [{ spec: spec('a'), standby: 'SB' }]);
+    await host.ready(3_000);
+    // Use the held spare, so the role's replacement is started.
+    await host.decide(spec('a'), { input: 'M', standby: 'SB' });
+    await until(() => cli.hookOutputs.filter((h) => h.type === 'foundry-warden').length >= 2);
+    const prompts = cli.hookOutputs
+      .filter((h) => h.type === 'foundry-warden')
+      .map((h) => h.output.updatedInput.prompt as string);
+    expect(new Set(prompts).size).toBe(1);
+    expect(prompts[0]).not.toMatch(/token/);
+    // The member's own call carries no token; the hook's answer does.
+    const live = [...cli.tasks.entries()].find(([, t]) => t.type === 'foundry-warden')!;
+    const filled = await cli.preTool(live[0], 'mcp__foundry-wardens__moment', {}, 'toolu_m');
+    expect(filled.hookSpecificOutput.updatedInput.token).toBe(live[1].token);
+    expect(host.env.CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL).toBe('1h');
+  });
+
+  test('setup fans out: each builder starts its own share of the dispatchers', async () => {
+    const { cli, host } = await setup({}, { dispatchers: 9, builders: 3 });
+    host.prestart(
+      't',
+      Array.from({ length: 9 }, (_, i) => ({ spec: spec(`r${i}`), standby: 'S' })),
+    );
+    await host.ready(3_000);
+    expect(host.setup.status).toBe('ready');
+    const roots = [...cli.tasks.values()].filter((t) => t.type === 'foundry-root');
+    expect(roots.map((t) => t.token).sort()).toEqual(['root', 'root2', 'root3']);
+    expect([...cli.tasks.values()].filter((t) => t.type === 'foundry-dispatch')).toHaveLength(9);
+    expect(host.holding()).toEqual({ expected: 9, held: 9 });
+    // Each builder started its own three dispatchers.
+    const startedBy = new Map<string, number>();
+    for (const h of cli.hookOutputs.filter((o) => o.type === 'foundry-dispatch'))
+      startedBy.set(h.by ?? '', (startedBy.get(h.by ?? '') ?? 0) + 1);
+    expect([...startedBy.values()]).toEqual([3, 3, 3]);
+  });
+
+  test('a builder that ends is rebuilt alone: the other builders, their dispatchers and their Wardens stay', async () => {
+    const { cli, host } = await setup({}, { dispatchers: 4, builders: 2, maxSetups: 3 });
+    host.prestart(
+      't',
+      Array.from({ length: 4 }, (_, i) => ({ spec: spec(`r${i}`), standby: 'S' })),
+    );
+    await host.ready(3_000);
+    const dispatchersBefore = [...cli.tasks.entries()]
+      .filter(([, t]) => t.type === 'foundry-dispatch')
+      .map(([id]) => id);
+    cli.endTask('root2');
+    await until(() => cli.results.length === 2 && host.serving());
+    const roots = [...cli.tasks.values()].filter((t) => t.type === 'foundry-root');
+    // The first builder is the same task; the second was replaced under a new token.
+    expect(roots.map((t) => t.token).sort()).toEqual(['root', 'root3']);
+    const dispatchersAfter = [...cli.tasks.entries()]
+      .filter(([, t]) => t.type === 'foundry-dispatch')
+      .map(([id]) => id);
+    // The surviving builder's two dispatchers were never restarted.
+    expect(
+      dispatchersBefore.filter((id) => dispatchersAfter.includes(id)).length,
+    ).toBeGreaterThanOrEqual(2);
+    await until(() => host.holding().held === 4);
+    expect(host.holding()).toEqual({ expected: 4, held: 4 });
   });
 
   test('a decision with no spare starts its own member with the input inline', async () => {
@@ -842,8 +915,9 @@ describe('ClaudeInSessionDecisions', () => {
     cli.endTask('root');
     await until(() => cli.results.length === 2 && host.serving());
     expect(cli.results).toEqual(['READY', 'READY']);
-    // The second death: no third setup turn; decisions are not served in-session.
-    cli.endTask('root');
+    // The second death (the replacement never takes the first one's token): no third setup turn;
+    // decisions are not served in-session.
+    cli.endTask('root2');
     await tick(100);
     expect(cli.results).toEqual(['READY', 'READY']);
     expect(host.serving()).toBe(false);
