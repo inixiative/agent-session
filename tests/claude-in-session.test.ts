@@ -33,6 +33,10 @@ type Behavior = {
   ignoreStop?: boolean;
   /** `stop_task` is acknowledged and the task ends this many ms later, or never (default: at once). */
   stopEndsAfterMs?: number | 'never';
+  /** A member whose prompt this matches ends at once, before its first call (one that dies on arrival). */
+  endsAtOnce?: (prompt: string) => boolean;
+  /** A member waits for this before its `moment` call (one that has started but not held yet). */
+  beforeMoment?: (prompt: string) => Promise<void> | undefined;
 };
 
 /**
@@ -181,6 +185,9 @@ function mainCli(behavior: Behavior = {}) {
           usage: { input_tokens: 5, output_tokens: 1, cache_read_input_tokens: 100 },
         },
       });
+      if (behavior.endsAtOnce?.(prompt)) return end(taskId, 'completed');
+      await behavior.beforeMoment?.(prompt);
+      if (!tasks.has(taskId)) return;
       if (behavior.memberTool) {
         const r = await preTool(taskId, behavior.memberTool, {}, `toolu_${++seq}`);
         if (r?.hookSpecificOutput?.permissionDecision === 'deny') return end(taskId, 'completed');
@@ -833,6 +840,178 @@ describe('ClaudeInSessionDecisions', () => {
     );
   });
 
+  test('a role whose members end at once is started 3 times, then backs off and is down until one holds', async () => {
+    // At most 20 deaths, so a host with no backoff fails this test instead of spinning it forever.
+    let deaths = 0;
+    const behavior: Behavior = {
+      endsAtOnce: (prompt) => prompt.includes('be the bad warden') && ++deaths <= 20,
+    };
+    const { cli, host, events } = await setup(behavior, {
+      failedStartBackoffMs: { initial: 200, max: 400 },
+    });
+    host.prestart(
+      't',
+      ['good', 'other', 'bad'].map((r) => ({ spec: spec(r), standby: 'S' })),
+    );
+    const badStarts = () =>
+      cli.hookOutputs.filter(
+        (h) =>
+          h.type === 'foundry-warden' &&
+          h.output?.permissionDecision === 'allow' &&
+          String(h.output.updatedInput.prompt).includes('be the bad warden'),
+      ).length;
+    // The other roles hold; the bad one is started three times in a row, then waits.
+    await until(() => host.holding().held === 2 && badStarts() >= 3);
+    await tick(50);
+    expect(badStarts()).toBe(3);
+    expect(host.holding()).toEqual({ expected: 3, held: 2 });
+    const down = host.snapshot().capacity!.rolesDown;
+    expect(down).toEqual([
+      {
+        key: spec('bad').key,
+        role: expect.stringMatching(/^d-[0-9a-f]{16}$/),
+        failedStarts: 3,
+        retryAt: expect.any(Number),
+      },
+    ]);
+    expect(down[0]!.retryAt - Date.now()).toBeGreaterThan(100);
+    expect(events.filter((e) => e.type === 'role-down')).toEqual([
+      {
+        type: 'role-down',
+        key: spec('bad').key,
+        role: down[0]!.role,
+        failedStarts: 3,
+        retryAt: down[0]!.retryAt,
+      },
+    ]);
+    // The other roles still serve, warm.
+    expect((await host.decide(spec('good'), { input: 'M', standby: 'S' })).prime).toBe('warm');
+    // After its wait (200 ms, then 400 ms, the cap) it is tried once more each time: never in a loop.
+    await until(() => badStarts() === 4, 1_000);
+    await tick(50);
+    expect(badStarts()).toBe(4);
+    expect(host.snapshot().capacity!.rolesDown[0]!.failedStarts).toBe(4);
+    await until(() => badStarts() === 5, 1_000);
+    expect(host.snapshot().capacity!.rolesDown[0]).toMatchObject({ failedStarts: 5 });
+    // A member that holds again resets it: the role is up, reported once.
+    behavior.endsAtOnce = undefined;
+    await until(() => host.holding().held === 3, 2_000);
+    expect(host.snapshot().capacity!.rolesDown).toEqual([]);
+    expect(events.filter((e) => e.type === 'role-recovered')).toEqual([
+      { type: 'role-recovered', key: spec('bad').key, role: down[0]!.role },
+    ]);
+    expect(events.filter((e) => e.type === 'role-down')).toHaveLength(1);
+    // Six starts of the bad role in all, over about a second: bounded, not one per tick.
+    expect(badStarts()).toBe(6);
+  });
+
+  test('a role that is down settles setup at once (degraded) instead of holding the chorus to its deadline', async () => {
+    const { cli, host, setups } = await setup(
+      { endsAtOnce: (prompt) => prompt.includes('be the bad warden') },
+      { setupDeadlineMs: 10_000, failedStartBackoffMs: { initial: 5_000, max: 5_000 } },
+    );
+    const at = Date.now();
+    host.prestart(
+      't',
+      ['good', 'other', 'bad'].map((r) => ({ spec: spec(r), standby: 'S' })),
+    );
+    await host.ready(10_000);
+    // Degraded as soon as the others hold and the role is down: far inside the 10 s deadline.
+    expect(Date.now() - at).toBeLessThan(2_000);
+    expect(host.setup.status).toBe('degraded');
+    const bad = host.snapshot().capacity!.rolesDown[0]!.role;
+    expect(host.setup.wardens).toEqual({ expected: 3, held: 2, failed: [bad] });
+    expect(setups.some((s) => s.status === 'ready')).toBe(false);
+    // The others serve, warm.
+    expect((await host.decide(spec('other'), { input: 'M', standby: 'S' })).prime).toBe('warm');
+    const starts = cli.hookOutputs.filter((h) => h.type === 'foundry-warden').length;
+    // Waiting does not spin the dispatcher: the down role starts nothing during its wait.
+    await tick(200);
+    expect(
+      cli.hookOutputs.filter(
+        (h) =>
+          h.type === 'foundry-warden' &&
+          String(h.output?.updatedInput?.prompt).includes('be the bad warden'),
+      ).length,
+    ).toBe(3);
+    expect(cli.hookOutputs.filter((h) => h.type === 'foundry-warden').length).toBeLessThanOrEqual(
+      starts + 1,
+    );
+    await host.close();
+    expect(host.snapshot().capacity!.rolesDown).toEqual([]);
+  });
+
+  test('a spare orphaned by its dispatcher that ends before holding is not a failed start of its role', async () => {
+    const gate = new Promise<void>(() => {});
+    const { cli, host, events } = await setup({
+      beforeMoment: (prompt) => (prompt.includes('be the slow warden') ? gate : undefined),
+    });
+    host.prestart(
+      't',
+      ['good', 'slow'].map((r) => ({ spec: spec(r), standby: 'S' })),
+    );
+    const slowTokens = () =>
+      cli.hookOutputs
+        .filter(
+          (h) =>
+            h.type === 'foundry-warden' &&
+            String(h.output?.updatedInput?.prompt).includes('be the slow warden'),
+        )
+        .map((h) => h.description);
+    const dispatchers = () =>
+      cli.hookOutputs
+        .filter((h) => h.type === 'foundry-dispatch' && h.output?.permissionDecision === 'allow')
+        .map((h) => h.description);
+    await until(() => host.holding().held === 1 && slowTokens().length === 1);
+    // Three times over: its dispatcher dies (the spare is orphaned), then the spare ends unheld.
+    for (let round = 1; round <= 3; round++) {
+      cli.endTask(dispatchers().at(-1)!);
+      await until(() => dispatchers().length === round + 1);
+      cli.endTask(slowTokens().at(-1)!);
+      await until(() => slowTokens().length === round + 1);
+    }
+    await tick(20);
+    expect(host.snapshot().capacity!.rolesDown).toEqual([]);
+    expect(events.some((e) => e.type === 'role-down')).toBe(false);
+  });
+
+  test('with two spares per role, spares that die together count as one failed start', async () => {
+    const { cli, host, events } = await setup(
+      { endsAtOnce: (prompt) => prompt.includes('be the bad warden') },
+      { sparesPerRole: 2, failedStartBackoffMs: { initial: 5_000, max: 5_000 } },
+    );
+    host.prestart(
+      't',
+      ['good', 'bad'].map((r) => ({ spec: spec(r), standby: 'S' })),
+    );
+    const badStarts = () =>
+      cli.hookOutputs.filter(
+        (h) =>
+          h.type === 'foundry-warden' &&
+          String(h.output?.updatedInput?.prompt).includes('be the bad warden'),
+      ).length;
+    await until(() => events.some((e) => e.type === 'role-down'));
+    await tick(50);
+    // Three rounds of two: down after its third round, not its third death.
+    expect(host.snapshot().capacity!.rolesDown[0]).toMatchObject({ failedStarts: 3 });
+    expect(badStarts()).toBeGreaterThanOrEqual(5);
+    const atDown = badStarts();
+    await tick(200);
+    expect(badStarts()).toBe(atDown);
+    expect(host.holding()).toEqual({ expected: 2, held: 1 });
+  });
+
+  test('a direct member that ends without answering fails its decision, not its role', async () => {
+    const { host } = await setup({ endsAtOnce: (prompt) => prompt.includes('be the cold warden') });
+    host.prestart('t', [{ spec: spec('good'), standby: 'S' }]);
+    await until(() => host.holding().held === 1);
+    for (let i = 0; i < 3; i++)
+      await expect(host.decide(spec('cold'), { input: `M${i}` })).rejects.toMatchObject({
+        reason: 'native-failed',
+      });
+    expect(host.snapshot().capacity!.rolesDown).toEqual([]);
+  });
+
   test('spawns the CLI refuses go out again once a slot frees', async () => {
     const { cli, host } = await setup({ limit: 4 });
     // root + dispatcher + 2 members fit; the third member is refused.
@@ -842,7 +1021,12 @@ describe('ClaudeInSessionDecisions', () => {
     );
     await until(() => host.holding().held === 2);
     expect(host.holding()).toEqual({ expected: 3, held: 2 });
-    expect(host.snapshot().capacity).toEqual({ awaitingSlot: 1, orphans: 0, orphanedOut: false });
+    expect(host.snapshot().capacity).toEqual({
+      awaitingSlot: 1,
+      orphans: 0,
+      orphanedOut: false,
+      rolesDown: [],
+    });
     // Using a spare frees a slot; its replacement and the refused one are both asked for again.
     expect((await host.decide(spec('a'), { input: 'M', standby: 'S' })).content).toBe('ANS:M');
     await until(

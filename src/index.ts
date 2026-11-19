@@ -139,6 +139,7 @@ export {
   type DecisionRequest,
   type DecisionResult,
   type InSessionCapacity,
+  type InSessionRoleDown,
   type PrimedEvent,
   type PrimedSessions,
   type PrimedSnapshot,

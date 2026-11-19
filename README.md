@@ -265,6 +265,22 @@ const result = await decisions.decide(spec, { input, standby });
   own subagents go to the tool gate untouched.
 - **Fresh per call.** Each member serves one decision. A used one is replaced
   at once; a role with no held spare starts a member with its input inline.
+- **Failed starts back off.** A spare that ends before it ever held its
+  `moment` call (and was not retired first) is a failed start of its role;
+  one orphaned by a dispatcher or builder that ended is the host's failure and
+  does not count, and spares of a role started together (`sparesPerRole` > 1)
+  that die together count as one step.
+  The first two in a row are replaced at once; from the third the role waits
+  before its next start, 1 s doubling to 60 s (`failedStartBackoffMs`), and is
+  reported down until a member of it holds: in `capacity.rolesDown` (its key,
+  definition name, failed starts and `retryAt`) and as one `role-down` event,
+  then one `role-recovered`. Other roles are untouched. A down role counts as
+  settled for setup: setup goes `degraded` (listing it as failed) as soon as
+  every other role holds and every dispatcher waits, instead of holding the
+  chorus back until the setup deadline.
+  A direct (cold) member that ends without answering is its decision's
+  failure, never its role's. Why: a member that died on arrival was replaced
+  with no bound (a test stand-in looped on it and took 23 GB, 2026-11-19).
 - **Held only.** A decision with `heldOnly` never starts a member: with no
   spare holding its standby, or if the held one is lost before delivery, it
   is refused unsent (`DecisionError`, `not-held`, `not-dispatched`). A caller that
@@ -273,8 +289,9 @@ const result = await decisions.decide(spec, { input, standby });
   `ClaudeInSessionDecisions` reads it.
 - **Capacity.** `snapshot().capacity` adds what no other reading exposes: spawns
   the CLI refused at its subagent cap (`awaitingSlot`), orphaned spares
-  (`orphans`), and whether too many orphans stopped in-session serving
-  (`orphanedOut`). Setup status and held roles are `setup` and `holding()`.
+  (`orphans`), whether too many orphans stopped in-session serving
+  (`orphanedOut`), and the roles backing off after failed starts (`rolesDown`).
+  Setup status and held roles are `setup` and `holding()`.
 - **Deadline and abort.** An undelivered decision is refused unsent. A
   delivered one has its member stopped (`stop_task`) before the
   `DecisionError` is thrown, and the error is `settled` when nothing of it

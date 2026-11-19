@@ -158,7 +158,24 @@ export type PrimedEvent =
   | { readonly type: 'limits'; readonly limits: LimitSnapshot }
   | { readonly type: 'violation'; readonly key: string; readonly detail: string }
   | { readonly type: 'hedged'; readonly key: string; readonly afterMs: number }
-  | { readonly type: 'transport-fallback'; readonly key: string };
+  | { readonly type: 'transport-fallback'; readonly key: string }
+  | {
+      /**
+       * An in-session role's members keep ending before they hold (`InSessionCapacity.rolesDown`):
+       * once, when it goes down. `key` is its decision key, `role` its definition name.
+       */
+      readonly type: 'role-down';
+      readonly key: string;
+      readonly role: string;
+      readonly failedStarts: number;
+      readonly retryAt: number;
+    }
+  | {
+      /** A role that was down holds a member again: once, when it recovers. */
+      readonly type: 'role-recovered';
+      readonly key: string;
+      readonly role: string;
+    };
 
 export interface PrimedSnapshot {
   readonly runtime: 'codex' | 'claude';
@@ -184,6 +201,21 @@ export interface InSessionCapacity {
   readonly orphans: number;
   /** Past `maxOrphans`: the session no longer serves decisions in-session. */
   readonly orphanedOut: boolean;
+  /**
+   * Roles whose members ended before they ever held, 3 or more times in a row: each waits before
+   * its next start (`retryAt`, epoch ms; past while that start runs) until a member of it holds.
+   */
+  readonly rolesDown: ReadonlyArray<InSessionRoleDown>;
+}
+
+export interface InSessionRoleDown {
+  /** Its decision key, as the latest roster named it. */
+  readonly key: string;
+  /** Its definition name (the hash of its composed text). */
+  readonly role: string;
+  /** Starts in a row that ended before holding. */
+  readonly failedStarts: number;
+  readonly retryAt: number;
 }
 
 export interface PrimedSessions {
