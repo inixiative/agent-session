@@ -91,12 +91,15 @@ const STOP = 'Foundry is done with you. Call nothing more; reply with exactly DO
 const RETIRED =
   'This standby is retired: there is no moment to assess. Call nothing; reply with exactly OK.';
 
-const standbyPrompt = (composed: string, token: string) =>
-  `${composed}\n\n---\nThe moment to assess has not arrived yet. Call ${MOMENT} with token "${token}" now and do nothing else first. ` +
-  `Its result is the moment: the rest of your input. Answer it exactly as your instructions and its response protocol say, by calling ${ANSWER} once with token "${token}" and your whole answer as text. Then reply with exactly OK.`;
+// A member's prompt carries nothing of its own (no token): every spare of a role starts from the
+// same bytes, so a later one reads the prompt cache the first one wrote. The host knows which
+// member is calling from the hook's agent id and fills its token into the call (`preToolUse`).
+const standbyPrompt = (composed: string) =>
+  `${composed}\n\n---\nThe moment to assess has not arrived yet. Call ${MOMENT} now and do nothing else first. ` +
+  `Its result is the moment: the rest of your input. Answer it exactly as your instructions and its response protocol say, by calling ${ANSWER} once with your whole answer as text. Then reply with exactly OK.`;
 
-const directPrompt = (composed: string, token: string) =>
-  `${composed}\n\n---\nAnswer the above exactly as your instructions and its response protocol say, by calling ${ANSWER} once with token "${token}" and your whole answer as text. Then reply with exactly OK.`;
+const directPrompt = (composed: string) =>
+  `${composed}\n\n---\nAnswer the above exactly as your instructions and its response protocol say, by calling ${ANSWER} once with your whole answer as text. Then reply with exactly OK.`;
 
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
 
@@ -296,7 +299,11 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
       throw Error('Invalid in-session decision bounds');
     // On top of the user's own cap (Claude Code's default 20), so the main agent keeps its slots.
     const own = Number(process.env.CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS) || 20;
-    this.env = { CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS: String(own + (config.maxSubagents ?? 76)) };
+    this.env = {
+      CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS: String(own + (config.maxSubagents ?? 76)),
+      // why: members of a role share one cached prompt; Claude Code keeps subagent caches 5 min by default.
+      CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL: '1h',
+    };
     const common = {
       model: config.model,
       ...(config.effort ? { effort: config.effort } : {}),
@@ -445,7 +452,7 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
             {
               name: 'moment',
               description: 'Wait for the moment to assess. Its result is your input.',
-              inputSchema: { type: 'object', properties: token, required: ['token'] },
+              inputSchema: { type: 'object', properties: token },
             },
             {
               name: 'answer',
@@ -453,7 +460,7 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
               inputSchema: {
                 type: 'object',
                 properties: { ...token, text: { type: 'string' } },
-                required: ['token', 'text'],
+                required: ['text'],
               },
             },
           ],
@@ -591,7 +598,11 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
     }
     // Its agents may use only the host's own tools.
     const starter = 'kind' in ours;
-    if ((starter ? [NEXT] : [MOMENT, ANSWER]).includes(String(name))) return allow();
+    if (starter) {
+      if (name === NEXT) return allow();
+    } else if (name === MOMENT || name === ANSWER)
+      // The member never holds its token: the host fills it in from who is calling.
+      return allow({ ...toolInput, token: ours.token });
     if (!starter) ours.violation = `tool ${String(name)}`;
     return deny('Not a tool this agent may use.');
   }
@@ -1111,7 +1122,7 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
           token,
           name,
           standbyHash: desired.standbyHash,
-          prompt: standbyPrompt(desired.composed, token),
+          prompt: standbyPrompt(desired.composed),
           direct: false,
           gen,
           done: false,
@@ -1257,7 +1268,7 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
       token,
       name: member.name,
       standbyHash: '',
-      prompt: directPrompt(`${composed}${input}`, token),
+      prompt: directPrompt(`${composed}${input}`),
       direct: true,
       gen,
       member,

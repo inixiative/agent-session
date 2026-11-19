@@ -161,6 +161,11 @@ function mainCli(behavior: Behavior = {}) {
     });
     void run(taskId, type, prompt);
   };
+  /** A member's tool call as the CLI makes it: the PreToolUse hook first, then the input it returned. */
+  const memberTool = async (taskId: string, name: string, args: Record<string, unknown>) => {
+    const r = await preTool(taskId, `mcp__foundry-wardens__${name}`, args, `toolu_${++seq}`);
+    return tool(taskId, name, r?.hookSpecificOutput?.updatedInput ?? args);
+  };
   const run = async (taskId: string, type: string, prompt: string) => {
     const token = /token "([^"]+)"/.exec(prompt)?.[1] ?? '';
     if (type === 'foundry-warden') {
@@ -182,7 +187,7 @@ function mainCli(behavior: Behavior = {}) {
       }
       let input: string;
       if (prompt.includes('Call mcp__foundry-wardens__moment')) {
-        const moment = await tool(taskId, 'moment', { token });
+        const moment = await memberTool(taskId, 'moment', {});
         if (!tasks.has(taskId)) return;
         if (moment?.startsWith('This standby is retired')) return end(taskId, 'completed');
         input = moment;
@@ -207,7 +212,7 @@ function mainCli(behavior: Behavior = {}) {
           usage: { input_tokens: 2, output_tokens: 7, cache_read_input_tokens: 300 },
         },
       });
-      await tool(taskId, 'answer', { token, text });
+      await memberTool(taskId, 'answer', { text });
       return end(taskId, 'completed');
     }
     // A starter: next → spawn every line → next …
@@ -454,6 +459,25 @@ describe('ClaudeInSessionDecisions', () => {
       'toolu_y',
     );
     expect(own.hookSpecificOutput).toBeUndefined();
+  });
+
+  test('every spare of a role starts from the same bytes: no token in its prompt, the hook fills it into its calls', async () => {
+    const { cli, host } = await setup();
+    host.prestart('t', [{ spec: spec('a'), standby: 'SB' }]);
+    await host.ready(3_000);
+    // Use the held spare, so the role's replacement is started.
+    await host.decide(spec('a'), { input: 'M', standby: 'SB' });
+    await until(() => cli.hookOutputs.filter((h) => h.type === 'foundry-warden').length >= 2);
+    const prompts = cli.hookOutputs
+      .filter((h) => h.type === 'foundry-warden')
+      .map((h) => h.output.updatedInput.prompt as string);
+    expect(new Set(prompts).size).toBe(1);
+    expect(prompts[0]).not.toMatch(/token/);
+    // The member's own call carries no token; the hook's answer does.
+    const live = [...cli.tasks.entries()].find(([, t]) => t.type === 'foundry-warden')!;
+    const filled = await cli.preTool(live[0], 'mcp__foundry-wardens__moment', {}, 'toolu_m');
+    expect(filled.hookSpecificOutput.updatedInput.token).toBe(live[1].token);
+    expect(host.env.CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL).toBe('1h');
   });
 
   test('a decision with no spare starts its own member with the input inline', async () => {
