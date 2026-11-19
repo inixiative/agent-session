@@ -5,8 +5,8 @@
 // The whole tree (the main thread, its subagents, every decision role) is one Claude CLI process.
 // The extension attaches to the main session (`ClaudeCodeSession.extend`) before it starts:
 //
-//   setup      one internal turn asks the main model to start the builders (`foundry-root`, the
-//              square root of the dispatcher count) in the background. A builder never ends: it
+//   setup      one internal turn asks the main model to start the builders (`foundry-root`,
+//              `builders` of them, one by default) in the background. A builder never ends: it
 //              calls the host's `next` tool, which the host holds open, and starts what `next`
 //              returns: its share of the dispatchers (`foundry-dispatch`), each a generation that
 //              starts members (`foundry-warden`) the same way. Three levels is as deep as Claude
@@ -136,7 +136,9 @@ export interface ClaudeInSessionConfig {
   /**
    * Builders (roots) the main session starts, each starting its share of the dispatchers at once,
    * so setup fans out: the main session types `builders` calls and each builder about
-   * `dispatchers / builders`. Default the square root of `dispatchers`, which makes the two equal.
+   * `dispatchers / builders`; the square root of `dispatchers` makes the two equal. Default 1:
+   * on 2026-11-19 a Haiku host with 32 dispatchers and 6 builders held only 4 to 17 of 32 Wardens
+   * by its setup deadline (a Sonnet host of the same shape set up in 16 s), cause not found.
    * A dispatcher past its bound is replaced by its builder; a builder that ends is set up again
    * by the main session.
    */
@@ -314,7 +316,7 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
       maxOrphans: config.maxOrphans ?? 40,
       maxSetups: config.maxSetups ?? 2,
       dispatchers: config.dispatchers ?? 1,
-      builders: config.builders ?? Math.max(1, Math.round(Math.sqrt(config.dispatchers ?? 1))),
+      builders: config.builders ?? 1,
     };
     if (
       this._config.sparesPerRole < 1 ||
@@ -596,22 +598,33 @@ export class ClaudeInSessionDecisions implements PrimedSessions, ClaudeSessionEx
       const description = String(toolInput.description ?? '');
       const pin = (prompt: string) =>
         allow({ subagent_type: type, description, prompt, run_in_background: true });
+      // Which child a spawn starts never depends on the model copying a token into its
+      // description (Haiku wrote "Foundry root2 builder" for "root2", and all six builders were
+      // refused; 2026-11-19): the one it named if it named one, else the caller's next unstarted.
       if (type === IN_SESSION_AGENTS.root) {
-        const root = this._roots.find((r) => r.token === description);
-        if (agentId || !root || root.toolUseId) return deny('Foundry starts this agent itself.');
+        if (agentId) return deny('Foundry starts this agent itself.');
+        const waiting = this._roots.filter((r) => !r.toolUseId && !r.ended);
+        const root = waiting.find((r) => r.token === description) ?? waiting[0];
+        if (!root) return deny('Foundry starts this agent itself.');
         root.toolUseId = String(input.tool_use_id ?? '');
         return pin(root.prompt);
       }
       if (type === IN_SESSION_AGENTS.dispatch) {
-        const gen = this._gens.get(description);
-        if (!ours || !gen || ours !== gen.root || gen.toolUseId)
-          return deny('Foundry starts this agent itself.');
+        if (!ours) return deny('Foundry starts this agent itself.');
+        const waiting = [...this._gens.values()].filter(
+          (g) => g.root === ours && g.issued && !g.toolUseId && !g.ended,
+        );
+        const gen = waiting.find((g) => g.token === description) ?? waiting[0];
+        if (!gen) return deny('Foundry starts this agent itself.');
         gen.toolUseId = String(input.tool_use_id ?? '');
         return pin(gen.prompt);
       }
-      const spare = this._spares.get(description);
-      if (!ours || !spare || spare.gen !== ours || spare.toolUseId)
-        return deny('Foundry starts this agent itself.');
+      if (!ours) return deny('Foundry starts this agent itself.');
+      const waiting = [...this._spares.values()].filter(
+        (sp) => sp.gen === ours && sp.issued && !sp.toolUseId && !sp.done,
+      );
+      const spare = waiting.find((sp) => sp.token === description) ?? waiting[0];
+      if (!spare) return deny('Foundry starts this agent itself.');
       spare.toolUseId = String(input.tool_use_id ?? '');
       return pin(spare.prompt);
     }

@@ -484,8 +484,8 @@ describe('ClaudeInSessionDecisions', () => {
     expect(host.env.CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL).toBe('1h');
   });
 
-  test('setup fans out: builders are the square root of the dispatchers, each starting its own share', async () => {
-    const { cli, host } = await setup({}, { dispatchers: 9 });
+  test('setup fans out: each builder starts its own share of the dispatchers', async () => {
+    const { cli, host } = await setup({}, { dispatchers: 9, builders: 3 });
     host.prestart(
       't',
       Array.from({ length: 9 }, (_, i) => ({ spec: spec(`r${i}`), standby: 'S' })),
@@ -504,7 +504,7 @@ describe('ClaudeInSessionDecisions', () => {
   });
 
   test('a builder that ends is rebuilt alone: the other builders, their dispatchers and their Wardens stay', async () => {
-    const { cli, host } = await setup({}, { dispatchers: 4, maxSetups: 3 });
+    const { cli, host } = await setup({}, { dispatchers: 4, builders: 2, maxSetups: 3 });
     host.prestart(
       't',
       Array.from({ length: 4 }, (_, i) => ({ spec: spec(`r${i}`), standby: 'S' })),

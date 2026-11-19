@@ -242,7 +242,7 @@ const result = await decisions.decide(spec, { input, standby });
 ```
 
 - **Shape.** The setup turn asks the main model to start the builders
-  (`foundry-root`; `builders`, by default the square root of `dispatchers`) in
+  (`foundry-root`; `builders` of them, one by default) in
   the background. A builder never ends: it starts its share of the dispatcher
   generations (`foundry-dispatch`), which start members (`foundry-warden`), all
   in the background, through a `next` tool the host holds open. A member holds
