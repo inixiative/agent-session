@@ -204,7 +204,7 @@ function handleMessage(msg: RpcMessage): void {
     const value = typeof params.value === 'string' ? params.value : '';
     if (configId === 'model') {
       if (value === 'nonexistent-model') {
-        respondError(id, -32602, `Unknown model: ${value}`);
+        respondError(id, -32602, `Invalid value '${value}' for config option 'model'`);
         return;
       }
       currentModel = value;
@@ -280,6 +280,8 @@ async function runPrompt(
       GEMINI_API_KEY: process.env.GEMINI_API_KEY ?? null,
       GOOGLE_API_KEY: process.env.GOOGLE_API_KEY ?? null,
       GOOGLE_APPLICATION_CREDENTIALS: process.env.GOOGLE_APPLICATION_CREDENTIALS ?? null,
+      GOOGLE_GENAI_USE_VERTEXAI: process.env.GOOGLE_GENAI_USE_VERTEXAI ?? null,
+      GEMINI_CLI_AUTH_OVERRIDE: process.env.GEMINI_CLI_AUTH_OVERRIDE ?? null,
       CUSTOM_VAR: process.env.CUSTOM_VAR ?? null,
     };
     notify('session/update', {

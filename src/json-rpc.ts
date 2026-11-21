@@ -62,16 +62,19 @@ export class JsonRpcConnection {
     private readonly _handlers: JsonRpcHandlers = {},
   ) {
     this.exited = _proc.exited;
-    void this._read();
+    const readDone = this._read();
     void this._readStderr();
     _proc.exited.then(
       (code) =>
-        this._close(
-          new JsonRpcClosedError(
-            `Native process exited (code ${code})${this._stderr.trim() ? `: ${this._stderr.trim().slice(-300)}` : ''}`,
+        readDone.then(() =>
+          this._close(
+            new JsonRpcClosedError(
+              `Native process exited (code ${code})${this._stderr.trim() ? `: ${this._stderr.trim().slice(-300)}` : ''}`,
+            ),
           ),
         ),
-      () => this._close(new JsonRpcClosedError('Native process exit unobserved')),
+      () =>
+        readDone.then(() => this._close(new JsonRpcClosedError('Native process exit unobserved'))),
     );
   }
 
@@ -232,7 +235,7 @@ export class JsonRpcConnection {
 
   respond(id: string | number, result: unknown): void {
     try {
-      this._write({ jsonrpc: '2.0', id, result });
+      this._write({ jsonrpc: '2.0', id, result: result === undefined ? null : result });
     } catch {
       /* closing */
     }

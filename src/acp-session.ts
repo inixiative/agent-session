@@ -1,3 +1,4 @@
+import { resolve } from 'node:path';
 import type { HostPermissionMode, PipedSubprocess } from './codex-session';
 import {
   type BeforeSendHook,
@@ -43,16 +44,18 @@ const CLIENT_INFO = { name: 'agent-session', title: 'agent-session', version: '1
 const MISSING_SESSION_PATTERN =
   /session\s+(?:id\s+)?not\s+found|unknown\s+session|no\s+such\s+session|session\s+does\s+not\s+exist/i;
 const MISSING_MODEL_PATTERN =
-  /model\s+(?:id\s+)?['"`]?[\w.:/-]*['"`]?\s+(?:not\s+found|does\s+not\s+exist|is\s+not\s+(?:supported|available))|unknown\s+model|invalid\s+model|model_not_found/i;
+  /model\s+(?:id\s+)?['"`]?[\w.:/-]*['"`]?\s+(?:not\s+found|does\s+not\s+exist|is\s+not\s+(?:supported|available))|unknown\s+model|invalid\s+model|model_not_found|invalid\s+value.*(?:config\s+option\s+)?['"`]?model['"`]?/i;
 
 /**
  * Inherited env vars that would override Antigravity subscription auth with a
- * metered API key or service account. Stripped by default in `agyAcpLaunch`.
+ * metered API key, service account, Vertex AI, or auth override. Stripped by default in `agyAcpLaunch`.
  */
 export const AGY_COMPETING_ENV: readonly string[] = Object.freeze([
   'GEMINI_API_KEY',
   'GOOGLE_API_KEY',
   'GOOGLE_APPLICATION_CREDENTIALS',
+  'GOOGLE_GENAI_USE_VERTEXAI',
+  'GEMINI_CLI_AUTH_OVERRIDE',
 ]);
 
 /**
@@ -63,6 +66,7 @@ export const GEMINI_CLI_COMPETING_ENV: readonly string[] = AGY_COMPETING_ENV;
 
 export type AcpMcpServer =
   | {
+      readonly type?: undefined;
       readonly name: string;
       readonly command: string;
       readonly args: readonly string[];
@@ -243,6 +247,7 @@ interface QueuedTurn {
   message: string;
   images: readonly SessionImage[];
   timeout: number;
+  cancelling?: boolean;
   resolve: (result: SessionResult) => void;
   reject: (error: Error) => void;
 }
@@ -300,6 +305,7 @@ export class AcpSession implements HarnessSession {
   // -- Transport --
   private _proc: PipedSubprocess | null = null;
   private _rpc: JsonRpcConnection | null = null;
+  private _exitPromise: Promise<void> | null = null;
   private _capabilities?: AcpServerCapabilities;
   private _configOptions: AcpConfigOption[] = [];
   private _currentModeId?: string;
@@ -310,6 +316,7 @@ export class AcpSession implements HarnessSession {
   // -- Session state --
   private _externalSessionId?: string;
   private _alive = false;
+  private _startEmitted = false;
   private _endEmitted = false;
   private _eventLog: SessionEvent[] = [];
   private _handlers: SessionEventHandler[] = [];
@@ -337,7 +344,7 @@ export class AcpSession implements HarnessSession {
     if (!config?.command?.length || !str(firstArg) || firstArg.includes('\0'))
       throw new Error('AcpSession requires a non-empty command');
     this._command = [...config.command];
-    this._cwd = config.cwd ?? process.cwd();
+    this._cwd = resolve(config.cwd ?? process.cwd());
     this._env = config.env;
     this._stripEnv = config.stripEnv ? [...config.stripEnv] : [];
     this._defaultTimeout = config.timeout ?? DEFAULT_TURN_TIMEOUT_MS;
@@ -444,9 +451,9 @@ export class AcpSession implements HarnessSession {
   async start(): Promise<void> {
     if (this._inflight)
       throw new Error('Native call ownership unresolved; automatic resume is blocked');
+    if (this._rpc) throw new Error('Session already started');
     if (this._startedOnce && !this._alive)
       throw new Error('ACP session restart requires a new owned instance');
-    if (this._rpc) throw new Error('Session already started');
     this._startedOnce = true;
     this._closing = false;
 
@@ -552,6 +559,7 @@ export class AcpSession implements HarnessSession {
       if (this._onSessionReady) await this._onSessionReady(this._externalSessionId);
 
       this._alive = true;
+      this._startEmitted = true;
       this._endEmitted = false;
       this._emit({
         kind: 'session_start',
@@ -593,6 +601,7 @@ export class AcpSession implements HarnessSession {
     )
       return 'no-turn';
 
+    turn.cancelling = true;
     const deadline = Date.now() + (opts?.timeoutMs ?? 5_000);
     try {
       this._rpc.notify('session/cancel', { sessionId: this._externalSessionId });
@@ -607,39 +616,49 @@ export class AcpSession implements HarnessSession {
   }
 
   kill(): void {
-    const teardown = this._teardown();
-    if (!teardown) return;
-    const { proc, rpc } = teardown;
-    rpc.kill();
-    const timer = setTimeout(() => forceKill(proc), DEFAULT_CLOSE_GRACE_MS);
-    timer.unref?.();
-    void proc.exited.finally(() => clearTimeout(timer));
+    void this._beginClose(DEFAULT_CLOSE_GRACE_MS);
   }
 
   /** Tear down the child process cleanly (SIGTERM -> SIGKILL grace) and settle any pending turn. */
   async close(opts?: { graceMs?: number }): Promise<void> {
+    await this._beginClose(opts?.graceMs ?? DEFAULT_CLOSE_GRACE_MS);
+  }
+
+  private _beginClose(graceMs: number): Promise<void> {
+    if (this._exitPromise) return this._exitPromise;
     const teardown = this._teardown();
-    if (!teardown) return;
+    if (!teardown) return Promise.resolve();
     const { proc, rpc } = teardown;
-    const graceMs = opts?.graceMs ?? DEFAULT_CLOSE_GRACE_MS;
     rpc.kill();
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const exited = await Promise.race([
-      proc.exited.then(() => true).catch(() => true),
-      new Promise<false>((resolve) => {
-        timer = setTimeout(() => resolve(false), graceMs);
-      }),
-    ]).finally(() => clearTimeout(timer));
-    if (!exited) {
-      forceKill(proc);
-      let killTimer: ReturnType<typeof setTimeout> | undefined;
-      await Promise.race([
-        proc.exited.catch(() => undefined),
-        new Promise<void>((resolve) => {
-          killTimer = setTimeout(resolve, 1_000);
+    const exited = proc.exited.then(
+      () => true as const,
+      () => true as const,
+    );
+    const done = (async () => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const settled = await Promise.race([
+        exited,
+        new Promise<false>((resolve) => {
+          timer = setTimeout(() => resolve(false), graceMs);
+          timer.unref?.();
         }),
-      ]).finally(() => clearTimeout(killTimer));
-    }
+      ]);
+      if (timer) clearTimeout(timer);
+      if (!settled) {
+        forceKill(proc);
+        let killTimer: ReturnType<typeof setTimeout> | undefined;
+        await Promise.race([
+          exited,
+          new Promise<void>((resolve) => {
+            killTimer = setTimeout(resolve, 1_000);
+            killTimer.unref?.();
+          }),
+        ]);
+        if (killTimer) clearTimeout(killTimer);
+      }
+    })();
+    this._exitPromise = done;
+    return done;
   }
 
   artifact(): SessionArtifact {
@@ -687,10 +706,6 @@ export class AcpSession implements HarnessSession {
 
     let transformed = message;
     for (const hook of this._beforeSendHooks) transformed = await hook(transformed);
-    if (this._baseContext && !this._injectedBaseContext) {
-      transformed = `${this._baseContext}\n\n${transformed}`;
-      this._injectedBaseContext = true;
-    }
 
     return new Promise<SessionResult>((resolve, reject) => {
       const evidence = new TurnState();
@@ -766,8 +781,14 @@ export class AcpSession implements HarnessSession {
     this._turnToolCalls.clear();
     this._turnUsage = undefined;
 
+    let text = turn.message;
+    if (this._baseContext && !this._injectedBaseContext) {
+      text = `${this._baseContext}\n\n${text}`;
+      this._injectedBaseContext = true;
+    }
+
     const prompt: Array<Record<string, unknown>> = [
-      { type: 'text', text: turn.message },
+      { type: 'text', text },
       ...turn.images.map((image) => ({
         type: 'image',
         mimeType: image.mediaType,
@@ -823,6 +844,7 @@ export class AcpSession implements HarnessSession {
 
     if (this._inflight === turn) {
       this._clearTimer();
+      this._cancelPendingApprovals(false);
       if (a.localOutcome === 'pending') {
         a.localOutcome = 'resolved';
         turn.resolve(a.result(this._externalSessionId));
@@ -855,6 +877,7 @@ export class AcpSession implements HarnessSession {
 
       if (this._inflight === turn) {
         this._clearTimer();
+        this._cancelPendingApprovals(false);
         if (a.localOutcome === 'pending') turn.reject(a.fail(surfaced, 'rpc'));
         this._inflight = null;
         this._processNextTurn();
@@ -864,8 +887,12 @@ export class AcpSession implements HarnessSession {
 
     // Transport / close error (e.g. child crashed mid-turn).
     if (a.rpcOutcome === 'pending') a.rpcOutcome = 'unknown';
-    if (this._inflight === turn) this._rejectInflight(error, 'transport');
-    else if (a.localOutcome === 'pending') turn.reject(a.fail(error, 'transport'));
+    if (this._inflight === turn) {
+      this._cancelPendingApprovals(false);
+      this._rejectInflight(error, 'transport');
+    } else if (a.localOutcome === 'pending') {
+      turn.reject(a.fail(error, 'transport'));
+    }
   }
 
   private _processNextTurn(): void {
@@ -902,7 +929,8 @@ export class AcpSession implements HarnessSession {
     this._cancelPendingApprovals(false);
     this._rejectInflight(err, 'transport');
     this._rejectQueue(err);
-    this._emit({ kind: 'session_end', timestamp: Date.now(), transportOutcome: 'failed' });
+    if (this._startEmitted)
+      this._emit({ kind: 'session_end', timestamp: Date.now(), transportOutcome: 'failed' });
   }
 
   private _teardown(): { proc: PipedSubprocess; rpc: JsonRpcConnection } | null {
@@ -917,7 +945,7 @@ export class AcpSession implements HarnessSession {
     this._rejectQueue(new Error('Session closed'));
     this._proc = null;
     this._rpc = null;
-    this._emit({ kind: 'session_end', timestamp: Date.now() });
+    if (this._startEmitted) this._emit({ kind: 'session_end', timestamp: Date.now() });
     return { proc, rpc };
   }
 
@@ -974,7 +1002,7 @@ export class AcpSession implements HarnessSession {
             if (Array.isArray(updated?.configOptions))
               this._configOptions = parseConfigOptions(updated.configOptions);
           } catch (error) {
-            if (isMissingModelError(error))
+            if (isMissingModelError(error, true))
               throw new NativeModelMissingError('acp', this._model, (error as Error).message);
             throw error;
           }
@@ -1000,7 +1028,7 @@ export class AcpSession implements HarnessSession {
                 unattributedReason: 'session-configuration',
                 raw: { type: 'model-switch-unsupported', model: this._model },
               });
-            } else if (isMissingModelError(error)) {
+            } else if (isMissingModelError(error, true)) {
               throw new NativeModelMissingError('acp', this._model, (error as Error).message);
             } else {
               throw error;
@@ -1096,13 +1124,24 @@ export class AcpSession implements HarnessSession {
     }
 
     const a = this._inflight?.evidence;
-    if (!a) {
+    if (a?.dispatch !== 'attempted') {
       this._emit({
         kind: 'native_status',
         timestamp: now,
         nativeSessionId: this._externalSessionId,
         correlation: 'unknown',
         unattributedReason: 'no-admission',
+        raw: update,
+      });
+      return;
+    }
+    if (a.nativeOutcome !== 'unknown') {
+      this._emit({
+        kind: 'native_status',
+        timestamp: now,
+        nativeSessionId: this._externalSessionId,
+        correlation: 'unknown',
+        unattributedReason: 'after-terminal',
         raw: update,
       });
       return;
@@ -1239,6 +1278,7 @@ export class AcpSession implements HarnessSession {
     const rpc = this._rpc;
     if (!rpc || rpc.closed) return;
 
+    const sessionId = str(params?.sessionId);
     const toolCall = object(params?.toolCall);
     const callId = str(toolCall?.toolCallId);
     const toolName = str(toolCall?.name) ?? str(toolCall?.title) ?? str(toolCall?.kind) ?? 'tool';
@@ -1251,14 +1291,63 @@ export class AcpSession implements HarnessSession {
       options.find((opt) => opt.kind === 'reject_once') ??
       options.find((opt) => opt.kind === 'reject_always');
 
-    const a = this._inflight?.evidence;
-    const identity = a
-      ? { ...a.identity, admissionId: a.admissionId, ...(callId ? { callId } : {}) }
-      : {
-          nativeSessionId: str(params?.sessionId) ?? this._externalSessionId,
-          correlation: 'unknown' as const,
-          unattributedReason: 'no-admission' as const,
-        };
+    if (sessionId && this._externalSessionId && sessionId !== this._externalSessionId) {
+      this._emit({
+        kind: 'native_status',
+        timestamp: Date.now(),
+        nativeSessionId: sessionId,
+        correlation: 'unknown',
+        unattributedReason: 'foreign-session',
+        ...(callId ? { callId } : {}),
+        raw: {
+          type: 'approval-response',
+          toolName,
+          decision: 'cancelled',
+          reason: 'foreign-session',
+        },
+      });
+      rpc.respond(id, { outcome: { outcome: 'cancelled' } });
+      return;
+    }
+
+    const turn = this._inflight;
+    const a = turn?.evidence;
+    if (
+      this._loadingSession ||
+      !turn ||
+      !a ||
+      a.dispatch !== 'attempted' ||
+      a.nativeOutcome !== 'unknown' ||
+      turn.cancelling
+    ) {
+      const unattributedReason = this._loadingSession
+        ? ('session-configuration' as const)
+        : a && a.nativeOutcome !== 'unknown'
+          ? ('after-terminal' as const)
+          : ('no-admission' as const);
+      this._emit({
+        ...(turn?.cancelling && a
+          ? { ...a.identity, admissionId: a.admissionId }
+          : {
+              nativeSessionId: sessionId ?? this._externalSessionId,
+              correlation: 'unknown' as const,
+              unattributedReason,
+            }),
+        ...(callId ? { callId } : {}),
+        kind: 'native_status',
+        timestamp: Date.now(),
+        raw: {
+          type: 'approval-response',
+          toolName,
+          decision: 'cancelled',
+          ...(turn?.cancelling ? { reason: 'turn-cancelling' } : {}),
+        },
+      });
+      rpc.respond(id, { outcome: { outcome: 'cancelled' } });
+      return;
+    }
+
+    const identity = { ...a.identity, admissionId: a.admissionId, ...(callId ? { callId } : {}) };
 
     this._emit({
       ...identity,
@@ -1300,7 +1389,7 @@ export class AcpSession implements HarnessSession {
       ...mcpToolParts(toolName),
       toolInput: Object.freeze(structuredClone(rawInput)),
       ...(callId ? { callId } : {}),
-      ...(a ? { admissionId: a.admissionId } : {}),
+      admissionId: a.admissionId,
       ...(str(toolCall?.title) ? { description: str(toolCall?.title) } : {}),
       signal: pending.controller.signal,
     });
@@ -1309,8 +1398,14 @@ export class AcpSession implements HarnessSession {
     if (pending.responded) return;
     pending.responded = true;
 
-    if (pending.controller.signal.aborted || !this._alive || this._rpc !== rpc || rpc.closed) {
-      if (!rpc.closed) rpc.respond(id, { outcome: { outcome: 'cancelled' } });
+    if (
+      pending.controller.signal.aborted ||
+      turn.cancelling ||
+      !this._alive ||
+      this._rpc !== rpc ||
+      rpc.closed
+    ) {
+      if (this._rpc === rpc && !rpc.closed) rpc.respond(id, { outcome: { outcome: 'cancelled' } });
       return;
     }
 
@@ -1433,7 +1528,7 @@ function filterMcpServers(
 ): Array<Record<string, unknown>> {
   const out: Array<Record<string, unknown>> = [];
   for (const server of servers) {
-    if ('type' in server) {
+    if ('type' in server && server.type !== undefined) {
       if (server.type === 'http' && !capabilities.http) continue;
       if (server.type === 'sse' && !capabilities.sse) continue;
       out.push({
@@ -1540,11 +1635,7 @@ function extractToolOutput(update: Record<string, unknown>): string | undefined 
   if (rawObj) {
     if (typeof rawObj.output === 'string') return rawObj.output;
     if (typeof rawObj.text === 'string') return rawObj.text;
-    try {
-      return JSON.stringify(rawObj);
-    } catch {
-      return undefined;
-    }
+    return JSON.stringify(rawObj);
   }
   return undefined;
 }
@@ -1586,8 +1677,9 @@ function isMissingSessionError(error: unknown): boolean {
   return MISSING_SESSION_PATTERN.test(error.message);
 }
 
-function isMissingModelError(error: unknown): boolean {
+function isMissingModelError(error: unknown, isModelSetCall = false): boolean {
   if (!(error instanceof JsonRpcError)) return false;
+  if (isModelSetCall && error.code === -32602) return true;
   return MISSING_MODEL_PATTERN.test(error.message);
 }
 

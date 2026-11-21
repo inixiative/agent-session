@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { resolve } from 'node:path';
+import { isAbsolute, resolve } from 'node:path';
 import {
   AcpSession,
   type AcpSessionConfig,
@@ -7,6 +7,7 @@ import {
   agyAcpLaunch,
   GEMINI_CLI_COMPETING_ENV,
   geminiCliAcpLaunch,
+  JsonRpcConnection,
   NativeBindingMissingError,
   NativeModelMissingError,
   nativeBindingMissing,
@@ -15,7 +16,7 @@ import {
   type ToolRequest,
   TRANSPORTS,
 } from '../src';
-import { tick } from './helpers/fake-process';
+import { fakeProcess, tick } from './helpers/fake-process';
 
 const FAKE_SERVER = resolve(import.meta.dir, 'fixtures/fake-acp-server.ts');
 const FAKE_CMD = [process.execPath, FAKE_SERVER] as const;
@@ -315,9 +316,13 @@ describe('AcpSession', () => {
     const priorGemini = process.env.GEMINI_API_KEY;
     const priorGoogle = process.env.GOOGLE_API_KEY;
     const priorCreds = process.env.GOOGLE_APPLICATION_CREDENTIALS;
+    const priorVertex = process.env.GOOGLE_GENAI_USE_VERTEXAI;
+    const priorAuthOverride = process.env.GEMINI_CLI_AUTH_OVERRIDE;
     process.env.GEMINI_API_KEY = 'secret-gemini-key';
     process.env.GOOGLE_API_KEY = 'secret-google-key';
     process.env.GOOGLE_APPLICATION_CREDENTIALS = '/tmp/sa.json';
+    process.env.GOOGLE_GENAI_USE_VERTEXAI = '1';
+    process.env.GEMINI_CLI_AUTH_OVERRIDE = 'api-key';
     try {
       const agyCfg = agyAcpLaunch({
         bin: '/usr/local/bin/agy',
@@ -404,12 +409,16 @@ describe('AcpSession', () => {
         GEMINI_API_KEY: null,
         GOOGLE_API_KEY: null,
         GOOGLE_APPLICATION_CREDENTIALS: null,
+        GOOGLE_GENAI_USE_VERTEXAI: null,
+        GEMINI_CLI_AUTH_OVERRIDE: null,
         CUSTOM_VAR: 'kept',
       });
 
       const launchSnapshot = JSON.parse((await session.send('inspect-launch')).content) as {
+        cwd: string;
         mcpServers: Array<{ name: string; type?: string }>;
       };
+      expect(isAbsolute(launchSnapshot.cwd)).toBe(true);
       expect(launchSnapshot.mcpServers.map((s) => s.name)).toEqual(['local-stdio', 'foundry-http']);
 
       // billing: 'api' preserves API keys when explicitly requested.
@@ -422,6 +431,10 @@ describe('AcpSession', () => {
       else process.env.GOOGLE_API_KEY = priorGoogle;
       if (priorCreds === undefined) delete process.env.GOOGLE_APPLICATION_CREDENTIALS;
       else process.env.GOOGLE_APPLICATION_CREDENTIALS = priorCreds;
+      if (priorVertex === undefined) delete process.env.GOOGLE_GENAI_USE_VERTEXAI;
+      else process.env.GOOGLE_GENAI_USE_VERTEXAI = priorVertex;
+      if (priorAuthOverride === undefined) delete process.env.GEMINI_CLI_AUTH_OVERRIDE;
+      else process.env.GEMINI_CLI_AUTH_OVERRIDE = priorAuthOverride;
     }
   });
 
@@ -507,5 +520,278 @@ describe('AcpSession', () => {
     expect(gateAborted).toBe(true);
     const result = await pending;
     expect(result.content).toBe('outcome:cancelled');
+  });
+
+  test('baseContext survives a rejected first-turn admission and is prepended on the first dispatched turn', async () => {
+    const session = track({ baseContext: 'STICKY BASE' });
+    await session.start();
+
+    await expect(
+      session.send('rejected turn', {
+        onAdmission: () => {
+          throw new Error('blocked');
+        },
+      }),
+    ).rejects.toBeInstanceOf(SessionTurnError);
+
+    const second = await session.send('actual first turn');
+    expect(second.content).toBe('Hello world: STICKY BASE\n\nactual first turn');
+
+    const third = await session.send('second dispatched turn');
+    expect(third.content).toBe('Hello world: second dispatched turn');
+  });
+
+  test('relative cwd is resolved to an absolute path and invalid model config option maps to NativeModelMissingError', async () => {
+    const session = track({ cwd: '.' });
+    await session.start();
+    const snap = JSON.parse((await session.send('inspect-launch')).content) as { cwd: string };
+    expect(isAbsolute(snap.cwd)).toBe(true);
+    expect(snap.cwd).toBe(resolve('.'));
+
+    const badConfigModel = track({
+      model: 'nonexistent-model',
+      env: { FAKE_ACP_MODEL_MODE: 'config_option' },
+    });
+    const events: SessionEvent[] = [];
+    badConfigModel.onEvent((e) => events.push(e));
+    await expect(badConfigModel.start()).rejects.toBeInstanceOf(NativeModelMissingError);
+    // Failed start never emitted session_start, so it must not emit session_end.
+    expect(events.some((e) => e.kind === 'session_start')).toBe(false);
+    expect(events.some((e) => e.kind === 'session_end')).toBe(false);
+  });
+
+  test('cancel/permission race: permission ask arriving during interruptNative() is cancelled even under bypassPermissions', async () => {
+    let promptId: number | undefined;
+    const fake = fakeProcess((m: Record<string, unknown>, io) => {
+      if (m.method === 'initialize') {
+        io.emit({
+          jsonrpc: '2.0',
+          id: m.id,
+          result: { protocolVersion: 1, agentCapabilities: {} },
+        });
+      } else if (m.method === 'session/new') {
+        io.emit({ jsonrpc: '2.0', id: m.id, result: { sessionId: 'race-sess' } });
+      } else if (m.method === 'session/prompt') {
+        promptId = m.id as number;
+      } else if (m.method === 'session/cancel') {
+        // Agent had a permission ask in flight right as cancel arrived.
+        io.emit({
+          jsonrpc: '2.0',
+          id: 'late-perm',
+          method: 'session/request_permission',
+          params: {
+            sessionId: 'race-sess',
+            toolCall: { toolCallId: 'tc-race', name: 'shell', rawInput: { command: 'echo hi' } },
+            options: [{ optionId: 'allow_once', name: 'Allow', kind: 'allow_once' }],
+          },
+        });
+      } else if (m.id === 'late-perm' && promptId !== undefined) {
+        io.emit({ jsonrpc: '2.0', id: promptId, result: { stopReason: 'cancelled' } });
+      }
+    });
+
+    const session = track({ permissionMode: 'bypassPermissions', spawn: () => fake.proc });
+    await session.start();
+
+    const pending = session.send('run');
+    await tick(10);
+    const outcome = await session.interruptNative({ timeoutMs: 1_000 });
+    expect(outcome).toBe('acknowledged');
+    const result = await pending;
+    expect(result.nativeOutcome).toBe('failed');
+
+    const permReply = fake.lines.find((line) => line.id === 'late-perm');
+    expect(permReply?.result).toEqual({ outcome: { outcome: 'cancelled' } });
+  });
+
+  test('foreign-session, loading-session, and idle permission requests are cancelled without calling gates or bypassPermissions', async () => {
+    let loadPromptResolve: (() => void) | undefined;
+    const fake = fakeProcess((m: Record<string, unknown>, io) => {
+      if (m.method === 'initialize') {
+        io.emit({
+          jsonrpc: '2.0',
+          id: m.id,
+          result: { protocolVersion: 1, agentCapabilities: { loadSession: true } },
+        });
+      } else if (m.method === 'session/load') {
+        // Send a permission request while session/load is still in progress.
+        io.emit({
+          jsonrpc: '2.0',
+          id: 'perm-loading',
+          method: 'session/request_permission',
+          params: {
+            sessionId: 'sess-1',
+            toolCall: { toolCallId: 'tc-load', name: 'shell' },
+            options: [{ optionId: 'allow_once', name: 'Allow', kind: 'allow_once' }],
+          },
+        });
+        loadPromptResolve = () => io.emit({ jsonrpc: '2.0', id: m.id, result: {} });
+      } else if (m.id === 'perm-loading') {
+        loadPromptResolve?.();
+      } else if (m.method === 'session/prompt') {
+        // Emit a foreign-session permission request during a real turn, then finish.
+        io.emit({
+          jsonrpc: '2.0',
+          id: 'perm-foreign',
+          method: 'session/request_permission',
+          params: {
+            sessionId: 'other-session',
+            toolCall: { toolCallId: 'tc-foreign', name: 'shell' },
+            options: [{ optionId: 'allow_once', name: 'Allow', kind: 'allow_once' }],
+          },
+        });
+        setTimeout(() => {
+          io.emit({ jsonrpc: '2.0', id: m.id, result: { stopReason: 'end_turn' } });
+        }, 15);
+      }
+    });
+
+    const events: SessionEvent[] = [];
+    const session = track({
+      externalSessionId: 'sess-1',
+      permissionMode: 'bypassPermissions',
+      spawn: () => fake.proc,
+    });
+    session.onEvent((e) => events.push(e));
+    await session.start();
+
+    // Idle permission request when no turn is in flight.
+    fake.io.emit({
+      jsonrpc: '2.0',
+      id: 'perm-idle',
+      method: 'session/request_permission',
+      params: {
+        sessionId: 'sess-1',
+        toolCall: { toolCallId: 'tc-idle', name: 'shell' },
+        options: [{ optionId: 'allow_once', name: 'Allow', kind: 'allow_once' }],
+      },
+    });
+    await tick(10);
+
+    await session.send('hello');
+
+    expect(fake.lines.find((l) => l.id === 'perm-loading')?.result).toEqual({
+      outcome: { outcome: 'cancelled' },
+    });
+    expect(fake.lines.find((l) => l.id === 'perm-idle')?.result).toEqual({
+      outcome: { outcome: 'cancelled' },
+    });
+    expect(fake.lines.find((l) => l.id === 'perm-foreign')?.result).toEqual({
+      outcome: { outcome: 'cancelled' },
+    });
+    expect(events.some((e) => e.unattributedReason === 'foreign-session')).toBe(true);
+  });
+
+  test('prewrite-v1: unsolicited session/update during pending onAdmission is unattributed and never pollutes turn evidence', async () => {
+    const fake = fakeProcess((m: Record<string, unknown>, io) => {
+      if (m.method === 'initialize') {
+        io.emit({
+          jsonrpc: '2.0',
+          id: m.id,
+          result: { protocolVersion: 1, agentCapabilities: {} },
+        });
+      } else if (m.method === 'session/new') {
+        io.emit({ jsonrpc: '2.0', id: m.id, result: { sessionId: 'prewrite-sess' } });
+      } else if (m.method === 'session/prompt') {
+        io.emit({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: 'prewrite-sess',
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: 'real answer' },
+            },
+          },
+        });
+        io.emit({ jsonrpc: '2.0', id: m.id, result: { stopReason: 'end_turn' } });
+      }
+    });
+
+    const events: SessionEvent[] = [];
+    const session = track({ spawn: () => fake.proc });
+    session.onEvent((e) => events.push(e));
+    await session.start();
+
+    const result = await session.send('hi', {
+      onAdmission: async () => {
+        // Unsolicited chunk arrives before session/prompt is written.
+        fake.io.emit({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: 'prewrite-sess',
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: 'unsolicited noise' },
+            },
+          },
+        });
+        await tick(10);
+      },
+    });
+
+    expect(result.content).toBe('real answer');
+    expect(result.content).not.toContain('unsolicited noise');
+    const unattributed = events.find((e) => e.unattributedReason === 'no-admission');
+    expect(unattributed).toBeDefined();
+  });
+
+  test('JsonRpcConnection.respond(id, undefined) emits result: null and fast exit drains buffered stdout', async () => {
+    const fake = fakeProcess((m: Record<string, unknown>, io) => {
+      if (m.method === 'ping') {
+        io.emit({ jsonrpc: '2.0', id: m.id, result: { ok: true } });
+        io.exit(0);
+      }
+    });
+    const rpc = new JsonRpcConnection(fake.proc, {
+      onRequest: (id, method) => {
+        if (method === 'notify_like') {
+          rpc.respond(id, undefined);
+          return true;
+        }
+        return false;
+      },
+    });
+
+    fake.io.emit({ jsonrpc: '2.0', id: 'r-undef', method: 'notify_like', params: {} });
+    await tick(10);
+    const reply = fake.lines.find((l) => l.id === 'r-undef');
+    expect(reply).toEqual({ jsonrpc: '2.0', id: 'r-undef', result: null });
+
+    const res = await rpc.request('ping');
+    expect(res).toEqual({ ok: true });
+  });
+
+  test('close() after kill() still awaits actual child termination', async () => {
+    let exited = false;
+    const fake = fakeProcess((m: Record<string, unknown>, io) => {
+      if (m.method === 'initialize') {
+        io.emit({
+          jsonrpc: '2.0',
+          id: m.id,
+          result: { protocolVersion: 1, agentCapabilities: {} },
+        });
+      } else if (m.method === 'session/new') {
+        io.emit({ jsonrpc: '2.0', id: m.id, result: { sessionId: 'close-after-kill' } });
+      }
+    });
+    const proc = {
+      ...fake.proc,
+      kill() {
+        setTimeout(() => {
+          exited = true;
+          fake.io.exit(0);
+        }, 60);
+      },
+    };
+    const session = track({ spawn: () => proc });
+    await session.start();
+
+    session.kill();
+    expect(exited).toBe(false);
+    await session.close();
+    expect(exited).toBe(true);
+    expect(session.alive).toBe(false);
   });
 });
