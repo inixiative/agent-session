@@ -1,6 +1,24 @@
 // @inixiative/agent-session — drive coding-agent runtimes as persistent,
 // streaming, event-captured sessions, over interchangeable transports.
 
+// The secret scratch pad (AS-009): `$$word` secrets used by reference, never read.
+export {
+  formatScratchRef,
+  isPrivatePath,
+  type PrivatePathOptions,
+  parseScratchRef,
+  privatePathDenial,
+  privatePathGate,
+  type ScratchDagger,
+  type ScratchPadSummary,
+  type ScratchRef,
+  type ScratchSource,
+  type ScratchUse,
+  SECRET_MARKER,
+  SECRET_SCRATCH_GUIDANCE,
+  SecretScratchError,
+  SecretScratchPad,
+} from '@inixiative/secret-scratch';
 // Agent Client Protocol (ACP v1 over stdio: Antigravity CLI, Gemini CLI, etc.).
 export {
   type AcpConfigOption,
@@ -16,7 +34,6 @@ export {
   type GeminiCliAcpLaunchOptions,
   geminiCliAcpLaunch,
 } from './acp-session';
-
 // Claude through the Agent SDK (caller supplies `query`; zero dependencies here).
 export {
   type ClaudeAgentSdkCanUseTool,
@@ -186,24 +203,6 @@ export {
   type SubscriptionCandidate,
   type UnknownUtilizationPolicy,
 } from './routing';
-// The secret scratch pad (AS-009): `$$word` secrets used by reference, never read.
-export {
-  formatScratchRef,
-  isPrivatePath,
-  type PrivatePathOptions,
-  parseScratchRef,
-  privatePathDenial,
-  privatePathGate,
-  type ScratchDagger,
-  type ScratchPadSummary,
-  type ScratchRef,
-  type ScratchSource,
-  type ScratchUse,
-  SECRET_MARKER,
-  SECRET_SCRATCH_GUIDANCE,
-  SecretScratchError,
-  SecretScratchPad,
-} from './secret-scratch';
 // Transports: how a session reaches its model, with declared capabilities.
 export {
   TRANSPORTS,
