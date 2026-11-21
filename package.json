@@ -16,7 +16,8 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "bun test",
-    "check": "bun run typecheck && bun run lint && bun run test",
+    "check:all": "bun run typecheck && bun run lint && bun run test",
+    "check": "inixiative-config bounded -- bun run check:all",
     "prepublishOnly": "bun run check",
     "measure:primed": "bun scripts/measure-primed.ts",
     "record:muse": "bun scripts/record-muse.ts",
@@ -45,7 +46,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.2",
-    "@inixiative/config": "^0.5.216",
+    "@inixiative/config": "^0.5.237",
     "@types/bun": "1.4.4",
     "lefthook": "2.1.9",
     "typescript": "6.0.3"
