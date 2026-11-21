@@ -108,6 +108,7 @@ describe('transport matrix', () => {
     expect(new ClaudeCodeSession({ spawn }).transport).toBe(TRANSPORTS['claude-cli']);
     expect(new CodexAppServerSession({ spawn }).transport).toBe(TRANSPORTS['codex-app-server']);
     expect(new MuseSession().transport).toBe(TRANSPORTS['muse-serve']);
+    expect(new AcpSession({ command: ['agent'], spawn }).transport).toBe(TRANSPORTS.acp);
     expect(
       new ClaudeAgentSdkSession({
         query: () => ({
@@ -122,21 +123,26 @@ describe('transport matrix', () => {
         .filter((t) => t.status === 'stub')
         .map((t) => t.kind)
         .sort(),
-    ).toEqual(['acp', 'api']);
+    ).toEqual(['api']);
     for (const [kind, d] of Object.entries(TRANSPORTS)) expect(d.kind).toBe(kind as never);
   });
 
   test('capability flags match the methods each implementation exposes', () => {
     const spawn = () => fakeProcess().proc;
-    const sessions: Record<'claude-cli' | 'codex-app-server' | 'muse-serve', HarnessSession> = {
+    const sessions: Record<
+      'claude-cli' | 'codex-app-server' | 'muse-serve' | 'acp',
+      HarnessSession
+    > = {
       'claude-cli': new ClaudeCodeSession({ spawn }),
       'codex-app-server': new CodexAppServerSession({ spawn }),
       'muse-serve': new MuseSession(),
+      acp: new AcpSession({ command: ['agent'], spawn }),
     };
     for (const [kind, session] of Object.entries(sessions)) {
       const caps = TRANSPORTS[kind as keyof typeof sessions].capabilities;
       expect(typeof session.interruptNative === 'function').toBe(caps.interrupt === 'acknowledged');
       expect(typeof session.readLimits === 'function').toBe(caps.limits.poll);
+      expect(typeof session.onToolRequest === 'function').toBe(caps.approvals === 'callback');
     }
   });
 
@@ -144,8 +150,15 @@ describe('transport matrix', () => {
     const spawn = () => fakeProcess().proc;
     expect(createSession('claude-cli', { spawn })).toBeInstanceOf(ClaudeCodeSession);
     expect(createSession('codex-app-server', { spawn })).toBeInstanceOf(CodexAppServerSession);
-    expect(() => createSession('acp', { command: ['agent'] })).toThrow(TransportUnavailableError);
-    expect(() => new AcpSession({ command: ['agent'] })).toThrow('acp');
+    expect(createSession('acp', { command: ['agent'], spawn })).toBeInstanceOf(AcpSession);
+    expect(() =>
+      createSession('api', {
+        provider: 'anthropic',
+        model: 'm',
+        apiKey: 'k',
+        allowApiBilling: true,
+      }),
+    ).toThrow(TransportUnavailableError);
     expect(
       () =>
         new ApiSession({ provider: 'anthropic', model: 'm', apiKey: 'k', allowApiBilling: true }),

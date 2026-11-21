@@ -1,6 +1,22 @@
 // @inixiative/agent-session — drive coding-agent runtimes as persistent,
 // streaming, event-captured sessions, over interchangeable transports.
 
+// Agent Client Protocol (ACP v1 over stdio: Antigravity CLI, Gemini CLI, etc.).
+export {
+  type AcpConfigOption,
+  type AcpMcpServer,
+  type AcpServerCapabilities,
+  AcpSession,
+  type AcpSessionConfig,
+  type AcpSpawn,
+  AGY_COMPETING_ENV,
+  type AgyAcpLaunchOptions,
+  agyAcpLaunch,
+  GEMINI_CLI_COMPETING_ENV,
+  type GeminiCliAcpLaunchOptions,
+  geminiCliAcpLaunch,
+} from './acp-session';
+
 // Claude through the Agent SDK (caller supplies `query`; zero dependencies here).
 export {
   type ClaudeAgentSdkCanUseTool,
@@ -198,8 +214,6 @@ export {
   TransportUnavailableError,
 } from './transport';
 export {
-  AcpSession,
-  type AcpSessionConfig,
   ApiSession,
   type ApiSessionConfig,
   createSession,

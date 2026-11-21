@@ -118,7 +118,7 @@ export class SessionTurnError extends Error {
  */
 export class NativeBindingMissingError extends Error {
   constructor(
-    readonly runtime: 'claude-code' | 'codex-app-server' | 'muse',
+    readonly runtime: 'claude-code' | 'codex-app-server' | 'muse' | 'acp',
     readonly binding: string,
     message: string,
     readonly cwd?: string,
@@ -148,7 +148,7 @@ export function nativeBindingMissing(error: unknown): NativeBindingMissingError 
  */
 export class NativeModelMissingError extends Error {
   constructor(
-    readonly runtime: 'claude-code' | 'codex-app-server' | 'muse',
+    readonly runtime: 'claude-code' | 'codex-app-server' | 'muse' | 'acp',
     readonly model: string,
     message: string,
   ) {

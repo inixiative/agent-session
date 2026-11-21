@@ -230,6 +230,14 @@ export class JsonRpcConnection {
     else entry.resolve(message.result);
   }
 
+  respond(id: string | number, result: unknown): void {
+    try {
+      this._write({ jsonrpc: '2.0', id, result });
+    } catch {
+      /* closing */
+    }
+  }
+
   respondError(id: string | number, code: number, message: string): void {
     try {
       this._write({ jsonrpc: '2.0', id, error: { code, message } });

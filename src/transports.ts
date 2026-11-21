@@ -1,6 +1,7 @@
 // Construct a HarnessSession by transport kind. Switching how a model is
 // reached is a change of `kind` (a routing decision), not of calling code.
 
+import { AcpSession, type AcpSessionConfig } from './acp-session';
 import {
   ClaudeAgentSdkSession,
   type ClaudeAgentSdkSessionConfig,
@@ -16,14 +17,7 @@ import {
   TransportUnavailableError,
 } from './transport';
 
-/** Agent Client Protocol agent launched over stdio. Typed for callers; not implemented. */
-export interface AcpSessionConfig {
-  /** Agent command, e.g. ["gemini", "--experimental-acp"]. */
-  command: readonly string[];
-  cwd?: string;
-  env?: Record<string, string | undefined>;
-  timeout?: number;
-}
+export { AcpSession, type AcpSessionConfig } from './acp-session';
 
 /** Direct metered API. Requires an explicit opt-in and an explicit key; never read from the environment. */
 export interface ApiSessionConfig {
@@ -42,16 +36,6 @@ export interface TransportConfigs {
   'claude-agent-sdk': ClaudeAgentSdkSessionConfig;
   acp: AcpSessionConfig;
   api: ApiSessionConfig;
-}
-
-/** Typed stub: constructing it throws TransportUnavailableError. */
-export class AcpSession {
-  constructor(_config: AcpSessionConfig) {
-    throw new TransportUnavailableError(
-      'acp',
-      'no ACP client is implemented in this package; use claude-cli, claude-agent-sdk, codex-app-server or muse-serve',
-    );
-  }
 }
 
 /** Typed stub: constructing it throws TransportUnavailableError, even with the opt-in set. */
@@ -89,7 +73,7 @@ export function createSession<K extends TransportKind>(
     case 'claude-agent-sdk':
       return new ClaudeAgentSdkSession(config as ClaudeAgentSdkSessionConfig);
     case 'acp':
-      return new AcpSession(config as AcpSessionConfig) as unknown as HarnessSession;
+      return new AcpSession(config as AcpSessionConfig);
     case 'api':
       return new ApiSession(config as ApiSessionConfig) as unknown as HarnessSession;
     default:
