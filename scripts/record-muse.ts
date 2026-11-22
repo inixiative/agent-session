@@ -8,6 +8,7 @@
 import { mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
+import type { CommandOptions } from '@muse-code/sdk';
 import { MuseSession } from '../src';
 import { spawnMuseHost } from '../src/muse-session';
 
@@ -41,13 +42,17 @@ const session = new MuseSession({
         handler(notification);
       });
     const command = connection.command.bind(connection);
-    connection.command = async (method, params, options) => {
+    connection.command = (async (
+      method: string,
+      params: Record<string, unknown>,
+      options?: CommandOptions,
+    ) => {
       const result = await command(method, params, options);
       const type = RESULT_TYPES[method];
       // The last answer per method is the one the fixture holds.
       if (type) results.set(type, result);
       return result;
-    };
+    }) as typeof connection.command;
     return host;
   },
 });

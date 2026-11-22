@@ -7,7 +7,7 @@
       "dependencies": {
         "@inixiative/json-rules": "^3.23.0",
         "@inixiative/secret-scratch": "^0.1.0",
-        "@muse-code/sdk": "1.4.20",
+        "@muse-code/sdk": "1.4.25",
       },
       "devDependencies": {
         "@biomejs/biome": "2.5.2",
@@ -43,7 +43,7 @@
 
     "@inixiative/secret-scratch": ["@inixiative/secret-scratch@0.1.0", "", { "bin": { "secret-scratch": "dist/cli.js" } }, "sha512-JyFbAH+QNjuKWh0UTcYX5a9gm0X2k5u3JG9QSeWUf9Ght1b2HNB8Fi69T1BeAuYjBMLnxUvv2DkompVmUZZ/LQ=="],
 
-    "@muse-code/sdk": ["@muse-code/sdk@1.4.20", "", { "peerDependencies": { "@types/node": ">=20" }, "optionalPeers": ["@types/node"] }, "sha512-eEdVdqof0Ffpo8NYRipIfgsG7vldX8LNMmbXn0rTrYcK85D1HeDYV0TrNmGpVIwS5wLPcZgHXgGUX5GJ2Tb24g=="],
+    "@muse-code/sdk": ["@muse-code/sdk@1.4.25", "", { "peerDependencies": { "@types/node": ">=20" }, "optionalPeers": ["@types/node"] }, "sha512-S4SLkixE7u1AHyNAlBYBMYg4tGGl6nsvwlm7eGA1ZBIzkqpagC9uuxUs6MXnVKs2L2O/LXhKcYMkmXkxwSDxWw=="],
 
     "@types/bun": ["@types/bun@1.4.4", "", { "dependencies": { "bun-types": "1.4.4" } }, "sha512-9wkRDXUXK124pEnAutE6n/l18j+i9GC5IAHK8TmX/2nlySETmky0OU6yL5U8pW1AoKh++AN9auDCr647BfurjQ=="],
 

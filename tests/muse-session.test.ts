@@ -38,7 +38,7 @@ const open = (fake: FakeMuse, config: MuseSessionConfig = {}) => {
 const kinds = (events: readonly SessionEvent[]) => events.map((e) => e.kind);
 
 // ---------------------------------------------------------------------------
-// The live recording (muse 1.4.20, 2026-11-15, `bun scripts/record-muse.ts`): a
+// The live recording (muse 1.4.25, 2026-11-22, `bun scripts/record-muse.ts`): a
 // supervised turn that ran `echo probe-ok` (one shell stage), then
 // `curl -sI https://example.com | head -1` (two stages and a network approval). Replayed frame by frame; an approval frame
 // waits for this client's decision, as the host did.
@@ -223,7 +223,7 @@ describe('MuseSession on the recorded supervised turn', () => {
       approval: { kind: 'network', host: 'example.com', port: 443, protocol: 'https' },
     });
     expect(gated.every((g) => g.admissionId === done.admissionId)).toBe(true);
-    expect(gated[0]!.callId).toBe('call_01a1dfd68cd6762cafdb9346b8cffb32');
+    expect(gated[0]!.callId).toBe('call_01a203b2218074a6b80f12f7e72260e6');
     const decisions = fake.requests.filter((r) => r.method === 'approval/decide');
     expect(decisions.map((d) => d.params!.choiceId)).toEqual([
       'allow_once',
@@ -244,12 +244,15 @@ describe('MuseSession on the recorded supervised turn', () => {
     expect(done.rpcOutcome).toBe('resolved');
     const turnKinds = kinds(done.events).filter((k) => k !== 'native_status');
     expect(turnKinds).toEqual([
+      'text_delta',
+      'text',
       'usage',
       'tool_use',
       'tool_result',
       'usage',
       'tool_use',
       'tool_result',
+      'text_delta',
       'text_delta',
       'text',
       'usage',
@@ -258,7 +261,7 @@ describe('MuseSession on the recorded supervised turn', () => {
     const use = done.events.find((e) => e.kind === 'tool_use')!;
     expect(use).toMatchObject({
       toolName: 'bash',
-      callId: 'call_01a1dfd68cd6762cafdb9346b8cffb32',
+      callId: 'call_01a203b2218074a6b80f12f7e72260e6',
       toolInput: { command: 'echo probe-ok' },
     });
     const uses = done.events.filter((e) => e.kind === 'tool_use');
@@ -273,29 +276,29 @@ describe('MuseSession on the recorded supervised turn', () => {
     expect(done.events.filter((e) => e.unattributedReason === 'unrecognized-event')).toEqual([]);
     // Input excludes cache reads; the turn total is the sum of the three requests.
     expect(done.events.filter((e) => e.kind === 'usage').map((e) => e.tokens)).toEqual([
-      expect.objectContaining({ input: 35601, output: 382, cacheRead: 0, thinking: 190 }),
-      expect.objectContaining({ input: 36079, output: 193, cacheRead: 0, thinking: 5 }),
-      expect.objectContaining({ input: 412, output: 38, cacheRead: 35956, thinking: 17 }),
+      expect.objectContaining({ input: 35868, output: 122, cacheRead: 0, thinking: 33 }),
+      expect.objectContaining({ input: 36078, output: 131, cacheRead: 0, thinking: 51 }),
+      expect.objectContaining({ input: 605, output: 27, cacheRead: 35700, thinking: 6 }),
     ]);
     expect(done.tokens).toEqual({
-      input: 72092,
-      output: 613,
-      cacheRead: 35956,
+      input: 72551,
+      output: 280,
+      cacheRead: 35700,
       cacheWrite: 0,
-      thinking: 212,
+      thinking: 90,
     });
-    expect(session.totalTokens).toEqual({ input: 72092, output: 613 });
+    expect(session.totalTokens).toEqual({ input: 72551, output: 280 });
     expect(session.turns).toBe(1);
 
-    // usage/changed after the turn: account limits, never part of the admission.
+    // usage/changed: account limits, never part of the admission.
     await Bun.sleep(5);
     const limit = session.events.find((e) => e.kind === 'rate_limit')!;
     expect(limit.unattributedReason).toBe('account-status');
     expect(limit.limits).toMatchObject({
       runtime: 'muse',
       windows: [
-        { id: 'window', usedPercent: 64, windowMinutes: 300 },
-        { id: 'weekly', usedPercent: 29, windowMinutes: 10_080 },
+        { id: 'window', usedPercent: 12, windowMinutes: 300 },
+        { id: 'weekly', usedPercent: 34, windowMinutes: 10_080 },
       ],
     });
     expect(limit.limits?.plan).toBeUndefined();
@@ -338,7 +341,7 @@ describe('MuseSession on the recorded supervised turn', () => {
     expect(await session.readLimits()).toMatchObject({
       runtime: 'muse',
       source: 'poll',
-      windows: [{ id: 'window', usedPercent: 64, resetsAt: 1794770152000 }, { id: 'weekly' }],
+      windows: [{ id: 'window', usedPercent: 12, resetsAt: 1795374761000 }, { id: 'weekly' }],
     });
     fake.handlers['usage/read'] = () => ({});
     expect(await session.readLimits()).toBeUndefined();

@@ -22,12 +22,12 @@ export class FakeMspError {
 }
 export type Handler = (params: Params) => unknown | Promise<unknown>;
 
-export const SESSION_ID = '01a1dfd6-7675-7e03-94ee-8489e14409e8';
-export const TURN_ID = '01a1dfd6-7924-7000-86a3-cbbbab024c97';
+export const SESSION_ID = '01a203b2-10d9-7101-a693-4b9dc8039ba6';
+export const TURN_ID = '01a203b2-1456-7000-9066-af8f692e3c5d';
 
 export const INITIALIZE: MuseInitializeResult = {
-  serverInfo: { name: 'muse', version: '1.4.20' },
-  userAgent: 'muse-build/1.4.20 (serve; macos-aarch64)',
+  serverInfo: { name: 'muse', version: '1.4.25' },
+  userAgent: 'muse-build/1.4.25 (serve; macos-aarch64)',
   museHome: '/home/user/.local/share/muse',
   platformFamily: 'unix',
   platformOs: 'macos',

@@ -1,6 +1,6 @@
 {
   "name": "@inixiative/agent-session",
-  "version": "0.22.1",
+  "version": "0.22.2",
   "description": "Drive coding-agent CLIs as persistent, streaming, event-captured sessions over interchangeable transports, with primed decision sessions, subscription pools, routing, limit polling and continuity.",
   "type": "module",
   "main": "src/index.ts",
@@ -42,7 +42,7 @@
   "dependencies": {
     "@inixiative/json-rules": "^3.23.0",
     "@inixiative/secret-scratch": "^0.1.0",
-    "@muse-code/sdk": "1.4.20"
+    "@muse-code/sdk": "1.4.25"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.2",

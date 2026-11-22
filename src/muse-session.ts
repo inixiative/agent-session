@@ -45,15 +45,15 @@ import { TurnState } from './turn-state';
 // session, submits turns, answers approvals and folds the view. turn/interrupt,
 // turn/steer, session/fork, session/setApprovalMode, usage/read and
 // userInput/cancel go through the same connection's `command`, written before
-// the facade had them (1.4.14) and kept on the raw wire, whose types 1.4.20 keeps.
+// the facade had them (1.4.14) and kept on the raw wire, whose types 1.4.25 keeps.
 // Every view notification is classified into the shared SessionEvent taxonomy.
 // The Muse session id is the externalSessionId used for cold resume.
 //
-// Wire contract: Muse Code 1.4.20 / @muse-code/sdk 1.4.20 (lockstep).
+// Wire contract: Muse Code 1.4.25 / @muse-code/sdk 1.4.25 (lockstep).
 // ---------------------------------------------------------------------------
 
 /** The SDK version this session is built against; the served CLI must report the same. */
-export const MUSE_SDK_VERSION = '1.4.20';
+export const MUSE_SDK_VERSION = '1.4.25';
 
 export type MuseApprovalMode = 'allowAll' | 'promptUnmatched';
 export type MusePermissionProfile = ':ask-me' | ':read-only' | ':unrestricted';

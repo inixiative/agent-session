@@ -167,7 +167,7 @@ An account's normalised rate-limit windows, each with used percent and reset tim
 Scratch reference in-thread; †<thread>/<message>.<n> from elsewhere. *Region:* [Tool gates and secret scratch pad](tool-gates-and-secrets/knowledge.md)
 
 **MUSE_SDK_VERSION**  
-The pinned Muse SDK/CLI version (1.4.20); another host version is refused at start. *Region:* [Transports and runtime sessions](transports/knowledge.md)
+The pinned Muse SDK/CLI version (1.4.25); another host version is refused at start. *Region:* [Transports and runtime sessions](transports/knowledge.md)
 
 **musePermissions**  
 Maps a host mode to an explicit Muse permission profile; MuseSession applies it to its permissionMode config (default 'default', gated). *Region:* [Transports and runtime sessions](transports/knowledge.md)
