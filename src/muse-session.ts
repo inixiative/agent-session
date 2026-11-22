@@ -14,6 +14,7 @@ import {
 } from '@muse-code/sdk';
 import type { HostPermissionMode } from './codex-session';
 import {
+  addSessionTokens,
   type BeforeSendHook,
   type HarnessSession,
   NativeBindingMissingError,
@@ -2100,18 +2101,6 @@ function museTokens(value: unknown): SessionTokens | undefined {
 }
 
 function addTokens(total: SessionTokens | undefined, next: SessionTokens): SessionTokens {
-  if (!total) {
-    const { providerUsage: _raw, ...first } = next;
-    return first;
-  }
-  const sum = (x?: number, y?: number) =>
-    x === undefined && y === undefined ? undefined : (x ?? 0) + (y ?? 0);
-  const thinking = sum(total.thinking, next.thinking);
-  return {
-    input: total.input + next.input,
-    output: total.output + next.output,
-    cacheRead: sum(total.cacheRead, next.cacheRead),
-    cacheWrite: sum(total.cacheWrite, next.cacheWrite),
-    ...(thinking !== undefined ? { thinking } : {}),
-  };
+  const { providerUsage: _raw, ...summed } = addSessionTokens(total, next) ?? next;
+  return summed;
 }

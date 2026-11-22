@@ -56,8 +56,9 @@ describe('AcpSession', () => {
       loadSession: true,
       promptCapabilities: { image: true, audio: false, embeddedContext: true },
       mcpCapabilities: { http: true, sse: false, acp: false },
-      sessionCapabilities: { resume: false, fork: false, close: false },
+      sessionCapabilities: { resume: false, fork: false, close: false, list: false },
       systemPromptAppend: false,
+      promptSteering: false,
       agentInfo: { name: 'fake-acp', title: 'Fake ACP', version: '1.0.0' },
     });
 
@@ -1214,5 +1215,283 @@ describe('AcpSession', () => {
     expect(fake.lines.some((m: Record<string, unknown>) => m.method === 'session/close')).toBe(
       true,
     );
+  });
+
+  test('agy >= 1.5.0 steers mid-turn via concurrent session/prompt and sums token usage across prompts', async () => {
+    const prompts: Array<{ id: unknown; text: string }> = [];
+    const fake = fakeProcess((m: Record<string, unknown>, io) => {
+      if (m.method === 'initialize') {
+        io.emit({
+          jsonrpc: '2.0',
+          id: m.id,
+          result: {
+            protocolVersion: 1,
+            agentInfo: { name: 'Antigravity ACP Server', version: '1.5.14' },
+            agentCapabilities: {
+              loadSession: true,
+              sessionCapabilities: { resume: {}, close: {}, list: {} },
+              _meta: { antigravity: { systemPrompt: { append: true } } },
+            },
+          },
+        });
+      } else if (m.method === 'session/new') {
+        io.emit({ jsonrpc: '2.0', id: m.id, result: { sessionId: 'agy-steer-1' } });
+      } else if (m.method === 'session/prompt') {
+        const blocks = (m.params as { prompt: Array<{ text?: string }> }).prompt;
+        const text = blocks.map((b) => b.text ?? '').join('');
+        prompts.push({ id: m.id, text });
+        if (prompts.length === 1) {
+          io.emit({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'agy-steer-1',
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                content: { type: 'text', text: 'first-' },
+              },
+            },
+          });
+        } else if (prompts.length === 2) {
+          // Prompt #1 is superseded (cancelled) by the steer; prompt #2 finishes the turn.
+          io.emit({
+            jsonrpc: '2.0',
+            id: prompts[0]!.id,
+            result: { stopReason: 'cancelled', usage: { inputTokens: 100, outputTokens: 20 } },
+          });
+          io.emit({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'agy-steer-1',
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                content: { type: 'text', text: 'steered' },
+              },
+            },
+          });
+          io.emit({
+            jsonrpc: '2.0',
+            id: m.id,
+            result: { stopReason: 'end_turn', usage: { inputTokens: 50, outputTokens: 30 } },
+          });
+        }
+      }
+    });
+
+    const events: SessionEvent[] = [];
+    const session = track({ spawn: () => fake.proc });
+    session.onEvent((e) => events.push(e));
+    await session.start();
+    expect(session.serverCapabilities?.promptSteering).toBe(true);
+    expect(session.serverCapabilities?.sessionCapabilities.list).toBe(true);
+    // No active turn yet -> ignored.
+    expect(await session.push({ kind: 'steer', text: 'too early' })).toMatchObject({
+      outcome: 'ignored',
+    });
+
+    const turnPromise = session.send('start working');
+    while (prompts.length < 1) await Bun.sleep(5);
+
+    const pushOutcome = await session.push({ kind: 'steer', text: 'actually do B' });
+    expect(pushOutcome).toEqual({ outcome: 'steered' });
+
+    const res = await turnPromise;
+    expect(prompts.map((p) => p.text)).toEqual(['start working', 'actually do B']);
+    expect(res.nativeOutcome).toBe('completed');
+    expect(res.content).toBe('first-steered');
+    expect(res.tokens).toMatchObject({ input: 150, output: 50 });
+    expect(
+      events.some(
+        (e) => e.kind === 'native_status' && (e.raw as { type?: string })?.type === 'push-steered',
+      ),
+    ).toBe(true);
+  });
+
+  test('usage_update is not double-counted when superseded prompt #1 settles without response.usage', async () => {
+    const prompts: Array<{ id: unknown }> = [];
+    const fake = fakeProcess((m: Record<string, unknown>, io) => {
+      if (m.method === 'initialize') {
+        io.emit({
+          jsonrpc: '2.0',
+          id: m.id,
+          result: {
+            protocolVersion: 1,
+            agentInfo: { name: 'Antigravity ACP Server', version: 'v1.5.14' },
+            agentCapabilities: { _meta: { antigravity: {} } },
+          },
+        });
+      } else if (m.method === 'session/new') {
+        io.emit({ jsonrpc: '2.0', id: m.id, result: { sessionId: 'agy-usage' } });
+      } else if (m.method === 'session/prompt') {
+        prompts.push({ id: m.id });
+        if (prompts.length === 2) {
+          // Steer emits a usage_update, then prompt #1 cancels without response.usage, then prompt #2 returns response.usage.
+          io.emit({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'agy-usage',
+              update: { sessionUpdate: 'usage_update', used: 50 },
+            },
+          });
+          io.emit({ jsonrpc: '2.0', id: prompts[0]!.id, result: { stopReason: 'cancelled' } });
+          io.emit({
+            jsonrpc: '2.0',
+            id: prompts[1]!.id,
+            result: { stopReason: 'end_turn', usage: { inputTokens: 50, outputTokens: 30 } },
+          });
+        }
+      }
+    });
+
+    const session = track({ spawn: () => fake.proc });
+    await session.start();
+    expect(session.serverCapabilities?.promptSteering).toBe(true);
+    const turnPromise = session.send('go');
+    while (prompts.length < 1) await Bun.sleep(5);
+    expect(await session.push({ kind: 'steer', text: 'redirect' })).toEqual({ outcome: 'steered' });
+    const res = await turnPromise;
+    expect(res.tokens).toMatchObject({ input: 50, output: 30 });
+  });
+
+  test('prompt-steer settles cleanly when steer prompt resolves before original prompt, and surfaces steer RPC errors', async () => {
+    const prompts: Array<{ id: unknown; text: string }> = [];
+    const fake = fakeProcess((m: Record<string, unknown>, io) => {
+      if (m.method === 'initialize') {
+        io.emit({
+          jsonrpc: '2.0',
+          id: m.id,
+          result: {
+            protocolVersion: 1,
+            agentInfo: { name: 'Antigravity ACP Server', version: '1.5.0' },
+            agentCapabilities: { _meta: { antigravity: {} } },
+          },
+        });
+      } else if (m.method === 'session/new') {
+        io.emit({ jsonrpc: '2.0', id: m.id, result: { sessionId: 'agy-steer-order' } });
+      } else if (m.method === 'session/prompt') {
+        const blocks = (m.params as { prompt: Array<{ text?: string }> }).prompt;
+        prompts.push({ id: m.id, text: blocks.map((b) => b.text ?? '').join('') });
+        if (prompts.length === 2) {
+          // Out-of-order: steer (#2) resolves end_turn BEFORE original (#1) resolves cancelled.
+          io.emit({ jsonrpc: '2.0', id: prompts[1]!.id, result: { stopReason: 'end_turn' } });
+          io.emit({ jsonrpc: '2.0', id: prompts[0]!.id, result: { stopReason: 'cancelled' } });
+        } else if (prompts.length === 4) {
+          // Turn 2: steer (#4) fails with an RPC error while original (#3) resolves end_turn.
+          io.emit({
+            jsonrpc: '2.0',
+            id: prompts[3]!.id,
+            error: { code: -32000, message: 'steer rejected' },
+          });
+          io.emit({ jsonrpc: '2.0', id: prompts[2]!.id, result: { stopReason: 'end_turn' } });
+        }
+      }
+    });
+
+    const session = track({ spawn: () => fake.proc });
+    await session.start();
+
+    const t1 = session.send('one');
+    while (prompts.length < 1) await Bun.sleep(5);
+    expect(await session.push({ kind: 'steer', text: 'steer-one' })).toEqual({
+      outcome: 'steered',
+    });
+    const r1 = await t1;
+    expect(r1.nativeOutcome).toBe('completed');
+
+    const t2 = session.send('two');
+    while (prompts.length < 3) await Bun.sleep(5);
+    expect(await session.push({ kind: 'steer', text: 'steer-two' })).toEqual({
+      outcome: 'steered',
+    });
+    await expect(t2).rejects.toThrow('steer rejected');
+  });
+
+  test('agy < 1.5.0, non-Antigravity ACP agents, and steerMode=none return ignored on push()', async () => {
+    const makeAgent = (agentInfo: Record<string, string>, meta?: Record<string, unknown>) =>
+      fakeProcess((m: Record<string, unknown>, io) => {
+        if (m.method === 'initialize') {
+          io.emit({
+            jsonrpc: '2.0',
+            id: m.id,
+            result: {
+              protocolVersion: 1,
+              agentInfo,
+              agentCapabilities: { ...(meta ? { _meta: meta } : {}) },
+            },
+          });
+        } else if (m.method === 'session/new') {
+          io.emit({ jsonrpc: '2.0', id: m.id, result: { sessionId: 'no-steer' } });
+        } else if (m.method === 'session/prompt') {
+          setTimeout(() => {
+            io.emit({ jsonrpc: '2.0', id: m.id, result: { stopReason: 'end_turn' } });
+          }, 40);
+        }
+      });
+
+    // agy 1.4.9 cannot prompt-steer.
+    const oldAgy = makeAgent(
+      { name: 'Antigravity ACP Server', version: '1.4.9' },
+      { antigravity: {} },
+    );
+    const s1 = track({ spawn: () => oldAgy.proc });
+    await s1.start();
+    expect(s1.serverCapabilities?.promptSteering).toBe(false);
+    const p1 = s1.send('hi');
+    await Bun.sleep(5);
+    expect(await s1.push({ kind: 'steer', text: 'nope' })).toMatchObject({ outcome: 'ignored' });
+    await p1;
+
+    // agy 1.5.14 with steerMode: 'none' also refuses push().
+    const disabled = makeAgent(
+      { name: 'Antigravity ACP Server', version: '1.5.14' },
+      { antigravity: {} },
+    );
+    const s2 = track({ steerMode: 'none', spawn: () => disabled.proc });
+    await s2.start();
+    expect(s2.serverCapabilities?.promptSteering).toBe(true);
+    const p2 = s2.send('hi');
+    await Bun.sleep(5);
+    expect(await s2.push({ kind: 'steer', text: 'nope' })).toMatchObject({ outcome: 'ignored' });
+    await p2;
+  });
+
+  test('interruptNative cancels a steered turn cleanly and blocks further steers while cancelling', async () => {
+    const prompts: Array<{ id: unknown }> = [];
+    const fake = fakeProcess((m: Record<string, unknown>, io) => {
+      if (m.method === 'initialize') {
+        io.emit({
+          jsonrpc: '2.0',
+          id: m.id,
+          result: {
+            protocolVersion: 1,
+            agentInfo: { name: 'Antigravity ACP Server', version: '1.5.14' },
+            agentCapabilities: { _meta: { antigravity: {} } },
+          },
+        });
+      } else if (m.method === 'session/new') {
+        io.emit({ jsonrpc: '2.0', id: m.id, result: { sessionId: 'agy-cancel' } });
+      } else if (m.method === 'session/prompt') {
+        prompts.push({ id: m.id });
+      } else if (m.method === 'session/cancel') {
+        for (const p of prompts.splice(0))
+          io.emit({ jsonrpc: '2.0', id: p.id, result: { stopReason: 'cancelled' } });
+      }
+    });
+
+    const session = track({ spawn: () => fake.proc });
+    await session.start();
+    const turnPromise = session.send('work');
+    while (prompts.length < 1) await Bun.sleep(5);
+    expect(await session.push({ kind: 'steer', text: 'change course' })).toEqual({
+      outcome: 'steered',
+    });
+    while (prompts.length < 2) await Bun.sleep(5);
+    const outcome = await session.interruptNative();
+    expect(outcome).toBe('acknowledged');
+    const res = await turnPromise;
+    expect(res.nativeOutcome).toBe('failed');
+    expect(res.terminal).toEqual({ type: 'session/prompt', subtype: 'cancelled' });
   });
 });

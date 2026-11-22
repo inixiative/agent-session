@@ -249,6 +249,28 @@ export interface SessionTokens {
   providerUsage?: Readonly<Record<string, unknown>>;
 }
 
+const SESSION_TOKEN_KEYS = [
+  'input',
+  'output',
+  'cacheRead',
+  'cacheWrite',
+  'cacheWrite5m',
+  'cacheWrite1h',
+  'thinking',
+] as const;
+
+/** Sum two token snapshots for one turn (e.g. across steered prompts). Provider usage is the latest snapshot's. */
+export function addSessionTokens(
+  a: SessionTokens | undefined,
+  b: SessionTokens | undefined,
+): SessionTokens | undefined {
+  if (!a || !b) return b ?? a;
+  const sum: SessionTokens = { ...b };
+  for (const key of SESSION_TOKEN_KEYS)
+    if (a[key] !== undefined || b[key] !== undefined) sum[key] = (a[key] ?? 0) + (b[key] ?? 0);
+  return sum;
+}
+
 export interface SessionEvent extends SessionIdentity {
   /**
    * Session-history evidence excluded from admission results and state transitions.

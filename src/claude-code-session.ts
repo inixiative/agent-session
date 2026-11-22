@@ -1,6 +1,7 @@
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { addSessionTokens } from './harness-session';
 import {
   claudeRateLimitSnapshot,
   claudeUsageSnapshot,
@@ -269,26 +270,8 @@ export type SteerState =
   | 'unconfirmed';
 const STEER_ACK_MS = 10_000;
 
-const TOKEN_KEYS = [
-  'input',
-  'output',
-  'cacheRead',
-  'cacheWrite',
-  'cacheWrite5m',
-  'cacheWrite1h',
-  'thinking',
-] as const;
 /** One turn's usage over several results (a steer answered after a result). Provider usage is the last result's. */
-const addTokens = (
-  a: SessionTokens | undefined,
-  b: SessionTokens | undefined,
-): SessionTokens | undefined => {
-  if (!a || !b) return b ?? a;
-  const sum: SessionTokens = { ...b };
-  for (const key of TOKEN_KEYS)
-    if (a[key] !== undefined || b[key] !== undefined) sum[key] = (a[key] ?? 0) + (b[key] ?? 0);
-  return sum;
-};
+const addTokens = addSessionTokens;
 
 // ---------------------------------------------------------------------------
 // Session

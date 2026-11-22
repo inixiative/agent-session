@@ -1,6 +1,7 @@
 import { resolve } from 'node:path';
 import type { HostPermissionMode, PipedSubprocess } from './codex-session';
 import {
+  addSessionTokens,
   type BeforeSendHook,
   type HarnessSession,
   NativeBindingMissingError,
@@ -109,9 +110,12 @@ export interface AcpServerCapabilities {
     readonly resume: boolean;
     readonly fork: boolean;
     readonly close: boolean;
+    readonly list: boolean;
   };
   /** Agent supports `_meta.antigravity.systemPrompt.append` on session create/resume/load. */
   readonly systemPromptAppend: boolean;
+  /** Agent supports mid-turn steering via concurrent `session/prompt` (e.g. `agy acp` >= 1.5.0). */
+  readonly promptSteering: boolean;
   readonly agentInfo?: {
     readonly name: string;
     readonly title?: string;
@@ -162,6 +166,12 @@ export interface AcpSessionConfig {
    * `session/load`).
    */
   resumeMethod?: 'resume' | 'load';
+  /**
+   * How `push()` steers an active turn. `'auto'` (default) enables concurrent `session/prompt`
+   * steering when the agent advertises Antigravity >= 1.5.0; `'prompt'` always steers with
+   * `session/prompt`; `'none'` disables mid-turn steering.
+   */
+  steerMode?: 'auto' | 'prompt' | 'none';
   /** MCP servers passed to `session/new` / `session/load`, filtered by the agent's advertised `mcpCapabilities`. */
   mcpServers?: readonly AcpMcpServer[];
   /** Persist the returned native `sessionId` before the session becomes live; a rejection aborts `start()`. */
@@ -276,6 +286,12 @@ interface QueuedTurn {
   images: readonly SessionImage[];
   timeout: number;
   cancelling?: boolean;
+  pendingPrompts: number;
+  promptSeq: number;
+  latestSettledSeq: number;
+  latestResponse?: Record<string, unknown>;
+  latestError?: Error;
+  accumulatedTokens?: SessionTokens;
   resolve: (result: SessionResult) => void;
   reject: (error: Error) => void;
 }
@@ -327,6 +343,7 @@ export class AcpSession implements HarnessSession {
   private readonly _permissionMode: HostPermissionMode;
   private readonly _baseContext?: string;
   private readonly _resumeMethod: 'resume' | 'load';
+  private readonly _steerMode: 'auto' | 'prompt' | 'none';
   private readonly _mcpServers: readonly AcpMcpServer[];
   private readonly _onSessionReady?: (sessionId: string) => void | Promise<void>;
   private readonly _spawn?: AcpSpawn;
@@ -384,6 +401,7 @@ export class AcpSession implements HarnessSession {
     this._baseContext = config.baseContext;
     this._externalSessionId = config.externalSessionId;
     this._resumeMethod = config.resumeMethod ?? 'resume';
+    this._steerMode = config.steerMode ?? 'auto';
     this._mcpServers = config.mcpServers ? [...config.mcpServers] : [];
     this._onSessionReady = config.onSessionReady;
     this._spawn = config.spawn;
@@ -463,15 +481,51 @@ export class AcpSession implements HarnessSession {
     throw new Error('ACP session fork is not implemented');
   }
 
+  private _canPromptSteer(): boolean {
+    if (this._steerMode === 'none') return false;
+    if (this._steerMode === 'prompt') return true;
+    return this._capabilities?.promptSteering === true;
+  }
+
+  /**
+   * Mid-turn steer via a concurrent `session/prompt` (supported by `agy acp` >= 1.5.0).
+   * Non-steering ACP agents (e.g. Gemini CLI, `agy` < 1.5.0) return `{ outcome: 'ignored', reason }`
+   * so callers can queue the message for the next turn.
+   */
   async push(payload: { kind: string; text: string }): Promise<PushOutcome> {
-    const reason = 'ACP transport does not support mid-turn steering';
+    const ignored = (reason: string): PushOutcome => {
+      this._emit({
+        kind: 'error',
+        timestamp: Date.now(),
+        text: `push_ignored: kind=${payload.kind} — ${reason}`,
+        raw: { kind: payload.kind },
+      });
+      return { outcome: 'ignored', reason };
+    };
+    const rpc = this._rpc;
+    const sessionId = this._externalSessionId;
+    if (!this._alive || !rpc || rpc.closed || !sessionId) return ignored('session is not running');
+    if (!this._canPromptSteer()) return ignored('ACP agent does not support mid-turn steering');
+    const turn = this._inflight;
+    if (
+      !turn ||
+      turn.evidence.dispatch !== 'attempted' ||
+      turn.evidence.localOutcome !== 'pending' ||
+      turn.evidence.nativeOutcome !== 'unknown'
+    )
+      return ignored('no owned in-flight turn');
+    if (turn.cancelling) return ignored('turn is cancelling');
+
+    const seq = this._sendPromptRpc(turn, [{ type: 'text', text: payload.text }]);
+    this._armTimer(turn);
     this._emit({
-      kind: 'error',
+      ...turn.evidence.identity,
+      admissionId: turn.evidence.admissionId,
+      kind: 'native_status',
       timestamp: Date.now(),
-      text: `push_ignored: kind=${payload.kind} — ${reason}`,
-      raw: { kind: payload.kind },
+      raw: { type: 'push-steered', kind: payload.kind, promptSeq: seq },
     });
-    return { outcome: 'ignored', reason };
+    return { outcome: 'steered' };
   }
 
   // ---------------------------------------------------------------------------
@@ -829,6 +883,9 @@ export class AcpSession implements HarnessSession {
         message: transformed,
         images,
         timeout,
+        pendingPrompts: 0,
+        promptSeq: 0,
+        latestSettledSeq: 0,
         resolve,
         reject,
         onAdmission: opts?.onAdmission,
@@ -906,31 +963,90 @@ export class AcpSession implements HarnessSession {
       })),
     ];
 
+    this._armTimer(turn);
+    this._sendPromptRpc(turn, prompt);
+  }
+
+  private _armTimer(turn: QueuedTurn): void {
+    this._clearTimer();
     if (turn.timeout > 0) {
       this._turnTimer = setTimeout(() => {
         this._turnTimer = null;
         this._rejectInflight(new Error(`Turn timed out after ${turn.timeout}ms`), 'timeout');
       }, turn.timeout);
     }
+  }
 
+  private _sendPromptRpc(turn: QueuedTurn, prompt: Array<Record<string, unknown>>): number {
+    const rpc = this._rpc;
+    const sessionId = this._externalSessionId;
+    const seq = ++turn.promptSeq;
+    turn.pendingPrompts++;
+    if (!rpc || !sessionId) {
+      turn.pendingPrompts--;
+      return seq;
+    }
     rpc
       .request('session/prompt', { sessionId, prompt })
       .then((raw) => {
-        this._finishTurnResponse(turn, raw);
+        this._onPromptResolved(turn, seq, raw);
       })
       .catch((error: unknown) => {
-        this._failTurnResponse(turn, error instanceof Error ? error : new Error(String(error)));
+        this._onPromptRejected(
+          turn,
+          seq,
+          error instanceof Error ? error : new Error(String(error)),
+        );
       });
+    return seq;
   }
 
-  private _finishTurnResponse(turn: QueuedTurn, raw: unknown): void {
-    const a = turn.evidence;
+  private _onPromptResolved(turn: QueuedTurn, seq: number, raw: unknown): void {
     const response = object(raw) ?? {};
+    const promptTokens = acpTokens(response.usage);
+    turn.accumulatedTokens = addSessionTokens(turn.accumulatedTokens, promptTokens);
+    if (seq >= turn.latestSettledSeq) {
+      turn.latestSettledSeq = seq;
+      turn.latestResponse = response;
+      turn.latestError = undefined;
+    }
+    turn.pendingPrompts = Math.max(0, turn.pendingPrompts - 1);
+    if (turn.pendingPrompts > 0) return;
+    const finalTokens = turn.accumulatedTokens ?? this._turnUsage;
+    this._turnUsage = undefined;
+    if (turn.latestError) this._failTurnResponse(turn, turn.latestError);
+    else this._finishTurnResponse(turn, turn.latestResponse ?? {}, finalTokens);
+  }
+
+  private _onPromptRejected(turn: QueuedTurn, seq: number, error: Error): void {
+    turn.pendingPrompts = Math.max(0, turn.pendingPrompts - 1);
+    if (!(error instanceof JsonRpcError)) {
+      this._turnUsage = undefined;
+      this._failTurnResponse(turn, error);
+      return;
+    }
+    if (seq >= turn.latestSettledSeq) {
+      turn.latestSettledSeq = seq;
+      turn.latestError = error;
+      turn.latestResponse = undefined;
+    }
+    if (turn.pendingPrompts > 0) return;
+    const finalTokens = turn.accumulatedTokens ?? this._turnUsage;
+    this._turnUsage = undefined;
+    if (turn.latestError) this._failTurnResponse(turn, turn.latestError);
+    else this._finishTurnResponse(turn, turn.latestResponse ?? {}, finalTokens);
+  }
+
+  private _finishTurnResponse(
+    turn: QueuedTurn,
+    response: Record<string, unknown>,
+    tokens: SessionTokens | undefined,
+  ): void {
+    const a = turn.evidence;
     const stopReason = str(response.stopReason);
     // Strict allowlist matching Claude/Codex/Muse: only explicit `end_turn` is a completed turn.
     const nativeOutcome = stopReason === 'end_turn' ? 'completed' : 'failed';
     const terminal = { type: 'session/prompt', subtype: stopReason ?? 'missing' } as const;
-    const tokens = acpTokens(response.usage) ?? this._turnUsage;
 
     a.rpcOutcome = 'resolved';
     a.nativeOutcome = nativeOutcome;
@@ -1724,6 +1840,28 @@ function resolveAcpToolName(
   return explicitName ?? prevName ?? str(update?.title) ?? str(update?.kind) ?? 'tool';
 }
 
+const PROMPT_STEERING_MIN_VERSION = [1, 5, 0] as const;
+
+function isAntigravityPromptSteering(
+  antigravityMeta: Record<string, unknown> | undefined,
+  agentName: string | undefined,
+  agentVersion: string | undefined,
+): boolean {
+  const isAntigravity =
+    antigravityMeta !== undefined ||
+    (agentName !== undefined && agentName.toLowerCase().includes('antigravity'));
+  if (!isAntigravity || !agentVersion) return false;
+  const match = /^v?(\d+)\.(\d+)\.(\d+)/i.exec(agentVersion.trim());
+  if (!match) return false;
+  const parsed = [Number(match[1]), Number(match[2]), Number(match[3])];
+  for (let i = 0; i < 3; i++) {
+    const left = parsed[i] ?? 0;
+    const right = PROMPT_STEERING_MIN_VERSION[i] ?? 0;
+    if (left !== right) return left > right;
+  }
+  return true;
+}
+
 function parseCapabilities(raw: unknown): AcpServerCapabilities {
   const res = object(raw);
   const caps = object(res?.agentCapabilities);
@@ -1734,6 +1872,7 @@ function parseCapabilities(raw: unknown): AcpServerCapabilities {
   const systemPromptMeta = object(antigravityMeta?.systemPrompt);
   const info = object(res?.agentInfo);
   const name = str(info?.name);
+  const version = str(info?.version);
   return Object.freeze({
     loadSession: caps?.loadSession === true,
     promptCapabilities: Object.freeze({
@@ -1750,14 +1889,16 @@ function parseCapabilities(raw: unknown): AcpServerCapabilities {
       resume: session?.resume !== undefined && session.resume !== null && session.resume !== false,
       fork: session?.fork !== undefined && session.fork !== null && session.fork !== false,
       close: session?.close !== undefined && session.close !== null && session.close !== false,
+      list: session?.list !== undefined && session.list !== null && session.list !== false,
     }),
     systemPromptAppend: systemPromptMeta?.append === true,
+    promptSteering: isAntigravityPromptSteering(antigravityMeta, name, version),
     ...(name
       ? {
           agentInfo: Object.freeze({
             name,
             ...(str(info?.title) ? { title: str(info?.title) } : {}),
-            ...(str(info?.version) ? { version: str(info?.version) } : {}),
+            ...(version ? { version } : {}),
           }),
         }
       : {}),
