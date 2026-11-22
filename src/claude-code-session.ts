@@ -97,6 +97,11 @@ export interface ClaudeCodeSessionConfig {
    * Omitted → the CLI's default effort. Recorded per run for comparability.
    */
   effort?: string;
+  /**
+   * Claude Code fast mode (`--settings '{"fastMode":true|false}'`).
+   * Omitted → leaves Claude Code's own user settings and model default untouched.
+   */
+  fastMode?: boolean;
   /** Working directory for the session. */
   cwd?: string;
   /** Max agentic turns per message. Defaults to 25. */
@@ -468,6 +473,7 @@ export class ClaudeCodeSession implements HarnessSession {
   private _bin: string;
   private _model: string;
   private _effort?: string;
+  private _fastMode?: boolean;
   private _cwd: string;
   readonly admissionProtocol = 'prewrite-v1' as const;
   readonly turnBudgetProtocol = 'optional-max-turns-v1' as const;
@@ -586,6 +592,7 @@ export class ClaudeCodeSession implements HarnessSession {
     this._bin = bin;
     this._model = config?.model ?? 'sonnet';
     this._effort = config?.effort;
+    this._fastMode = config?.fastMode;
     this._cwd = config?.cwd ?? process.cwd();
     // Undefined retains standalone legacy behavior; null explicitly omits the CLI cap.
     if (
@@ -1084,6 +1091,7 @@ export class ClaudeCodeSession implements HarnessSession {
       bin: this._bin,
       model: this._model,
       effort: this._effort,
+      ...(this._fastMode !== undefined ? { fastMode: this._fastMode } : {}),
       cwd: opts?.cwd ?? this._cwd,
       maxTurns: this._maxTurns,
       permissionMode: this._permissionMode,
@@ -2303,6 +2311,9 @@ export class ClaudeCodeSession implements HarnessSession {
       '--model',
       this._model,
       ...(this._effort ? ['--effort', this._effort] : []),
+      ...(this._fastMode !== undefined
+        ? ['--settings', JSON.stringify({ fastMode: this._fastMode })]
+        : []),
       ...(this._maxTurns === null ? [] : ['--max-turns', String(this._maxTurns)]),
       '--permission-mode',
       this._permissionMode,

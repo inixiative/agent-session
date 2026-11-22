@@ -117,6 +117,11 @@ export interface CodexSessionConfig {
    * minimal|low|medium|high|xhigh. Omitted → codex's default. Recorded per run.
    */
   effort?: string;
+  /**
+   * Codex service tier (e.g. `"default"`, `"fast"`, `"priority"`, `"flex"`, `"ultrafast"`).
+   * Passed on `thread/start`, `thread/resume`, and `turn/start`. Omitted → Codex's default.
+   */
+  serviceTier?: string;
   /** Working directory for the session. */
   cwd?: string;
   /** Default per-send timeout in ms. Defaults to 600000 (10 min). */
@@ -156,6 +161,8 @@ interface QueuedTurn {
   reject: (error: Error) => void;
   /** The turn's error message when Codex tagged it `modelNotFound`: the model is not served. */
   modelMissing?: string;
+  /** The turn's error message when Codex rejected encrypted history on a resumed thread. */
+  bindingMissing?: string;
 }
 
 // codex reasoning-effort levels (model_reasoning_effort), low→high.
@@ -173,6 +180,7 @@ export class CodexAppServerSession implements HarnessSession {
   private _bin: string;
   private _model: string;
   private _effort?: string;
+  private _serviceTier?: string;
   private _cwd: string;
   private _defaultTimeout: number;
   private _baseContext?: string;
@@ -227,6 +235,7 @@ export class CodexAppServerSession implements HarnessSession {
     this._bin = bin;
     this._model = config?.model ?? 'gpt-5.5';
     this._effort = config?.effort;
+    this._serviceTier = config?.serviceTier;
     this._cwd = config?.cwd ?? process.cwd();
     this._defaultTimeout = config?.timeout ?? 600_000;
     this._baseContext = config?.baseContext;
@@ -579,9 +588,22 @@ export class CodexAppServerSession implements HarnessSession {
     a.content = this._resultText;
     a.tokens = tokens ?? a.tokens;
     const missing = a.nativeOutcome === 'failed' ? this._inflight.modelMissing : undefined;
+    const brokenBinding = a.nativeOutcome === 'failed' ? this._inflight.bindingMissing : undefined;
     if (a.localOutcome === 'pending' && missing)
       this._inflight.reject(
         a.fail(new NativeModelMissingError('codex-app-server', this._model, missing), undefined),
+      );
+    else if (a.localOutcome === 'pending' && brokenBinding && this._externalSessionId)
+      this._inflight.reject(
+        a.fail(
+          new NativeBindingMissingError(
+            'codex-app-server',
+            this._externalSessionId,
+            brokenBinding,
+            this._cwd,
+          ),
+          undefined,
+        ),
       );
     else if (a.localOutcome === 'pending') {
       a.localOutcome = 'resolved';
@@ -1241,6 +1263,7 @@ export class CodexAppServerSession implements HarnessSession {
           // Approvals go to the gates, never to a config-selected reviewer (auto_review, guardian).
           ...(this._gated ? { approvalsReviewer: 'user' } : {}),
           sandbox: this._sandbox,
+          ...(this._serviceTier ? { serviceTier: this._serviceTier } : {}),
           ...(this._options.config ? { config: this._options.config } : {}),
         });
       } catch (error) {
@@ -1339,6 +1362,9 @@ export class CodexAppServerSession implements HarnessSession {
           VALID_EFFORTS.includes(String(response?.reasoningEffort))
             ? { reasoningEffort: response?.reasoningEffort }
             : {}),
+          ...(typeof response?.serviceTier === 'string' || response?.serviceTier === null
+            ? { serviceTier: response.serviceTier }
+            : {}),
           history: {
             source: method,
             turns: Array.isArray(thread?.turns)
@@ -1384,6 +1410,7 @@ export class CodexAppServerSession implements HarnessSession {
         })),
       ],
       ...(this._effort ? { effort: this._effort } : {}),
+      ...(this._serviceTier ? { serviceTier: this._serviceTier } : {}),
     });
     await completed; // Native terminal and RPC acknowledgment are both required.
     return a.tokens;
@@ -1492,8 +1519,12 @@ export class CodexAppServerSession implements HarnessSession {
       if (turn.error != null && typeof error?.message !== 'string')
         return unowned('unrecognized-event');
       this._seenTerminals.add(turnId);
+      const rawReason = error ? (error.message as string) : undefined;
+      const encryptedHistoryError = rawReason ? codexEncryptedHistoryError(rawReason) : undefined;
       if (error?.codexErrorInfo === 'modelNotFound' && this._inflight)
-        this._inflight.modelMissing = error.message as string;
+        this._inflight.modelMissing = rawReason;
+      else if (encryptedHistoryError && this._inflight)
+        this._inflight.bindingMissing = encryptedHistoryError;
       this._fileChanges.clear();
       this._turnDone?.();
       this._turnDone = undefined;
@@ -1508,7 +1539,7 @@ export class CodexAppServerSession implements HarnessSession {
             type: method,
             turnId,
             subtype: turn.status,
-            ...(error ? { reason: error.message as string } : {}),
+            ...(error ? { reason: encryptedHistoryError ?? rawReason } : {}),
           },
         },
       ];
@@ -1776,6 +1807,32 @@ const object = (value: unknown): Record<string, unknown> | undefined =>
   value !== null && typeof value === 'object' && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : undefined;
+
+/**
+ * Codex wraps OpenAI encrypted-history rejections in a generic turn error JSON body that can carry
+ * sensitive headers (`x-codex-turn-state`). Detect the code and return a safe message so the caller
+ * drops the broken binding and starts fresh without leaking headers.
+ */
+function codexEncryptedHistoryError(message: string): string | undefined {
+  if (!message.includes('invalid_encrypted_content')) return undefined;
+  const safe = 'Encrypted conversation history could not be decrypted or parsed.';
+  const tryJson = (text: string): boolean => {
+    try {
+      const parsed = object(JSON.parse(text));
+      const inner = object(parsed?.error);
+      return (
+        inner?.code === 'invalid_encrypted_content' || parsed?.code === 'invalid_encrypted_content'
+      );
+    } catch {
+      return false;
+    }
+  };
+  if (tryJson(message)) return safe;
+  const brace = message.indexOf('{');
+  if (brace > 0 && tryJson(message.slice(brace))) return safe;
+  if (/"code"\s*:\s*"invalid_encrypted_content"/.test(message)) return safe;
+  return undefined;
+}
 
 /** A fileChange item's change as a file-change gate sees it (`toolInput.changes`). */
 export interface CodexFileChange {

@@ -513,6 +513,14 @@ describe('Agent SDK transport', () => {
         'no-chrome': null,
       },
     });
+    expect(
+      sdkOptionsFromArgv([
+        '--settings',
+        '{"fastMode":true}',
+        '--settings',
+        '{"disableAllHooks":true}',
+      ]).settings,
+    ).toEqual({ fastMode: true, disableAllHooks: true });
   });
 
   function sdkDouble() {

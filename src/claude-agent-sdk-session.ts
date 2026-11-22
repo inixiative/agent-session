@@ -110,6 +110,20 @@ export function sdkOptionsFromArgv(argv: readonly string[]): Record<string, unkn
         options.mcpServers = parsed.mcpServers ?? {};
         break;
       }
+      case '--settings': {
+        const raw = value();
+        if (raw.trimStart().startsWith('{')) {
+          const parsed = JSON.parse(raw) as Record<string, unknown>;
+          const prev =
+            options.settings && typeof options.settings === 'object'
+              ? (options.settings as Record<string, unknown>)
+              : {};
+          options.settings = { ...prev, ...parsed };
+        } else {
+          extraArgs.settings = raw;
+        }
+        break;
+      }
       case '--tools': {
         // `--tools ""` (text-only) is an empty list; the SDK spells that `tools: []`.
         const list = argv[i + 1] !== undefined && !argv[i + 1]!.startsWith('--') ? value() : '';

@@ -35,6 +35,10 @@ export interface JsonRpcHandlers {
     method: string,
     params: Record<string, unknown> | undefined,
   ): boolean;
+  /** Non-empty stdout line that was not valid JSON (e.g. a CLI auth prompt). */
+  onNonJsonLine?(line: string): void;
+  /** Complete stderr line emitted by the child process. */
+  onStderrLine?(line: string): void;
   onClose?(error: Error): void;
 }
 
@@ -176,14 +180,38 @@ export class JsonRpcConnection {
   private async _readStderr(): Promise<void> {
     const reader = this._proc.stderr.getReader();
     const decoder = new TextDecoder();
+    let buffer = '';
     try {
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        this._stderr = (this._stderr + decoder.decode(value, { stream: true })).slice(-8_192);
+        const text = decoder.decode(value, { stream: true });
+        this._stderr = (this._stderr + text).slice(-8_192);
+        if (this._handlers.onStderrLine) {
+          buffer += text;
+          const lines = buffer.split('\n');
+          buffer = lines.pop()!;
+          // Guard against unbounded growth on carriage-return progress output with no newlines.
+          if (buffer.length > 16_384) buffer = buffer.slice(-16_384);
+          for (const line of lines) this._stderrLine(line);
+        }
+      }
+      if (this._handlers.onStderrLine) {
+        const tail = buffer + decoder.decode();
+        if (tail) this._stderrLine(tail);
       }
     } catch {
       /* diagnostics only */
+    }
+  }
+
+  private _stderrLine(line: string): void {
+    const trimmed = line.replace(/\r$/, '');
+    if (!trimmed) return;
+    try {
+      this._handlers.onStderrLine?.(trimmed);
+    } catch {
+      /* observer */
     }
   }
 
@@ -193,6 +221,11 @@ export class JsonRpcConnection {
     try {
       message = object(JSON.parse(line));
     } catch {
+      try {
+        this._handlers.onNonJsonLine?.(line.replace(/\r$/, ''));
+      } catch {
+        /* observer */
+      }
       return;
     }
     if (!message) return;

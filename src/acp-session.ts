@@ -45,24 +45,38 @@ const MISSING_SESSION_PATTERN =
   /session\s+(?:id\s+)?not\s+found|unknown\s+session|no\s+such\s+session|session\s+does\s+not\s+exist/i;
 const MISSING_MODEL_PATTERN =
   /model\s+(?:id\s+)?['"`]?[\w.:/-]*['"`]?\s+(?:not\s+found|does\s+not\s+exist|is\s+not\s+(?:supported|available))|unknown\s+model|invalid\s+model|model_not_found|invalid\s+value.*(?:config\s+option\s+)?['"`]?model['"`]?/i;
+const ANTIGRAVITY_AUTH_URL_PREFIX = 'Open the following link to authenticate the ACP server: ';
+const ANTIGRAVITY_NO_BROWSER_PREFIX = 'No browser is available here';
+const AUTH_ERROR_PATTERN = /auth|sign[\s-]?in|log[\s-]?in|unauthenticated|credential/i;
 
 /**
- * Inherited env vars that would override Antigravity subscription auth with a
- * metered API key, service account, Vertex AI, or auth override. Stripped by default in `agyAcpLaunch`.
+ * Inherited env vars that would override Gemini CLI OAuth/Google login with a
+ * metered API key, service account, or GCP project. Stripped by default in `geminiCliAcpLaunch`.
  */
-export const AGY_COMPETING_ENV: readonly string[] = Object.freeze([
+export const GEMINI_CLI_COMPETING_ENV: readonly string[] = Object.freeze([
   'GEMINI_API_KEY',
   'GOOGLE_API_KEY',
   'GOOGLE_APPLICATION_CREDENTIALS',
   'GOOGLE_GENAI_USE_VERTEXAI',
   'GEMINI_CLI_AUTH_OVERRIDE',
+  'GOOGLE_CLOUD_PROJECT',
+  'GOOGLE_CLOUD_LOCATION',
+  'GOOGLE_CLOUD_QUOTA_PROJECT',
+  'GCLOUD_PROJECT',
+  'CLOUDSDK_CORE_PROJECT',
 ]);
 
 /**
- * Inherited env vars that would override Gemini CLI OAuth/Google login with a
- * metered API key or service account. Stripped by default in `geminiCliAcpLaunch`.
+ * Inherited env vars that would override Antigravity subscription auth with a
+ * metered API key, service account, GCP project, Vertex AI, or auth override.
+ * Stripped by default in `agyAcpLaunch`.
  */
-export const GEMINI_CLI_COMPETING_ENV: readonly string[] = AGY_COMPETING_ENV;
+export const AGY_COMPETING_ENV: readonly string[] = Object.freeze([
+  ...GEMINI_CLI_COMPETING_ENV,
+  'AGY_ACP_CCPA_PROJECT',
+  'AGY_ACP_ENABLE_OAUTH',
+  'AGY_ACP_FORCE_FILE_STORAGE',
+]);
 
 export type AcpMcpServer =
   | {
@@ -96,6 +110,8 @@ export interface AcpServerCapabilities {
     readonly fork: boolean;
     readonly close: boolean;
   };
+  /** Agent supports `_meta.antigravity.systemPrompt.append` on session create/resume/load. */
+  readonly systemPromptAppend: boolean;
   readonly agentInfo?: {
     readonly name: string;
     readonly title?: string;
@@ -136,10 +152,16 @@ export interface AcpSessionConfig {
   effort?: string;
   /** Host permission mode. Under `bypassPermissions`, inbound permission asks auto-approve; otherwise they go to `onToolRequest()` gates (fail-closed when none registered). Defaults to `default`. */
   permissionMode?: HostPermissionMode;
-  /** Prepended to the first turn's text. */
+  /** Passed natively via `_meta.antigravity.systemPrompt.append` when advertised; otherwise prepended to the first turn's text. */
   baseContext?: string;
-  /** Native ACP `sessionId` to resume via `session/load` during `start()`. */
+  /** Native ACP `sessionId` to resume during `start()`. */
   externalSessionId?: string;
+  /**
+   * Which ACP resume method to try first when `externalSessionId` is set. Defaults to `'resume'`
+   * (prefers `session/resume` to avoid replaying history `AcpSession` discards, falling back to
+   * `session/load`).
+   */
+  resumeMethod?: 'resume' | 'load';
   /** MCP servers passed to `session/new` / `session/load`, filtered by the agent's advertised `mcpCapabilities`. */
   mcpServers?: readonly AcpMcpServer[];
   /** Persist the returned native `sessionId` before the session becomes live; a rejection aborts `start()`. */
@@ -160,7 +182,10 @@ type SharedLaunchOptions = Omit<AcpSessionConfig, 'command' | 'stripEnv'> & {
 };
 
 export interface AgyAcpLaunchOptions extends SharedLaunchOptions {
-  /** Override `--app-data-dir` for profile isolation. */
+  /**
+   * Override `--app-data-dir` for profile isolation.
+   * Note: `agy` joins this path beneath `--gemini-dir` even when given an absolute path.
+   */
   appDataDir?: string;
   /** Override `--gemini-dir`. */
   geminiDir?: string;
@@ -184,6 +209,7 @@ export function agyAcpLaunch(opts: AgyAcpLaunchOptions = {}): AcpSessionConfig {
     geminiDir,
     agent,
     permissionMode,
+    env,
     ...rest
   } = opts;
   const command: string[] = [bin, 'acp', '--stdio'];
@@ -196,6 +222,8 @@ export function agyAcpLaunch(opts: AgyAcpLaunchOptions = {}): AcpSessionConfig {
   return {
     ...rest,
     command,
+    // Prevent `agy` from self-updating in place mid-session, and drop inherited Electron Crashpad pipes.
+    env: { AGY_CLI_DISABLE_AUTO_UPDATE: '1', CHROME_CRASHPAD_PIPE_NAME: undefined, ...env },
     ...(permissionMode ? { permissionMode } : {}),
     ...(billing === 'subscription' ? { stripEnv: AGY_COMPETING_ENV } : {}),
   };
@@ -298,6 +326,7 @@ export class AcpSession implements HarnessSession {
   private readonly _effort?: string;
   private readonly _permissionMode: HostPermissionMode;
   private readonly _baseContext?: string;
+  private readonly _resumeMethod: 'resume' | 'load';
   private readonly _mcpServers: readonly AcpMcpServer[];
   private readonly _onSessionReady?: (sessionId: string) => void | Promise<void>;
   private readonly _spawn?: AcpSpawn;
@@ -354,6 +383,7 @@ export class AcpSession implements HarnessSession {
     this._permissionMode = config.permissionMode ?? 'default';
     this._baseContext = config.baseContext;
     this._externalSessionId = config.externalSessionId;
+    this._resumeMethod = config.resumeMethod ?? 'resume';
     this._mcpServers = config.mcpServers ? [...config.mcpServers] : [];
     this._onSessionReady = config.onSessionReady;
     this._spawn = config.spawn;
@@ -457,6 +487,21 @@ export class AcpSession implements HarnessSession {
     this._startedOnce = true;
     this._closing = false;
 
+    let failStartupAuth: ((err: Error) => void) | null = null;
+    const startupAuthFailed = new Promise<never>((_, reject) => {
+      failStartupAuth = reject;
+    });
+    // Prevent unhandled rejections if an auth line arrives after startup already settled.
+    void startupAuthFailed.catch(() => {});
+    const onAuthPromptLine = (line: string) => {
+      if (!line.startsWith(ANTIGRAVITY_AUTH_URL_PREFIX)) return;
+      failStartupAuth?.(
+        new Error(
+          'ACP agent sign-in required; authenticate the CLI (e.g. `agy acp --login`) and retry.',
+        ),
+      );
+    };
+
     const env = this._childEnv();
     const proc = this._spawn
       ? this._spawn(this._command, { cwd: this._cwd, env })
@@ -471,6 +516,8 @@ export class AcpSession implements HarnessSession {
     const rpc = new JsonRpcConnection(proc, {
       onNotification: (method, params) => this._onNotification(method, params),
       onRequest: (id, method, params) => this._onRequest(id, method, params),
+      onNonJsonLine: onAuthPromptLine,
+      onStderrLine: onAuthPromptLine,
       onClose: (error) => {
         if (this._rpc !== rpc || this._closing) return;
         this._transportFailure(error);
@@ -478,86 +525,116 @@ export class AcpSession implements HarnessSession {
     });
     this._rpc = rpc;
 
+    const startupRpc = <T>(call: Promise<T>): Promise<T> => Promise.race([call, startupAuthFailed]);
+
     try {
-      const initRaw = await rpc.request(
-        'initialize',
-        {
-          protocolVersion: ACP_PROTOCOL_VERSION,
-          clientInfo: CLIENT_INFO,
-          clientCapabilities: {},
-        },
-        this._startupTimeout,
+      const initRaw = await startupRpc(
+        rpc.request(
+          'initialize',
+          {
+            protocolVersion: ACP_PROTOCOL_VERSION,
+            clientInfo: CLIENT_INFO,
+            clientCapabilities: {},
+          },
+          this._startupTimeout,
+        ),
       );
       this._capabilities = parseCapabilities(initRaw);
 
       const mcpServers = filterMcpServers(this._mcpServers, this._capabilities.mcpCapabilities);
+      const nativeSystemPrompt =
+        this._baseContext && this._capabilities.systemPromptAppend ? this._baseContext : undefined;
+      const sessionMetaParam = nativeSystemPrompt
+        ? { _meta: { antigravity: { systemPrompt: { append: nativeSystemPrompt } } } }
+        : {};
       let sessionMeta: Record<string, unknown> | undefined;
 
       if (this._externalSessionId) {
         const binding = this._externalSessionId;
-        if (this._capabilities.loadSession) {
-          this._loadingSession = true;
-          try {
-            sessionMeta = object(
-              await rpc.request(
-                'session/load',
-                { sessionId: binding, cwd: this._cwd, mcpServers },
+        const canResume = this._capabilities.sessionCapabilities.resume;
+        const canLoad = this._capabilities.loadSession;
+        const runResume = async () =>
+          object(
+            await startupRpc(
+              rpc.request(
+                'session/resume',
+                { sessionId: binding, cwd: this._cwd, mcpServers, ...sessionMetaParam },
                 this._startupTimeout,
               ),
+            ),
+          );
+        const runLoad = async () => {
+          this._loadingSession = true;
+          try {
+            return object(
+              await startupRpc(
+                rpc.request(
+                  'session/load',
+                  { sessionId: binding, cwd: this._cwd, mcpServers, ...sessionMetaParam },
+                  this._startupTimeout,
+                ),
+              ),
             );
-          } catch (error) {
-            if (isMissingSessionError(error))
-              throw new NativeBindingMissingError(
-                'acp',
-                binding,
-                error instanceof Error ? error.message : String(error),
-                this._cwd,
-              );
-            throw error;
           } finally {
             this._loadingSession = false;
           }
-        } else if (this._capabilities.sessionCapabilities.resume) {
-          try {
-            sessionMeta = object(
-              await rpc.request(
-                'session/resume',
-                { sessionId: binding, cwd: this._cwd, mcpServers },
-                this._startupTimeout,
-              ),
+        };
+
+        try {
+          if (this._resumeMethod === 'resume' && canResume) {
+            try {
+              sessionMeta = await runResume();
+            } catch (error) {
+              if (error instanceof JsonRpcError && error.code === -32601 && canLoad)
+                sessionMeta = await runLoad();
+              else throw error;
+            }
+          } else if (canLoad) {
+            sessionMeta = await runLoad();
+          } else if (canResume) {
+            sessionMeta = await runResume();
+          } else {
+            throw new NativeBindingMissingError(
+              'acp',
+              binding,
+              'ACP agent does not advertise session/load or session/resume capability',
+              this._cwd,
             );
-          } catch (error) {
-            if (isMissingSessionError(error))
-              throw new NativeBindingMissingError(
-                'acp',
-                binding,
-                error instanceof Error ? error.message : String(error),
-                this._cwd,
-              );
-            throw error;
           }
-        } else {
-          throw new NativeBindingMissingError(
-            'acp',
-            binding,
-            'ACP agent does not advertise session/load or session/resume capability',
-            this._cwd,
-          );
+        } catch (error) {
+          if (isMissingSessionError(error))
+            throw new NativeBindingMissingError(
+              'acp',
+              binding,
+              error instanceof Error ? error.message : String(error),
+              this._cwd,
+            );
+          throw error;
         }
       } else {
         sessionMeta = object(
-          await rpc.request('session/new', { cwd: this._cwd, mcpServers }, this._startupTimeout),
+          await startupRpc(
+            rpc.request(
+              'session/new',
+              { cwd: this._cwd, mcpServers, ...sessionMetaParam },
+              this._startupTimeout,
+            ),
+          ),
         );
         const sessionId = str(sessionMeta?.sessionId);
         if (!sessionId) throw new Error('ACP session/new did not return a sessionId');
         this._externalSessionId = sessionId;
       }
 
+      if (nativeSystemPrompt) this._injectedBaseContext = true;
+
       this._applySessionState(sessionMeta);
-      await this._applyInitialModelAndEffort(rpc, this._externalSessionId, sessionMeta);
+      await startupRpc(this._applyInitialMode(rpc, this._externalSessionId, sessionMeta));
+      await startupRpc(this._applyInitialModelAndEffort(rpc, this._externalSessionId, sessionMeta));
 
       if (this._onSessionReady) await this._onSessionReady(this._externalSessionId);
 
+      failStartupAuth = null;
       this._alive = true;
       this._startEmitted = true;
       this._endEmitted = false;
@@ -574,7 +651,13 @@ export class AcpSession implements HarnessSession {
         },
       });
     } catch (error) {
-      await this.close({ graceMs: 500 });
+      failStartupAuth = null;
+      await this._beginClose(500);
+      if (isStartupSignInError(error))
+        throw new Error(
+          `ACP agent sign-in required: ${error instanceof Error ? error.message : String(error)}`,
+          { cause: error },
+        );
       throw error;
     }
   }
@@ -619,22 +702,49 @@ export class AcpSession implements HarnessSession {
     void this._beginClose(DEFAULT_CLOSE_GRACE_MS);
   }
 
-  /** Tear down the child process cleanly (SIGTERM -> SIGKILL grace) and settle any pending turn. */
+  /** Tear down the child process cleanly (best-effort session/close when idle, then SIGTERM -> SIGKILL grace). */
   async close(opts?: { graceMs?: number }): Promise<void> {
-    await this._beginClose(opts?.graceMs ?? DEFAULT_CLOSE_GRACE_MS);
+    await this._beginClose(opts?.graceMs ?? DEFAULT_CLOSE_GRACE_MS, true);
   }
 
-  private _beginClose(graceMs: number): Promise<void> {
+  private _beginClose(graceMs: number, sendSessionClose = false): Promise<void> {
     if (this._exitPromise) return this._exitPromise;
-    const teardown = this._teardown();
-    if (!teardown) return Promise.resolve();
-    const { proc, rpc } = teardown;
-    rpc.kill();
-    const exited = proc.exited.then(
-      () => true as const,
-      () => true as const,
-    );
+    if (!this._rpc || !this._proc) return Promise.resolve();
+    const rpcForClose =
+      sendSessionClose &&
+      this._alive &&
+      !this._closing &&
+      !this._inflight &&
+      this._capabilities?.sessionCapabilities.close &&
+      this._externalSessionId &&
+      this._rpc &&
+      !this._rpc.closed
+        ? { rpc: this._rpc, sessionId: this._externalSessionId }
+        : null;
+    // Flip closing/alive synchronously before any await so concurrent sends refuse, concurrent
+    // closes coalesce, and a child exiting on `session/close` never fires `_transportFailure()`.
+    if (rpcForClose) {
+      this._closing = true;
+      this._alive = false;
+    }
     const done = (async () => {
+      if (rpcForClose) {
+        await rpcForClose.rpc
+          .request(
+            'session/close',
+            { sessionId: rpcForClose.sessionId },
+            Math.min(500, Math.max(50, graceMs)),
+          )
+          .catch(() => {});
+      }
+      const teardown = this._teardown();
+      if (!teardown) return;
+      const { proc, rpc } = teardown;
+      rpc.kill();
+      const exited = proc.exited.then(
+        () => true as const,
+        () => true as const,
+      );
       let timer: ReturnType<typeof setTimeout> | undefined;
       const settled = await Promise.race([
         exited,
@@ -816,10 +926,10 @@ export class AcpSession implements HarnessSession {
   private _finishTurnResponse(turn: QueuedTurn, raw: unknown): void {
     const a = turn.evidence;
     const response = object(raw) ?? {};
-    const stopReason = str(response.stopReason) ?? 'end_turn';
-    const nativeOutcome =
-      stopReason === 'cancelled' || stopReason === 'refusal' ? 'failed' : 'completed';
-    const terminal = { type: 'session/prompt', subtype: stopReason } as const;
+    const stopReason = str(response.stopReason);
+    // Strict allowlist matching Claude/Codex/Muse: only explicit `end_turn` is a completed turn.
+    const nativeOutcome = stopReason === 'end_turn' ? 'completed' : 'failed';
+    const terminal = { type: 'session/prompt', subtype: stopReason ?? 'missing' } as const;
     const tokens = acpTokens(response.usage) ?? this._turnUsage;
 
     a.rpcOutcome = 'resolved';
@@ -978,6 +1088,82 @@ export class AcpSession implements HarnessSession {
     if (currentModeId) this._currentModeId = currentModeId;
     if (Array.isArray(meta.configOptions))
       this._configOptions = parseConfigOptions(meta.configOptions);
+    if (!this._currentModeId) {
+      const modeOpt = this._configOptions.find(
+        (opt) => (opt.category === 'mode' || opt.id === 'mode') && opt.type === 'select',
+      );
+      if (typeof modeOpt?.currentValue === 'string' && modeOpt.currentValue)
+        this._currentModeId = modeOpt.currentValue;
+    }
+  }
+
+  private _emitConfigStatus(sessionId: string, raw: Record<string, unknown>): void {
+    this._emit({
+      kind: 'native_status',
+      timestamp: Date.now(),
+      nativeSessionId: sessionId,
+      correlation: 'unknown',
+      unattributedReason: 'session-configuration',
+      raw,
+    });
+  }
+
+  private async _applyInitialMode(
+    rpc: JsonRpcConnection,
+    sessionId: string,
+    sessionMeta: Record<string, unknown> | undefined,
+  ): Promise<void> {
+    const candidates = MODE_CANDIDATES[this._permissionMode];
+    const modeOpt = this._configOptions.find(
+      (opt) => (opt.category === 'mode' || opt.id === 'mode') && opt.type === 'select',
+    );
+    const modeChoices = modeOpt?.options;
+    if (modeOpt && modeChoices?.length) {
+      const target = candidates.find((candidate) =>
+        modeChoices.some((choice) => choice.value === candidate),
+      );
+      if (target && modeOpt.currentValue !== target) {
+        try {
+          const updated = object(
+            await rpc.request(
+              'session/set_config_option',
+              { sessionId, configId: modeOpt.id, value: target },
+              this._startupTimeout,
+            ),
+          );
+          if (Array.isArray(updated?.configOptions))
+            this._configOptions = parseConfigOptions(updated.configOptions);
+          this._currentModeId = target;
+        } catch (error) {
+          if (error instanceof JsonRpcError && (error.code === -32601 || error.code === -32602)) {
+            this._emitConfigStatus(sessionId, { type: 'mode-switch-unsupported', mode: target });
+          } else {
+            throw error;
+          }
+        }
+      }
+      return;
+    }
+
+    const modes = object(sessionMeta?.modes);
+    const available = Array.isArray(modes?.availableModes)
+      ? modes.availableModes
+          .map((entry) => str(object(entry)?.id))
+          .filter((id): id is string => !!id)
+      : [];
+    if (!available.length) return;
+    const target = candidates.find((candidate) => available.includes(candidate));
+    if (!target || this._currentModeId === target) return;
+    try {
+      await rpc.request('session/set_mode', { sessionId, modeId: target }, this._startupTimeout);
+      this._currentModeId = target;
+    } catch (error) {
+      if (error instanceof JsonRpcError && (error.code === -32601 || error.code === -32602)) {
+        this._emitConfigStatus(sessionId, { type: 'mode-switch-unsupported', mode: target });
+      } else {
+        throw error;
+      }
+    }
   }
 
   private async _applyInitialModelAndEffort(
@@ -1020,13 +1206,9 @@ export class AcpSession implements HarnessSession {
           } catch (error) {
             if (error instanceof JsonRpcError && error.code === -32601) {
               // Agent does not support runtime model switching via session/set_model.
-              this._emit({
-                kind: 'native_status',
-                timestamp: Date.now(),
-                nativeSessionId: sessionId,
-                correlation: 'unknown',
-                unattributedReason: 'session-configuration',
-                raw: { type: 'model-switch-unsupported', model: this._model },
+              this._emitConfigStatus(sessionId, {
+                type: 'model-switch-unsupported',
+                model: this._model,
               });
             } else if (isMissingModelError(error, true)) {
               throw new NativeModelMissingError('acp', this._model, (error as Error).message);
@@ -1041,21 +1223,38 @@ export class AcpSession implements HarnessSession {
     if (this._effort) {
       const effortOpt = this._configOptions.find(
         (opt) =>
-          opt.category === 'thought_level' ||
-          opt.id === 'effort' ||
-          opt.id === 'thought_level' ||
-          opt.id === 'reasoning_effort',
+          opt.type === 'select' &&
+          (opt.category === 'thought_level' ||
+            opt.category === 'thinking' ||
+            opt.id === 'effort' ||
+            opt.id === 'thought_level' ||
+            opt.id === 'reasoning_effort'),
       );
       if (effortOpt && effortOpt.currentValue !== this._effort) {
-        const updated = object(
-          await rpc.request(
-            'session/set_config_option',
-            { sessionId, configId: effortOpt.id, value: this._effort },
-            this._startupTimeout,
-          ),
-        );
-        if (Array.isArray(updated?.configOptions))
-          this._configOptions = parseConfigOptions(updated.configOptions);
+        const unsupportedChoice =
+          effortOpt.options?.length &&
+          !effortOpt.options.some((choice) => choice.value === this._effort);
+        if (unsupportedChoice) {
+          this._emitConfigStatus(sessionId, { type: 'effort-unsupported', effort: this._effort });
+          return;
+        }
+        try {
+          const updated = object(
+            await rpc.request(
+              'session/set_config_option',
+              { sessionId, configId: effortOpt.id, value: this._effort },
+              this._startupTimeout,
+            ),
+          );
+          if (Array.isArray(updated?.configOptions))
+            this._configOptions = parseConfigOptions(updated.configOptions);
+        } catch (error) {
+          if (error instanceof JsonRpcError && (error.code === -32601 || error.code === -32602)) {
+            this._emitConfigStatus(sessionId, { type: 'effort-unsupported', effort: this._effort });
+          } else {
+            throw error;
+          }
+        }
       }
     }
   }
@@ -1207,8 +1406,7 @@ export class AcpSession implements HarnessSession {
   ): SessionEvent[] {
     const callId = str(update.toolCallId);
     const prev = callId ? this._turnToolCalls.get(callId) : undefined;
-    const toolName =
-      str(update.name) ?? prev?.toolName ?? str(update.title) ?? str(update.kind) ?? 'tool';
+    const toolName = resolveAcpToolName(update, prev?.toolName);
     const tracked: TrackedToolCall = prev ?? { toolName, started: false, completed: false };
     tracked.toolName = toolName;
     if (callId) this._turnToolCalls.set(callId, tracked);
@@ -1281,7 +1479,8 @@ export class AcpSession implements HarnessSession {
     const sessionId = str(params?.sessionId);
     const toolCall = object(params?.toolCall);
     const callId = str(toolCall?.toolCallId);
-    const toolName = str(toolCall?.name) ?? str(toolCall?.title) ?? str(toolCall?.kind) ?? 'tool';
+    const prevName = callId ? this._turnToolCalls.get(callId)?.toolName : undefined;
+    const toolName = resolveAcpToolName(toolCall, prevName);
     const rawInput = object(toolCall?.rawInput) ?? {};
     const options = parsePermissionOptions(params?.options);
     const allowOption =
@@ -1355,6 +1554,24 @@ export class AcpSession implements HarnessSession {
       timestamp: Date.now(),
       raw: { type: 'approval-request', toolName, ...(callId ? { callId } : {}) },
     });
+
+    // Antigravity routes native user-input questions over `session/request_permission` with
+    // `toolCallId: "interaction_*"` and `kind: "allow_once"` choices; never auto-pick an answer.
+    if (callId?.startsWith('interaction_')) {
+      rpc.respond(id, { outcome: { outcome: 'cancelled' } });
+      this._emit({
+        ...identity,
+        kind: 'native_status',
+        timestamp: Date.now(),
+        raw: {
+          type: 'approval-response',
+          toolName,
+          decision: 'cancelled',
+          reason: 'user-input-unsupported',
+        },
+      });
+      return;
+    }
 
     if (this._permissionMode === 'bypassPermissions') {
       if (allowOption) {
@@ -1485,12 +1702,36 @@ export class AcpSession implements HarnessSession {
 // Wire parsing helpers
 // ---------------------------------------------------------------------------
 
+const MODE_CANDIDATES: Readonly<Record<HostPermissionMode, readonly string[]>> = {
+  default: ['default'],
+  acceptEdits: ['acceptEdits', 'accept-edits', 'auto_edit'],
+  plan: ['plan'],
+  bypassPermissions: ['bypassPermissions', 'yolo'],
+};
+
+function resolveAcpToolName(
+  update: Record<string, unknown> | undefined,
+  prevName: string | undefined,
+): string {
+  const rawInput = object(update?.rawInput);
+  const serverName = str(rawInput?.ServerName);
+  const mcpToolName = str(rawInput?.ToolName);
+  const explicitName = str(update?.name);
+  if (serverName && mcpToolName && (!explicitName || explicitName === 'call_mcp_tool'))
+    return `mcp__${serverName}__${mcpToolName}`;
+  // Subsequent tool_call_update frames may repeat `name: "call_mcp_tool"` without rawInput; keep the resolved MCP name.
+  if (explicitName === 'call_mcp_tool' && prevName?.startsWith('mcp__')) return prevName;
+  return explicitName ?? prevName ?? str(update?.title) ?? str(update?.kind) ?? 'tool';
+}
+
 function parseCapabilities(raw: unknown): AcpServerCapabilities {
   const res = object(raw);
   const caps = object(res?.agentCapabilities);
   const prompt = object(caps?.promptCapabilities);
   const mcp = object(caps?.mcpCapabilities);
   const session = object(caps?.sessionCapabilities);
+  const antigravityMeta = object(object(caps?._meta)?.antigravity);
+  const systemPromptMeta = object(antigravityMeta?.systemPrompt);
   const info = object(res?.agentInfo);
   const name = str(info?.name);
   return Object.freeze({
@@ -1510,6 +1751,7 @@ function parseCapabilities(raw: unknown): AcpServerCapabilities {
       fork: session?.fork !== undefined && session.fork !== null && session.fork !== false,
       close: session?.close !== undefined && session.close !== null && session.close !== false,
     }),
+    systemPromptAppend: systemPromptMeta?.append === true,
     ...(name
       ? {
           agentInfo: Object.freeze({
@@ -1635,6 +1877,8 @@ function extractToolOutput(update: Record<string, unknown>): string | undefined 
   if (rawObj) {
     if (typeof rawObj.output === 'string') return rawObj.output;
     if (typeof rawObj.text === 'string') return rawObj.text;
+    if (typeof rawObj.combinedOutput === 'string') return rawObj.combinedOutput;
+    if (typeof rawObj.combined_output === 'string') return rawObj.combined_output;
     return JSON.stringify(rawObj);
   }
   return undefined;
@@ -1669,6 +1913,12 @@ function acpTokens(value: unknown): SessionTokens | undefined {
     ...(thinking !== undefined ? { thinking } : {}),
     providerUsage: usage,
   };
+}
+
+function isStartupSignInError(error: unknown): boolean {
+  if (!(error instanceof JsonRpcError)) return false;
+  if (error.code === -32000 && AUTH_ERROR_PATTERN.test(error.message)) return true;
+  return error.code === -32603 && error.message.startsWith(ANTIGRAVITY_NO_BROWSER_PREFIX);
 }
 
 function isMissingSessionError(error: unknown): boolean {

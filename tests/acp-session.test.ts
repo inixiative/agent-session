@@ -57,6 +57,7 @@ describe('AcpSession', () => {
       promptCapabilities: { image: true, audio: false, embeddedContext: true },
       mcpCapabilities: { http: true, sse: false, acp: false },
       sessionCapabilities: { resume: false, fork: false, close: false },
+      systemPromptAppend: false,
       agentInfo: { name: 'fake-acp', title: 'Fake ACP', version: '1.0.0' },
     });
 
@@ -793,5 +794,425 @@ describe('AcpSession', () => {
     await session.close();
     expect(exited).toBe(true);
     expect(session.alive).toBe(false);
+  });
+
+  test('Antigravity native systemPrompt append, session/resume preference, mode mapping, and session/close', async () => {
+    const seenMethods: string[] = [];
+    let receivedMeta: unknown;
+    let receivedPromptText = '';
+    const fake = fakeProcess((m: Record<string, unknown>, io) => {
+      seenMethods.push(String(m.method));
+      if (m.method === 'initialize') {
+        io.emit({
+          jsonrpc: '2.0',
+          id: m.id,
+          result: {
+            protocolVersion: 1,
+            agentInfo: { name: 'Antigravity ACP Server', version: '1.5.14' },
+            agentCapabilities: {
+              loadSession: true,
+              sessionCapabilities: { resume: {}, close: {} },
+              _meta: { antigravity: { systemPrompt: { append: true } } },
+            },
+          },
+        });
+      } else if (m.method === 'session/resume') {
+        receivedMeta = (m.params as Record<string, unknown>)?._meta;
+        io.emit({
+          jsonrpc: '2.0',
+          id: m.id,
+          result: {
+            modes: {
+              currentModeId: 'default',
+              availableModes: [
+                { id: 'default', name: 'Default' },
+                { id: 'accept-edits', name: 'Accept edits' },
+                { id: 'plan', name: 'Plan' },
+              ],
+            },
+            configOptions: [
+              {
+                id: 'mode',
+                name: 'Mode',
+                category: 'mode',
+                type: 'select',
+                currentValue: 'default',
+                options: [
+                  { value: 'default', name: 'Default' },
+                  { value: 'accept-edits', name: 'Accept edits' },
+                  { value: 'plan', name: 'Plan' },
+                ],
+              },
+              {
+                id: 'thought_level',
+                name: 'Thinking Level',
+                category: 'thought_level',
+                type: 'select',
+                currentValue: 'high',
+                options: [
+                  { value: 'low', name: 'Low' },
+                  { value: 'medium', name: 'Medium' },
+                  { value: 'high', name: 'High' },
+                ],
+              },
+            ],
+          },
+        });
+      } else if (m.method === 'session/set_config_option') {
+        const p = m.params as { configId: string; value: string };
+        io.emit({
+          jsonrpc: '2.0',
+          id: m.id,
+          result: {
+            configOptions: [
+              {
+                id: 'mode',
+                name: 'Mode',
+                category: 'mode',
+                type: 'select',
+                currentValue: p.configId === 'mode' ? p.value : 'default',
+                options: [
+                  { value: 'default', name: 'Default' },
+                  { value: 'accept-edits', name: 'Accept edits' },
+                  { value: 'plan', name: 'Plan' },
+                ],
+              },
+              {
+                id: 'thought_level',
+                name: 'Thinking Level',
+                category: 'thought_level',
+                type: 'select',
+                currentValue: 'high',
+                options: [
+                  { value: 'low', name: 'Low' },
+                  { value: 'medium', name: 'Medium' },
+                  { value: 'high', name: 'High' },
+                ],
+              },
+            ],
+          },
+        });
+      } else if (m.method === 'session/prompt') {
+        const blocks = (m.params as { prompt: Array<{ text?: string }> }).prompt;
+        receivedPromptText = blocks.map((b) => b.text ?? '').join('');
+        io.emit({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: 'agy-sess-1',
+            update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'ok' } },
+          },
+        });
+        io.emit({ jsonrpc: '2.0', id: m.id, result: { stopReason: 'end_turn' } });
+      } else if (m.method === 'session/close') {
+        io.emit({ jsonrpc: '2.0', id: m.id, result: {} });
+      }
+    });
+
+    const events: SessionEvent[] = [];
+    const session = track({
+      externalSessionId: 'agy-sess-1',
+      baseContext: 'STANDING LAYER',
+      permissionMode: 'acceptEdits',
+      // Model only offers low/medium/high: xhigh degrades gracefully instead of aborting start().
+      effort: 'xhigh',
+      spawn: () => fake.proc,
+    });
+    session.onEvent((e) => events.push(e));
+    await session.start();
+
+    expect(session.serverCapabilities?.systemPromptAppend).toBe(true);
+    expect(seenMethods).toContain('session/resume');
+    expect(seenMethods).not.toContain('session/load');
+    expect(receivedMeta).toEqual({ antigravity: { systemPrompt: { append: 'STANDING LAYER' } } });
+    expect(session.currentModeId).toBe('accept-edits');
+    expect(
+      events.some(
+        (e) =>
+          e.kind === 'native_status' && (e.raw as { type?: string })?.type === 'effort-unsupported',
+      ),
+    ).toBe(true);
+
+    const res = await session.send('hello');
+    expect(res.content).toBe('ok');
+    // baseContext went through native systemPrompt append, never prepended to user text.
+    expect(receivedPromptText).toBe('hello');
+
+    await session.close();
+    expect(seenMethods).toContain('session/close');
+  });
+
+  test('falls back to session/load when session/resume returns -32601', async () => {
+    const seen: string[] = [];
+    const fake = fakeProcess((m: Record<string, unknown>, io) => {
+      seen.push(String(m.method));
+      if (m.method === 'initialize') {
+        io.emit({
+          jsonrpc: '2.0',
+          id: m.id,
+          result: {
+            protocolVersion: 1,
+            agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {} } },
+          },
+        });
+      } else if (m.method === 'session/resume') {
+        io.emit({ jsonrpc: '2.0', id: m.id, error: { code: -32601, message: 'Method not found' } });
+      } else if (m.method === 'session/load') {
+        io.emit({ jsonrpc: '2.0', id: m.id, result: {} });
+      }
+    });
+    const session = track({ externalSessionId: 'fallback-sess', spawn: () => fake.proc });
+    await session.start();
+    expect(seen).toEqual(['initialize', 'session/resume', 'session/load']);
+  });
+
+  test('interaction_* user-input requests are cancelled even under bypassPermissions, and MCP/combinedOutput normalize', async () => {
+    const fake = fakeProcess((m: Record<string, unknown>, io) => {
+      if (m.method === 'initialize') {
+        io.emit({
+          jsonrpc: '2.0',
+          id: m.id,
+          result: { protocolVersion: 1, agentCapabilities: {} },
+        });
+      } else if (m.method === 'session/new') {
+        io.emit({ jsonrpc: '2.0', id: m.id, result: { sessionId: 'agy-proto' } });
+      } else if (m.method === 'session/prompt') {
+        io.emit({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: 'agy-proto',
+            update: {
+              sessionUpdate: 'tool_call',
+              toolCallId: 'mcp-1',
+              title: 'Run call_mcp_tool',
+              rawInput: { ServerName: 'foundry', ToolName: 'set_plan' },
+              status: 'in_progress',
+            },
+          },
+        });
+        io.emit({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: 'agy-proto',
+            update: {
+              sessionUpdate: 'tool_call_update',
+              toolCallId: 'mcp-1',
+              status: 'completed',
+              rawOutput: { combinedOutput: 'plan saved', exitCode: 0 },
+            },
+          },
+        });
+        io.emit({
+          jsonrpc: '2.0',
+          id: 'ask-q1',
+          method: 'session/request_permission',
+          params: {
+            sessionId: 'agy-proto',
+            toolCall: { toolCallId: 'interaction_abc', title: 'Pick an option', rawInput: {} },
+            options: [
+              { optionId: '1', name: 'Option A', kind: 'allow_once' },
+              { optionId: '2', name: 'Option B', kind: 'allow_once' },
+            ],
+          },
+        });
+      } else if (m.id === 'ask-q1') {
+        const prompt = fake.lines.find((l) => l.method === 'session/prompt');
+        io.emit({ jsonrpc: '2.0', id: prompt.id, result: { stopReason: 'max_tokens' } });
+      }
+    });
+
+    const session = track({ permissionMode: 'bypassPermissions', spawn: () => fake.proc });
+    await session.start();
+    const res = await session.send('work');
+
+    // max_tokens is a non-end_turn stop -> failed nativeOutcome.
+    expect(res.nativeOutcome).toBe('failed');
+    expect(res.terminal).toEqual({ type: 'session/prompt', subtype: 'max_tokens' });
+
+    // interaction_* was cancelled instead of auto-selecting option 1.
+    const reply = fake.lines.find((l) => l.id === 'ask-q1');
+    expect(reply?.result).toEqual({ outcome: { outcome: 'cancelled' } });
+
+    // call_mcp_tool normalized to mcp__foundry__set_plan and combinedOutput extracted.
+    const use = res.events.find((e) => e.kind === 'tool_use');
+    expect(use).toMatchObject({
+      toolName: 'mcp__foundry__set_plan',
+      toolServer: 'foundry',
+      toolMethod: 'set_plan',
+    });
+    const out = res.events.find((e) => e.kind === 'tool_result');
+    expect(out?.toolOutput).toBe('plan saved');
+  });
+
+  test('startup fails fast on Antigravity auth URL prompt instead of hanging for startupTimeout', async () => {
+    const fake = fakeProcess((m: Record<string, unknown>, io) => {
+      if (m.method === 'initialize') {
+        io.emitRaw(
+          'Open the following link to authenticate the ACP server: https://accounts.google.com/o/oauth2/v2/auth',
+        );
+      }
+    });
+    const session = track({ startupTimeout: 10_000, spawn: () => fake.proc });
+    const started = Date.now();
+    await expect(session.start()).rejects.toThrow(/sign-in required/i);
+    expect(Date.now() - started).toBeLessThan(2_000);
+  });
+
+  test('agyAcpLaunch disables auto-update by default and strips competing GCP/Antigravity env vars', () => {
+    const cfg = agyAcpLaunch();
+    expect(cfg.env?.AGY_CLI_DISABLE_AUTO_UPDATE).toBe('1');
+    expect(cfg.env).toHaveProperty('CHROME_CRASHPAD_PIPE_NAME', undefined);
+    expect(AGY_COMPETING_ENV).toContain('GOOGLE_CLOUD_PROJECT');
+    expect(AGY_COMPETING_ENV).toContain('AGY_ACP_CCPA_PROJECT');
+    expect(GEMINI_CLI_COMPETING_ENV).toContain('GOOGLE_CLOUD_PROJECT');
+    const override = agyAcpLaunch({ env: { AGY_CLI_DISABLE_AUTO_UPDATE: '0' } });
+    expect(override.env?.AGY_CLI_DISABLE_AUTO_UPDATE).toBe('0');
+  });
+
+  test('close() races cleanly: flips closing before session/close, refuses concurrent send, and never emits transportOutcome failed', async () => {
+    let closeCalls = 0;
+    const fake = fakeProcess((m: Record<string, unknown>, io) => {
+      if (m.method === 'initialize') {
+        io.emit({
+          jsonrpc: '2.0',
+          id: m.id,
+          result: { protocolVersion: 1, agentCapabilities: { sessionCapabilities: { close: {} } } },
+        });
+      } else if (m.method === 'session/new') {
+        io.emit({
+          jsonrpc: '2.0',
+          id: m.id,
+          result: {
+            sessionId: 'close-race',
+            configOptions: [
+              {
+                id: 'mode',
+                name: 'Mode',
+                category: 'mode',
+                type: 'select',
+                currentValue: 'default',
+                options: [{ value: 'default', name: 'Default' }],
+              },
+              {
+                id: 'thinking',
+                name: 'Thinking',
+                category: 'thinking',
+                type: 'boolean',
+                currentValue: true,
+              },
+            ],
+          },
+        });
+      } else if (m.method === 'session/close') {
+        closeCalls++;
+        // Child exits immediately upon receiving session/close without replying.
+        setTimeout(() => io.exit(0), 15);
+      }
+    });
+
+    const events: SessionEvent[] = [];
+    const session = track({ effort: 'high', spawn: () => fake.proc });
+    session.onEvent((e) => events.push(e));
+    await session.start();
+    // Mode populated from configOptions even without legacy `modes`; boolean `thinking` ignored.
+    expect(session.currentModeId).toBe('default');
+
+    const c1 = session.close();
+    const c2 = session.close();
+    await expect(session.send('too late')).rejects.toThrow();
+    await Promise.all([c1, c2]);
+
+    expect(closeCalls).toBe(1);
+    const ends = events.filter((e) => e.kind === 'session_end');
+    expect(ends).toHaveLength(1);
+    expect(ends[0]?.transportOutcome).toBeUndefined();
+  });
+
+  test('tool_call_update repeating call_mcp_tool preserves normalized MCP name and missing stopReason fails closed', async () => {
+    const fake = fakeProcess((m: Record<string, unknown>, io) => {
+      if (m.method === 'initialize') {
+        io.emit({
+          jsonrpc: '2.0',
+          id: m.id,
+          result: { protocolVersion: 1, agentCapabilities: {} },
+        });
+      } else if (m.method === 'session/new') {
+        io.emit({ jsonrpc: '2.0', id: m.id, result: { sessionId: 'mcp-keep' } });
+      } else if (m.method === 'session/prompt') {
+        io.emit({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: 'mcp-keep',
+            update: {
+              sessionUpdate: 'tool_call',
+              toolCallId: 'mcp-2',
+              name: 'call_mcp_tool',
+              rawInput: { ServerName: 'foundry', ToolName: 'set_plan' },
+              status: 'in_progress',
+            },
+          },
+        });
+        io.emit({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: 'mcp-keep',
+            update: {
+              sessionUpdate: 'tool_call_update',
+              toolCallId: 'mcp-2',
+              name: 'call_mcp_tool',
+              status: 'completed',
+              rawOutput: { combinedOutput: 'done' },
+            },
+          },
+        });
+        // Omitted stopReason must fail closed.
+        io.emit({ jsonrpc: '2.0', id: m.id, result: {} });
+      }
+    });
+
+    const session = track({ spawn: () => fake.proc });
+    await session.start();
+    const res = await session.send('go');
+    expect(res.nativeOutcome).toBe('failed');
+    expect(res.terminal).toEqual({ type: 'session/prompt', subtype: 'missing' });
+    const resultEvt = res.events.find((e) => e.kind === 'tool_result');
+    expect(resultEvt).toMatchObject({
+      toolName: 'mcp__foundry__set_plan',
+      toolServer: 'foundry',
+      toolMethod: 'set_plan',
+      toolOutput: 'done',
+    });
+  });
+
+  test('calling close() before start() does not poison later close() teardown', async () => {
+    const fake = fakeProcess((m: Record<string, unknown>, io) => {
+      if (m.method === 'initialize') {
+        io.emit({
+          jsonrpc: '2.0',
+          id: m.id,
+          result: { protocolVersion: 1, agentCapabilities: { sessionCapabilities: { close: {} } } },
+        });
+      } else if (m.method === 'session/new') {
+        io.emit({ jsonrpc: '2.0', id: m.id, result: { sessionId: 'pre-close' } });
+      } else if (m.method === 'session/close') {
+        io.emit({ jsonrpc: '2.0', id: m.id, result: {} });
+      }
+    });
+
+    const session = track({ spawn: () => fake.proc });
+    // Pre-start close is a no-op and must not cache a resolved _exitPromise.
+    await session.close();
+    await session.start();
+    expect(session.alive).toBe(true);
+    await session.close();
+    expect(session.alive).toBe(false);
+    expect(fake.killed).toBe(true);
+    expect(fake.lines.some((m: Record<string, unknown>) => m.method === 'session/close')).toBe(
+      true,
+    );
   });
 });

@@ -1043,4 +1043,39 @@ describe('a model the provider does not serve', () => {
     ).toBeUndefined();
     expect(nativeModelMissing(undefined)).toBeUndefined();
   });
+
+  test('fastMode passes --settings JSON on spawn and survives fork()', async () => {
+    const commands: string[][] = [];
+    const spawn = (cmd: string[]) => {
+      commands.push(cmd);
+      return makeFakeProc({ autoReplyOnSend: true }).proc;
+    };
+
+    const fast = new ClaudeCodeSession({ model: 'claude-opus-5-5', fastMode: true, spawn });
+    await fast.start();
+    await fast.send('hi');
+    const idx = commands[0]!.indexOf('--settings');
+    expect(idx).toBeGreaterThan(-1);
+    expect(JSON.parse(commands[0]![idx + 1]!)).toEqual({ fastMode: true });
+
+    const forked = fast.fork({ spawn });
+    await forked.start();
+    const fIdx = commands[1]!.indexOf('--settings');
+    expect(fIdx).toBeGreaterThan(-1);
+    expect(JSON.parse(commands[1]![fIdx + 1]!)).toEqual({ fastMode: true });
+    forked.kill();
+    fast.kill();
+
+    const standard = new ClaudeCodeSession({ model: 'claude-opus-5-5', fastMode: false, spawn });
+    await standard.start();
+    const sIdx = commands[2]!.indexOf('--settings');
+    expect(sIdx).toBeGreaterThan(-1);
+    expect(JSON.parse(commands[2]![sIdx + 1]!)).toEqual({ fastMode: false });
+    standard.kill();
+
+    const omitted = new ClaudeCodeSession({ model: 'claude-sonnet-5-5', spawn });
+    await omitted.start();
+    expect(commands[3]).not.toContain('--settings');
+    omitted.kill();
+  });
 });

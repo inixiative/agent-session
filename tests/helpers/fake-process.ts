@@ -2,7 +2,9 @@ import type { PipedSubprocess } from '../../src/claude-code-session';
 
 /** A scriptable stdio process: each stdin JSON line is handed to `onMessage`. */
 export function fakeProcess(onMessage: (message: any, io: FakeIo) => void = () => {}) {
-  let out!: ReadableStreamDefaultController<Uint8Array>, exit!: (code: number) => void;
+  let out!: ReadableStreamDefaultController<Uint8Array>,
+    err!: ReadableStreamDefaultController<Uint8Array>,
+    exit!: (code: number) => void;
   let closed = false,
     killed = false;
   const lines: any[] = [];
@@ -11,11 +13,22 @@ export function fakeProcess(onMessage: (message: any, io: FakeIo) => void = () =
     emit(value) {
       if (!closed) out.enqueue(encoder.encode(`${JSON.stringify(value)}\n`));
     },
+    emitRaw(line) {
+      if (!closed) out.enqueue(encoder.encode(`${line}\n`));
+    },
+    emitStderr(line) {
+      if (!closed) err.enqueue(encoder.encode(`${line}\n`));
+    },
     exit(code = 0) {
       if (!closed) {
         closed = true;
         try {
           out.close();
+        } catch {
+          /* closed */
+        }
+        try {
+          err.close();
         } catch {
           /* closed */
         }
@@ -31,7 +44,7 @@ export function fakeProcess(onMessage: (message: any, io: FakeIo) => void = () =
     }),
     stderr: new ReadableStream<Uint8Array>({
       start(c) {
-        c.close();
+        err = c;
       },
     }),
     exited: new Promise<number>((resolve) => {
@@ -69,6 +82,8 @@ export function fakeProcess(onMessage: (message: any, io: FakeIo) => void = () =
 
 export interface FakeIo {
   emit(value: unknown): void;
+  emitRaw(line: string): void;
+  emitStderr(line: string): void;
   exit(code?: number): void;
 }
 

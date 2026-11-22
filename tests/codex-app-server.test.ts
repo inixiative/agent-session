@@ -752,6 +752,47 @@ test('a turn Codex fails with modelNotFound rejects with a typed missing-model e
   expect((await next).nativeOutcome).toBe('completed');
 });
 
+test('a turn Codex fails with invalid_encrypted_content rejects with NativeBindingMissingError and scrubs headers', async () => {
+  const f = fixture({ binding: 'thread-enc' });
+  await f.session.start();
+  const pending = f.session.send('hi');
+  await tick();
+  f.rpc();
+  f.begin();
+  f.terminal('turn-one', 'failed', {
+    codexErrorInfo: 'other',
+    message: JSON.stringify({
+      error: {
+        type: 'invalid_request_error',
+        code: 'invalid_encrypted_content',
+        message: 'Encrypted content could not be decrypted or parsed.',
+      },
+      headers: { 'x-codex-turn-state': 'secret-turn-state-token' },
+      status: 400,
+    }),
+  });
+  const error = await pending.catch((e) => e);
+  const missing = nativeBindingMissing(error);
+  expect(missing).toBeInstanceOf(NativeBindingMissingError);
+  expect(missing).toMatchObject({ runtime: 'codex-app-server', binding: 'thread-enc' });
+  expect(error.attempt.terminal.reason).not.toContain('secret-turn-state-token');
+  expect(error.attempt.terminal.reason).toContain('Encrypted conversation history');
+
+  // Unrelated prose mentioning invalid_encrypted_content does NOT drop the native binding.
+  const f2 = fixture({ binding: 'thread-ok' });
+  await f2.session.start();
+  const pending2 = f2.session.send('hi');
+  await tick();
+  f2.rpc();
+  f2.begin();
+  f2.terminal('turn-one', 'failed', {
+    codexErrorInfo: 'other',
+    message: 'User note mentioned invalid_encrypted_content in prose',
+  });
+  const res2 = await pending2;
+  expect(res2.nativeOutcome).toBe('failed');
+});
+
 // Synthetic: a plan refusal could not be reproduced on this login; the shapes follow Codex's taxonomy.
 test('usage limits and other failures naming the model stay ordinary failed turns', async () => {
   for (const error of [
@@ -770,4 +811,89 @@ test('usage limits and other failures naming the model stay ordinary failed turn
     expect(result.nativeOutcome).toBe('failed');
     expect(nativeModelMissing(result)).toBeUndefined();
   }
+});
+
+test('serviceTier is sent on thread/start, thread/resume, and turn/start when configured', async () => {
+  const requests: Request[] = [];
+  let out!: ReadableStreamDefaultController<Uint8Array>;
+  let exit!: (code: number) => void;
+  let closed = false;
+  const emit = (value: unknown) => {
+    if (!closed) out.enqueue(new TextEncoder().encode(`${JSON.stringify(value)}\n`));
+  };
+  const proc = {
+    stdout: new ReadableStream<Uint8Array>({
+      start(c) {
+        out = c;
+      },
+    }),
+    stderr: new ReadableStream<Uint8Array>(),
+    stdin: {
+      write(chunk: string | Uint8Array) {
+        const text = typeof chunk === 'string' ? chunk : new TextDecoder().decode(chunk);
+        for (const line of text.split('\n').filter(Boolean)) {
+          const msg = JSON.parse(line) as Request;
+          requests.push(msg);
+          if (msg.method === 'initialize')
+            emit({ id: msg.id, result: { userAgent: 'codex/0.169' } });
+          else if (msg.method === 'thread/start')
+            emit({
+              id: msg.id,
+              result: {
+                thread: { id: 'thread-tier', turns: [], status: { type: 'idle' } },
+                model: 'gpt-6.2-sol',
+                reasoningEffort: 'medium',
+                serviceTier: 'fast',
+              },
+            });
+          else if (msg.method === 'turn/start') {
+            emit({
+              id: msg.id,
+              result: { turn: { id: 'turn-tier', items: [], status: 'inProgress' } },
+            });
+            emit({
+              method: 'turn/completed',
+              params: {
+                threadId: 'thread-tier',
+                turn: { id: 'turn-tier', items: [], status: 'completed' },
+              },
+            });
+          }
+        }
+        return text.length;
+      },
+      flush() {},
+      end() {},
+    },
+    exited: new Promise<number>((resolve) => {
+      exit = resolve;
+    }),
+    kill() {
+      if (!closed) {
+        closed = true;
+        out.close();
+        exit(0);
+      }
+    },
+  };
+  const session = new CodexAppServerSession({
+    model: 'gpt-6.2-sol',
+    serviceTier: 'fast',
+    cwd: '/repo',
+    spawn: () => proc,
+  });
+  closes.push(() => session.kill());
+  await session.start();
+  const res = await session.send('go');
+  expect(res.nativeOutcome).toBe('completed');
+  const threadStart = requests.find((r) => r.method === 'thread/start');
+  const turnStart = requests.find((r) => r.method === 'turn/start');
+  expect(threadStart?.params?.serviceTier).toBe('fast');
+  expect(turnStart?.params?.serviceTier).toBe('fast');
+  const configured = session.events.find(
+    (e) =>
+      e.kind === 'native_status' &&
+      (e.raw as { type?: string } | undefined)?.type === 'thread-configured',
+  );
+  expect((configured?.raw as { serviceTier?: string } | undefined)?.serviceTier).toBe('fast');
 });
