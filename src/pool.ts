@@ -18,6 +18,7 @@ import { join, resolve } from 'node:path';
 import type { HarnessSession } from './harness-session';
 import { type LimitSnapshot, mergeLimits } from './limits';
 import { probeClaudeLimits, probeCodexLimits } from './limits-probe';
+import { PROFILE_VARIABLE } from './profile-variable';
 import {
   type BillingMode,
   type ExclusionReason,
@@ -198,8 +199,6 @@ export interface SubscriptionPoolOptions {
   readonly now?: () => number;
   readonly onEvent?: (event: PoolEvent) => void;
 }
-
-const PROFILE_VARIABLE = { codex: 'CODEX_HOME', claude: 'CLAUDE_CONFIG_DIR' } as const;
 
 export class SubscriptionPool {
   private readonly _instances = new Map<string, InstanceState>();

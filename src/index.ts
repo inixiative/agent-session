@@ -203,6 +203,14 @@ export {
   type SubscriptionCandidate,
   type UnknownUtilizationPolicy,
 } from './routing';
+export {
+  type SignIn,
+  type SignInOptions,
+  type SignInProcess,
+  type SignInRuntime,
+  type SignInTokens,
+  startSignIn,
+} from './sign-in';
 // Transports: how a session reaches its model, with declared capabilities.
 export {
   TRANSPORTS,

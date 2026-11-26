@@ -399,6 +399,16 @@ The gate reads names, not contents, and a pipe command can still copy a value ou
 it keeps honest agents from reading secrets, it is not a sandbox. Design and
 limits: [tickets/AS-009](tickets/AS-009-secret-scratch-pad.md).
 
+## Subscription sign-in
+
+`startSignIn('claude' | 'codex', { profileDirectory })` runs `claude setup-token` or `codex login`
+on a pseudo-terminal in a private directory of its own, for a host that has no terminal to
+offer: show `url`, give the code the page returns to `sendCode`, and await `result` for the
+tokens. `deviceAuth` (Codex) is for a person on another machine than the CLI: they enter
+`userCode` on that page and nothing comes back to type. Keys that would select another login
+or metered billing are dropped from the environment, a printed token never reaches
+`onOutput`. There is no time limit: the caller cancels, and removes the directory. Needs a Bun with terminal support.
+
 ## Roadmap
 
 | Runtime | Status |

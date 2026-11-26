@@ -1,6 +1,6 @@
 {
   "name": "@inixiative/agent-session",
-  "version": "0.22.3",
+  "version": "0.23.0",
   "description": "Drive coding-agent CLIs as persistent, streaming, event-captured sessions over interchangeable transports, with primed decision sessions, subscription pools, routing, limit polling and continuity.",
   "type": "module",
   "main": "src/index.ts",
@@ -8,7 +8,8 @@
   "exports": {
     ".": "./src/index.ts",
     "./muse-env": "./src/muse-env.ts",
-    "./routing": "./src/routing.ts"
+    "./routing": "./src/routing.ts",
+    "./sign-in": "./src/sign-in.ts"
   },
   "files": [
     "src"
