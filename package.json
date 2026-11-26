@@ -41,13 +41,13 @@
   ],
   "license": "MIT",
   "dependencies": {
-    "@inixiative/json-rules": "^3.23.0",
+    "@inixiative/json-rules": "^4.7.0",
     "@inixiative/secret-scratch": "^0.1.0",
     "@muse-code/sdk": "1.4.25"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.2",
-    "@inixiative/config": "^0.5.237",
+    "@inixiative/config": "^0.5.252",
     "@types/bun": "1.4.4",
     "lefthook": "2.1.9",
     "typescript": "6.0.3"
